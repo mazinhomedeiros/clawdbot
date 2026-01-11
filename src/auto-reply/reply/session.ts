@@ -23,6 +23,8 @@ import {
   type SessionScope,
   saveSessionStore,
 } from "../../config/sessions.js";
+import { getProviderDock } from "../../providers/dock.js";
+import { normalizeProviderId } from "../../providers/registry.js";
 import { normalizeMainKey } from "../../routing/session-key.js";
 import { resolveCommandAuthorization } from "../command-auth.js";
 import type { MsgContext, TemplateContext } from "../templating.js";
@@ -129,6 +131,7 @@ export async function initSessionState(params: {
 
   let persistedThinking: string | undefined;
   let persistedVerbose: string | undefined;
+  let persistedReasoning: string | undefined;
   let persistedModelOverride: string | undefined;
   let persistedProviderOverride: string | undefined;
 
@@ -194,6 +197,7 @@ export async function initSessionState(params: {
     abortedLastRun = entry.abortedLastRun ?? false;
     persistedThinking = entry.thinkingLevel;
     persistedVerbose = entry.verboseLevel;
+    persistedReasoning = entry.reasoningLevel;
     persistedModelOverride = entry.modelOverride;
     persistedProviderOverride = entry.providerOverride;
   } else {
@@ -213,6 +217,7 @@ export async function initSessionState(params: {
     // Persist previously stored thinking/verbose levels when present.
     thinkingLevel: persistedThinking ?? baseEntry?.thinkingLevel,
     verboseLevel: persistedVerbose ?? baseEntry?.verboseLevel,
+    reasoningLevel: persistedReasoning ?? baseEntry?.reasoningLevel,
     responseUsage: baseEntry?.responseUsage,
     modelOverride: persistedModelOverride ?? baseEntry?.modelOverride,
     providerOverride: persistedProviderOverride ?? baseEntry?.providerOverride,
@@ -233,7 +238,13 @@ export async function initSessionState(params: {
     const subject = ctx.GroupSubject?.trim();
     const space = ctx.GroupSpace?.trim();
     const explicitRoom = ctx.GroupRoom?.trim();
-    const isRoomProvider = provider === "discord" || provider === "slack";
+    const normalizedProvider = normalizeProviderId(provider);
+    const isRoomProvider = Boolean(
+      normalizedProvider &&
+        getProviderDock(normalizedProvider)?.capabilities.chatTypes.includes(
+          "channel",
+        ),
+    );
     const nextRoom =
       explicitRoom ??
       (isRoomProvider && subject && subject.startsWith("#")

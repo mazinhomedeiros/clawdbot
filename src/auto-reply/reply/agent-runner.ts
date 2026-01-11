@@ -1,15 +1,18 @@
 import crypto from "node:crypto";
 import fs from "node:fs";
-import { runClaudeCliAgent } from "../../agents/claude-cli-runner.js";
+import { runCliAgent } from "../../agents/cli-runner.js";
+import { getCliSessionId, setCliSessionId } from "../../agents/cli-session.js";
 import { lookupContextTokens } from "../../agents/context.js";
 import { DEFAULT_CONTEXT_TOKENS } from "../../agents/defaults.js";
 import { resolveModelAuthMode } from "../../agents/model-auth.js";
 import { runWithModelFallback } from "../../agents/model-fallback.js";
+import { isCliProvider } from "../../agents/model-selection.js";
 import {
   queueEmbeddedPiMessage,
   runEmbeddedPiAgent,
 } from "../../agents/pi-embedded.js";
 import { hasNonzeroUsage, type NormalizedUsage } from "../../agents/usage.js";
+import type { ClawdbotConfig } from "../../config/config.js";
 import {
   loadSessionStore,
   resolveSessionTranscriptPath,
@@ -24,6 +27,9 @@ import {
   registerAgentRunContext,
 } from "../../infra/agent-events.js";
 import { isAudioFileName } from "../../media/mime.js";
+import { getProviderDock } from "../../providers/dock.js";
+import type { ProviderThreadingToolContext } from "../../providers/plugins/types.js";
+import { normalizeProviderId } from "../../providers/registry.js";
 import { defaultRuntime } from "../../runtime.js";
 import {
   estimateUsageCost,
@@ -34,7 +40,7 @@ import {
 import { stripHeartbeatToken } from "../heartbeat.js";
 import type { OriginatingChannelType, TemplateContext } from "../templating.js";
 import { normalizeVerboseLevel, type VerboseLevel } from "../thinking.js";
-import { SILENT_REPLY_TOKEN } from "../tokens.js";
+import { isSilentReplyText, SILENT_REPLY_TOKEN } from "../tokens.js";
 import type { GetReplyOptions, ReplyPayload } from "../types.js";
 import {
   createAudioAsVoiceBuffer,
@@ -68,47 +74,32 @@ const BUN_FETCH_SOCKET_ERROR_RE = /socket connection was closed unexpectedly/i;
 const BLOCK_REPLY_SEND_TIMEOUT_MS = 15_000;
 
 /**
- * Build Slack-specific threading context for tool auto-injection.
- * Returns undefined values for non-Slack providers.
+ * Build provider-specific threading context for tool auto-injection.
  */
-function buildSlackThreadingContext(params: {
+function buildThreadingToolContext(params: {
   sessionCtx: TemplateContext;
-  config: { slack?: { replyToMode?: "off" | "first" | "all" } } | undefined;
+  config: ClawdbotConfig | undefined;
   hasRepliedRef: { value: boolean } | undefined;
-}): {
-  currentChannelId: string | undefined;
-  currentThreadTs: string | undefined;
-  replyToMode: "off" | "first" | "all" | undefined;
-  hasRepliedRef: { value: boolean } | undefined;
-} {
+}): ProviderThreadingToolContext {
   const { sessionCtx, config, hasRepliedRef } = params;
-  const isSlack = sessionCtx.Provider?.toLowerCase() === "slack";
-  if (!isSlack) {
-    return {
-      currentChannelId: undefined,
-      currentThreadTs: undefined,
-      replyToMode: undefined,
-      hasRepliedRef: undefined,
-    };
-  }
-
-  // If we're already inside a thread, never jump replies out of it (even in
-  // replyToMode="off"/"first"). This keeps tool calls consistent with the
-  // auto-reply path.
-  const configuredReplyToMode = config?.slack?.replyToMode ?? "off";
-  const effectiveReplyToMode = sessionCtx.ThreadLabel
-    ? ("all" as const)
-    : configuredReplyToMode;
-
-  return {
-    // Extract channel from "channel:C123" format
-    currentChannelId: sessionCtx.To?.startsWith("channel:")
-      ? sessionCtx.To.slice("channel:".length)
-      : undefined,
-    currentThreadTs: sessionCtx.ReplyToId,
-    replyToMode: effectiveReplyToMode,
-    hasRepliedRef,
-  };
+  if (!config) return {};
+  const provider = normalizeProviderId(sessionCtx.Provider);
+  if (!provider) return {};
+  const dock = getProviderDock(provider);
+  if (!dock?.threading?.buildToolContext) return {};
+  return (
+    dock.threading.buildToolContext({
+      cfg: config,
+      accountId: sessionCtx.AccountId,
+      context: {
+        Provider: sessionCtx.Provider,
+        To: sessionCtx.To,
+        ReplyToId: sessionCtx.ReplyToId,
+        ThreadLabel: sessionCtx.ThreadLabel,
+      },
+      hasRepliedRef,
+    }) ?? {}
+  );
 }
 
 const isBunFetchSocketError = (message?: string) =>
@@ -280,6 +271,7 @@ export async function runReplyAgent(params: {
   const replyToMode = resolveReplyToMode(
     followupRun.run.config,
     replyToChannel,
+    sessionCtx.AccountId,
   );
   const applyReplyToMode = createReplyToModeFilterForChannel(
     replyToMode,
@@ -376,7 +368,7 @@ export async function runReplyAgent(params: {
         provider: followupRun.run.provider,
         model: followupRun.run.model,
         run: (provider, model) => {
-          if (provider === "claude-cli") {
+          if (isCliProvider(provider, followupRun.run.config)) {
             const startedAt = Date.now();
             emitAgentEvent({
               runId,
@@ -386,7 +378,8 @@ export async function runReplyAgent(params: {
                 startedAt,
               },
             });
-            return runClaudeCliAgent({
+            const cliSessionId = getCliSessionId(sessionEntry, provider);
+            return runCliAgent({
               sessionId: followupRun.run.sessionId,
               sessionKey,
               sessionFile: followupRun.run.sessionFile,
@@ -400,8 +393,7 @@ export async function runReplyAgent(params: {
               runId,
               extraSystemPrompt: followupRun.run.extraSystemPrompt,
               ownerNumbers: followupRun.run.ownerNumbers,
-              claudeSessionId:
-                sessionEntry?.claudeCliSessionId?.trim() || undefined,
+              cliSessionId,
             })
               .then((result) => {
                 emitAgentEvent({
@@ -435,8 +427,8 @@ export async function runReplyAgent(params: {
             messageProvider:
               sessionCtx.Provider?.trim().toLowerCase() || undefined,
             agentAccountId: sessionCtx.AccountId,
-            // Slack threading context for tool auto-injection
-            ...buildSlackThreadingContext({
+            // Provider threading context for tool auto-injection
+            ...buildThreadingToolContext({
               sessionCtx,
               config: followupRun.run.config,
               hasRepliedRef: opts?.hasRepliedRef,
@@ -483,6 +475,7 @@ export async function runReplyAgent(params: {
                       }
                       text = stripped.text;
                     }
+                    if (isSilentReplyText(text, SILENT_REPLY_TOKEN)) return;
                     await typingSignals.signalTextDelta(text);
                     await opts.onPartialReply?.({
                       text,
@@ -815,10 +808,9 @@ export async function runReplyAgent(params: {
       runResult.meta.agentMeta?.provider ??
       fallbackProvider ??
       followupRun.run.provider;
-    const cliSessionId =
-      providerUsed === "claude-cli"
-        ? runResult.meta.agentMeta?.sessionId?.trim()
-        : undefined;
+    const cliSessionId = isCliProvider(providerUsed, cfg)
+      ? runResult.meta.agentMeta?.sessionId?.trim()
+      : undefined;
     const contextTokensUsed =
       agentCfgContextTokens ??
       lookupContextTokens(modelUsed) ??
@@ -836,7 +828,7 @@ export async function runReplyAgent(params: {
               const output = usage.output ?? 0;
               const promptTokens =
                 input + (usage.cacheRead ?? 0) + (usage.cacheWrite ?? 0);
-              return {
+              const patch: Partial<SessionEntry> = {
                 inputTokens: input,
                 outputTokens: output,
                 totalTokens:
@@ -845,8 +837,17 @@ export async function runReplyAgent(params: {
                 model: modelUsed,
                 contextTokens: contextTokensUsed ?? entry.contextTokens,
                 updatedAt: Date.now(),
-                claudeCliSessionId: cliSessionId ?? entry.claudeCliSessionId,
               };
+              if (cliSessionId) {
+                const nextEntry = { ...entry, ...patch };
+                setCliSessionId(nextEntry, providerUsed, cliSessionId);
+                return {
+                  ...patch,
+                  cliSessionIds: nextEntry.cliSessionIds,
+                  claudeCliSessionId: nextEntry.claudeCliSessionId,
+                };
+              }
+              return patch;
             },
           });
         } catch (err) {
@@ -857,13 +858,24 @@ export async function runReplyAgent(params: {
           await updateSessionStoreEntry({
             storePath,
             sessionKey,
-            update: async (entry) => ({
-              modelProvider: providerUsed ?? entry.modelProvider,
-              model: modelUsed ?? entry.model,
-              contextTokens: contextTokensUsed ?? entry.contextTokens,
-              claudeCliSessionId: cliSessionId ?? entry.claudeCliSessionId,
-              updatedAt: Date.now(),
-            }),
+            update: async (entry) => {
+              const patch: Partial<SessionEntry> = {
+                modelProvider: providerUsed ?? entry.modelProvider,
+                model: modelUsed ?? entry.model,
+                contextTokens: contextTokensUsed ?? entry.contextTokens,
+                updatedAt: Date.now(),
+              };
+              if (cliSessionId) {
+                const nextEntry = { ...entry, ...patch };
+                setCliSessionId(nextEntry, providerUsed, cliSessionId);
+                return {
+                  ...patch,
+                  cliSessionIds: nextEntry.cliSessionIds,
+                  claudeCliSessionId: nextEntry.claudeCliSessionId,
+                };
+              }
+              return patch;
+            },
           });
         } catch (err) {
           logVerbose(`failed to persist model/context update: ${String(err)}`);

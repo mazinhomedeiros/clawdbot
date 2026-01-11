@@ -66,8 +66,11 @@ import {
   resolveAuthProfileOrder,
   resolveModelAuthMode,
 } from "./model-auth.js";
+import { normalizeModelCompat } from "./model-compat.js";
 import { ensureClawdbotModelsJson } from "./models-config.js";
 import type { MessagingToolSend } from "./pi-embedded-messaging.js";
+import { ensurePiCompactionReserveTokens } from "./pi-settings.js";
+import { acquireSessionWriteLock } from "./session-write-lock.js";
 
 export type { MessagingToolSend } from "./pi-embedded-messaging.js";
 
@@ -114,6 +117,7 @@ import {
   type SkillSnapshot,
 } from "./skills.js";
 import { buildAgentSystemPrompt } from "./system-prompt.js";
+import { buildToolSummaryMap } from "./tool-summaries.js";
 import { normalizeUsage, type UsageLike } from "./usage.js";
 import {
   filterBootstrapFilesForSession,
@@ -232,6 +236,21 @@ function buildContextPruningExtension(params: {
   return {
     additionalExtensionPaths: [resolvePiExtensionPath("context-pruning")],
   };
+}
+
+function buildEmbeddedExtensionPaths(params: {
+  cfg: ClawdbotConfig | undefined;
+  sessionManager: SessionManager;
+  provider: string;
+  modelId: string;
+  model: Model<Api> | undefined;
+}): string[] {
+  const paths = [resolvePiExtensionPath("transcript-sanitize")];
+  const pruning = buildContextPruningExtension(params);
+  if (pruning.additionalExtensionPaths) {
+    paths.push(...pruning.additionalExtensionPaths);
+  }
+  return paths;
 }
 
 export type EmbeddedPiAgentMeta = {
@@ -394,6 +413,113 @@ async function sanitizeSessionHistory(params: {
   }).messages;
 }
 
+/**
+ * Limits conversation history to the last N user turns (and their associated
+ * assistant responses). This reduces token usage for long-running DM sessions.
+ *
+ * @param messages - The full message history
+ * @param limit - Max number of user turns to keep (undefined = no limit)
+ * @returns Messages trimmed to the last `limit` user turns
+ */
+export function limitHistoryTurns(
+  messages: AgentMessage[],
+  limit: number | undefined,
+): AgentMessage[] {
+  if (!limit || limit <= 0 || messages.length === 0) return messages;
+
+  // Count user messages from the end, find cutoff point
+  let userCount = 0;
+  let lastUserIndex = messages.length;
+
+  for (let i = messages.length - 1; i >= 0; i--) {
+    if (messages[i].role === "user") {
+      userCount++;
+      if (userCount > limit) {
+        // We exceeded the limit; keep from the last valid user turn onwards
+        return messages.slice(lastUserIndex);
+      }
+      lastUserIndex = i;
+    }
+  }
+  // Fewer than limit user turns, keep all
+  return messages;
+}
+
+/**
+ * Extracts the provider name and user ID from a session key and looks up
+ * dmHistoryLimit from the provider config, with per-DM override support.
+ *
+ * Session key formats:
+ * - `telegram:dm:123` → provider = telegram, userId = 123
+ * - `agent:main:telegram:dm:123` → provider = telegram, userId = 123
+ *
+ * Resolution order:
+ * 1. Per-DM override: provider.dms[userId].historyLimit
+ * 2. Provider default: provider.dmHistoryLimit
+ */
+export function getDmHistoryLimitFromSessionKey(
+  sessionKey: string | undefined,
+  config: ClawdbotConfig | undefined,
+): number | undefined {
+  if (!sessionKey || !config) return undefined;
+
+  const parts = sessionKey.split(":").filter(Boolean);
+  // Handle agent-prefixed keys: agent:<agentId>:<provider>:...
+  const providerParts =
+    parts.length >= 3 && parts[0] === "agent" ? parts.slice(2) : parts;
+
+  const provider = providerParts[0]?.toLowerCase();
+  if (!provider) return undefined;
+
+  // Extract userId: format is provider:dm:userId or provider:dm:userId:...
+  // The userId may contain colons (e.g., email addresses), so join remaining parts
+  const kind = providerParts[1]?.toLowerCase();
+  const userId = providerParts.slice(2).join(":");
+  if (kind !== "dm") return undefined;
+
+  // Helper to get limit with per-DM override support
+  const getLimit = (
+    providerConfig:
+      | {
+          dmHistoryLimit?: number;
+          dms?: Record<string, { historyLimit?: number }>;
+        }
+      | undefined,
+  ): number | undefined => {
+    if (!providerConfig) return undefined;
+    // Check per-DM override first
+    if (
+      userId &&
+      kind === "dm" &&
+      providerConfig.dms?.[userId]?.historyLimit !== undefined
+    ) {
+      return providerConfig.dms[userId].historyLimit;
+    }
+    // Fall back to provider default
+    return providerConfig.dmHistoryLimit;
+  };
+
+  // Map provider to config key
+  switch (provider) {
+    case "telegram":
+      return getLimit(config.telegram);
+    case "whatsapp":
+      return getLimit(config.whatsapp);
+    case "discord":
+      return getLimit(config.discord);
+    case "slack":
+      return getLimit(config.slack);
+    case "signal":
+      return getLimit(config.signal);
+    case "imessage":
+      return getLimit(config.imessage);
+    case "msteams":
+      return getLimit(config.msteams);
+    default:
+      return undefined;
+  }
+}
+
 const ACTIVE_EMBEDDED_RUNS = new Map<string, EmbeddedPiQueueHandle>();
 type EmbeddedRunWaiter = {
   resolve: (ended: boolean) => void;
@@ -480,6 +606,9 @@ type EmbeddedSandboxInfo = {
   browserControlUrl?: string;
   browserNoVncUrl?: string;
   hostBrowserAllowed?: boolean;
+  allowedControlUrls?: string[];
+  allowedControlHosts?: string[];
+  allowedControlPorts?: number[];
   elevated?: {
     allowed: boolean;
     defaultLevel: "on" | "off";
@@ -572,6 +701,9 @@ export function buildEmbeddedSandboxInfo(
     browserControlUrl: sandbox.browser?.controlUrl,
     browserNoVncUrl: sandbox.browser?.noVncUrl,
     hostBrowserAllowed: sandbox.browserAllowHostControl,
+    allowedControlUrls: sandbox.browserAllowedControlUrls,
+    allowedControlHosts: sandbox.browserAllowedControlHosts,
+    allowedControlPorts: sandbox.browserAllowedControlPorts,
     ...(elevatedAllowed
       ? {
           elevated: {
@@ -620,6 +752,7 @@ function buildEmbeddedSystemPrompt(params: {
     runtimeInfo: params.runtimeInfo,
     sandboxInfo: params.sandboxInfo,
     toolNames: params.tools.map((tool) => tool.name),
+    toolSummaries: buildToolSummaryMap(params.tools),
     modelAliasLines: params.modelAliasLines,
     userTimezone: params.userTimezone,
     userTime: params.userTime,
@@ -755,7 +888,7 @@ function resolveModel(
       modelRegistry,
     };
   }
-  return { model, authStorage, modelRegistry };
+  return { model: normalizeModelCompat(model), authStorage, modelRegistry };
 }
 
 export async function compactEmbeddedPiSession(params: {
@@ -946,70 +1079,83 @@ export async function compactEmbeddedPiSession(params: {
         });
         const systemPrompt = createSystemPromptOverride(appendPrompt);
 
-        // Pre-warm session file to bring it into OS page cache
-        await prewarmSessionFile(params.sessionFile);
-        const sessionManager = SessionManager.open(params.sessionFile);
-        trackSessionManagerAccess(params.sessionFile);
-        const settingsManager = SettingsManager.create(
-          effectiveWorkspace,
-          agentDir,
-        );
-        const pruning = buildContextPruningExtension({
-          cfg: params.config,
-          sessionManager,
-          provider,
-          modelId,
-          model,
+        const sessionLock = await acquireSessionWriteLock({
+          sessionFile: params.sessionFile,
         });
-        const additionalExtensionPaths = pruning.additionalExtensionPaths;
-
-        const { builtInTools, customTools } = splitSdkTools({
-          tools,
-          sandboxEnabled: !!sandbox?.enabled,
-        });
-
-        let session: Awaited<ReturnType<typeof createAgentSession>>["session"];
-        ({ session } = await createAgentSession({
-          cwd: resolvedWorkspace,
-          agentDir,
-          authStorage,
-          modelRegistry,
-          model,
-          thinkingLevel: mapThinkingLevel(params.thinkLevel),
-          systemPrompt,
-          tools: builtInTools,
-          customTools,
-          sessionManager,
-          settingsManager,
-          skills: [],
-          contextFiles: [],
-          additionalExtensionPaths,
-        }));
-
         try {
-          const prior = await sanitizeSessionHistory({
-            messages: session.messages,
-            modelApi: model.api,
+          // Pre-warm session file to bring it into OS page cache
+          await prewarmSessionFile(params.sessionFile);
+          const sessionManager = SessionManager.open(params.sessionFile);
+          trackSessionManagerAccess(params.sessionFile);
+          const settingsManager = SettingsManager.create(
+            effectiveWorkspace,
+            agentDir,
+          );
+          ensurePiCompactionReserveTokens({ settingsManager });
+          const additionalExtensionPaths = buildEmbeddedExtensionPaths({
+            cfg: params.config,
             sessionManager,
-            sessionId: params.sessionId,
+            provider,
+            modelId,
+            model,
           });
-          const validated = validateGeminiTurns(prior);
-          if (validated.length > 0) {
-            session.agent.replaceMessages(validated);
+
+          const { builtInTools, customTools } = splitSdkTools({
+            tools,
+            sandboxEnabled: !!sandbox?.enabled,
+          });
+
+          let session: Awaited<
+            ReturnType<typeof createAgentSession>
+          >["session"];
+          ({ session } = await createAgentSession({
+            cwd: resolvedWorkspace,
+            agentDir,
+            authStorage,
+            modelRegistry,
+            model,
+            thinkingLevel: mapThinkingLevel(params.thinkLevel),
+            systemPrompt,
+            tools: builtInTools,
+            customTools,
+            sessionManager,
+            settingsManager,
+            skills: [],
+            contextFiles: [],
+            additionalExtensionPaths,
+          }));
+
+          try {
+            const prior = await sanitizeSessionHistory({
+              messages: session.messages,
+              modelApi: model.api,
+              sessionManager,
+              sessionId: params.sessionId,
+            });
+            const validated = validateGeminiTurns(prior);
+            const limited = limitHistoryTurns(
+              validated,
+              getDmHistoryLimitFromSessionKey(params.sessionKey, params.config),
+            );
+            if (limited.length > 0) {
+              session.agent.replaceMessages(limited);
+            }
+            const result = await session.compact(params.customInstructions);
+            return {
+              ok: true,
+              compacted: true,
+              result: {
+                summary: result.summary,
+                firstKeptEntryId: result.firstKeptEntryId,
+                tokensBefore: result.tokensBefore,
+                details: result.details,
+              },
+            };
+          } finally {
+            session.dispose();
           }
-          const result = await session.compact(params.customInstructions);
-          return {
-            ok: true,
-            compacted: true,
-            result: {
-              summary: result.summary,
-              firstKeptEntryId: result.firstKeptEntryId,
-              tokensBefore: result.tokensBefore,
-              details: result.details,
-            },
-          };
         } finally {
-          session.dispose();
+          await sessionLock.release();
         }
       } catch (err) {
         return {
@@ -1327,6 +1473,9 @@ export async function runEmbeddedPiAgent(params: {
           });
           const systemPrompt = createSystemPromptOverride(appendPrompt);
 
+          const sessionLock = await acquireSessionWriteLock({
+            sessionFile: params.sessionFile,
+          });
           // Pre-warm session file to bring it into OS page cache
           await prewarmSessionFile(params.sessionFile);
           const sessionManager = SessionManager.open(params.sessionFile);
@@ -1335,14 +1484,14 @@ export async function runEmbeddedPiAgent(params: {
             effectiveWorkspace,
             agentDir,
           );
-          const pruning = buildContextPruningExtension({
+          ensurePiCompactionReserveTokens({ settingsManager });
+          const additionalExtensionPaths = buildEmbeddedExtensionPaths({
             cfg: params.config,
             sessionManager,
             provider,
             modelId,
             model,
           });
-          const additionalExtensionPaths = pruning.additionalExtensionPaths;
 
           const { builtInTools, customTools } = splitSdkTools({
             tools,
@@ -1379,11 +1528,16 @@ export async function runEmbeddedPiAgent(params: {
               sessionId: params.sessionId,
             });
             const validated = validateGeminiTurns(prior);
-            if (validated.length > 0) {
-              session.agent.replaceMessages(validated);
+            const limited = limitHistoryTurns(
+              validated,
+              getDmHistoryLimitFromSessionKey(params.sessionKey, params.config),
+            );
+            if (limited.length > 0) {
+              session.agent.replaceMessages(limited);
             }
           } catch (err) {
             session.dispose();
+            await sessionLock.release();
             throw err;
           }
           let aborted = Boolean(params.abortSignal?.aborted);
@@ -1413,6 +1567,7 @@ export async function runEmbeddedPiAgent(params: {
             });
           } catch (err) {
             session.dispose();
+            await sessionLock.release();
             throw err;
           }
           const {
@@ -1509,6 +1664,7 @@ export async function runEmbeddedPiAgent(params: {
               notifyEmbeddedRunEnded(params.sessionId);
             }
             session.dispose();
+            await sessionLock.release();
             params.abortSignal?.removeEventListener?.("abort", onAbort);
           }
           if (promptError && !aborted) {

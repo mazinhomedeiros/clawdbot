@@ -1,62 +1,73 @@
 # Changelog
 
-## 2026.1.11-3
+## 2026.1.11 (Unreleased)
+
+### Changes
+- Plugins: add extension loader (tools/RPC/CLI/services), discovery paths, config schema, and Control UI labels; ship voice-call plugin stub + skill.
+- Docs: add plugins doc + cross-links from tools/skills/gateway config.
+- Tests: add Docker plugin loader smoke test.
+- Build: set pnpm minimum release age to 2880 minutes (2 days). (#718) — thanks @dan-dr.
+- macOS: prompt to install the global `clawdbot` CLI when missing in local mode; install via `clawd.bot/install-cli.sh` (no onboarding) and use external launchd/CLI instead of the embedded gateway runtime.
+- Docs: add gog calendar event color IDs from `gog calendar colors`. (#715) — thanks @mjrussell.
+- Cron/CLI: trim model overrides on cron edits and document main-session guidance. (#711) — thanks @mjrussell.
+- Skills: bundle `skill-creator` to guide creating and packaging skills.
+- Discord: expose channel/category management actions in the message tool. (#730) — thanks @NicholasSpisak
 
 ### Fixes
-- CLI/Providers: fix `providers status` tip about `status --deep` requiring a reachable gateway.
-- Docs/Troubleshooting: clarify that `clawdbot status --deep` runs gateway health checks (and needs a reachable gateway).
-
-## 2026.1.11-2
-
-### Fixes
-- CLI/Status: add a “More:” footer with next-step commands and document status/diagnostics commands in troubleshooting.
-
-## 2026.1.11-1
-
-### New Features and Changes
-- Agents/Browser: add `browser.target` (sandbox/host/custom) with sandbox host-control gating via `agents.defaults.sandbox.browser.allowHostControl`, and expand browser tool docs (remote control, profiles, internals).
-
-## 2026.1.10-4
-
-### Fixes
-- CLI/Status: show token previews (first/last chars) in `clawdbot status` provider details; keep `status --all` redacted (hash+length).
-
-## 2026.1.10-3
-
-### Fixes
-- CLI/Status: add troubleshooting link footer to `clawdbot status --all` output.
-
-## 2026.1.10-2
-
-### Fixes
-- CLI/Status: provider table uses `SETUP` for missing credentials (not `WARN`); richer per-provider detail (token sources, missing keys).
-
-## 2026.1.10-1
-
-### Fixes
-- CLI/Status: expand tables to full terminal width; improve update + daemon summary lines; keep `status --all` gateway log tail pasteable.
-- WhatsApp: detect @lid mentions in groups using authDir reverse mapping + resolve self JID E.164 for mention gating. (#692) — thanks @peschee.
+- Doctor: surface plugin diagnostics in the report.
+- CLI/Update: preserve base environment when passing overrides to update subprocesses. (#713) — thanks @danielz1z.
+- Agents: treat message tool errors as failures so fallback replies still send; require `to` + `message` for `action=send`. (#717) — thanks @theglove44.
+- Agents: route subagent transcripts to the target agent sessions directory and add regression coverage. (#708) — thanks @xMikeMickelson.
+- Agents/Tools: preserve action enums when flattening tool schemas. (#708) — thanks @xMikeMickelson.
 
 ## 2026.1.10
 
-### New Features and Changes
+### Highlights
+- CLI: `clawdbot status` now table-based + shows OS/update/gateway/daemon/agents/sessions; `status --all` adds a full read-only debug report (tables, log tails, Tailscale summary, and scan progress via OSC-9 + spinner).
+- CLI Backends: add Codex CLI fallback with resume support (text output) and JSONL parsing for new runs, plus a live CLI resume probe.
+- CLI: add `clawdbot update` (safe-ish git checkout update) + `--update` shorthand. (#673) — thanks @fm1randa.
+- Gateway: add OpenAI-compatible `/v1/chat/completions` HTTP endpoint (auth, SSE streaming, per-agent routing). (#680).
+
+### Changes
 - Onboarding/Models: add first-class Z.AI (GLM) auth choice (`zai-api-key`) + `--zai-api-key` flag.
+- CLI/Onboarding: add OpenRouter API key auth option in configure/onboard. (#703) — thanks @mteam88.
 - Agents: add human-delay pacing between block replies (modes: off/natural/custom, per-agent configurable). (#446) — thanks @tony-freedomology.
+- Agents/Browser: add `browser.target` (sandbox/host/custom) with sandbox host-control gating via `agents.defaults.sandbox.browser.allowHostControl`, allowlists for custom control URLs/hosts/ports, and expand browser tool docs (remote control, profiles, internals).
 - Onboarding/Models: add catalog-backed default model picker to onboarding + configure. (#611) — thanks @jonasjancarik.
 - Agents/OpenCode Zen: update fallback models + defaults, keep legacy alias mappings. (#669) — thanks @magimetal.
-- Providers: unify group history context wrappers across providers with per-provider/per-account `historyLimit` overrides (fallback to `messages.groupChat.historyLimit`). Set `0` to disable. (#672) — thanks @steipete.
-- CLI: add `clawdbot update` (safe-ish git checkout update) + `--update` shorthand. (#673) — thanks @fm1randa.
-- CLI: improve `clawdbot status` (OS/update/gateway/daemon/agents/sessions) + add `status --all` for full read-only diagnosis with tables, log tails, and scan progress (OSC-9 + spinner).
-- Gateway: add OpenAI-compatible `/v1/chat/completions` HTTP endpoint (auth, SSE streaming, per-agent routing). (#680) — thanks @steipete.
+- CLI: add `clawdbot reset` and `clawdbot uninstall` flows (interactive + non-interactive) plus docker cleanup smoke test.
+- Providers: move provider wiring to a plugin architecture. (#661).
+- Providers: unify group history context wrappers across providers with per-provider/per-account `historyLimit` overrides (fallback to `messages.groupChat.historyLimit`). Set `0` to disable. (#672).
 - Gateway/Heartbeat: optionally deliver heartbeat `Reasoning:` output (`agents.defaults.heartbeat.includeReasoning`). (#690)
 - Docker: allow optional home volume + extra bind mounts in `docker-setup.sh`. (#679) — thanks @gabriel-trigo.
 
 ### Fixes
+- Agents/Pi: raise compaction `reserveTokens` floor to 20k to leave enough headroom for pre-compaction “memory write” turns.
+- Auto-reply: suppress draft/typing streaming for `NO_REPLY` (silent system ops) so it doesn’t leak partial output.
+- CLI/Status: expand tables to full terminal width; clarify provider setup vs runtime warnings; richer per-provider detail; token previews in `status` while keeping `status --all` redacted; add troubleshooting link footer; keep log tails pasteable; show gateway auth used when reachable; surface provider runtime errors (Signal/iMessage/Slack); harden `tailscale status --json` parsing; make `status --all` scan progress determinate; and replace the footer with a 3-line “Next steps” recommendation (share/debug/probe).
+- CLI/Gateway: clarify that `clawdbot gateway status` reports RPC health (connect + RPC) and shows RPC failures separately from connect failures.
+- CLI/Update: gate progress spinner on stdout TTY and align clean-check step label. (#701) — thanks @bjesuiter.
+- Telegram: add `/whoami` + `/id` commands to reveal sender id for allowlists; allow `@username` and prefixed ids in `allowFrom` prompts (with stability warning).
+- Control UI: stop auto-writing `telegram.groups["*"]` and warn/confirm before enabling wildcard groups.
+- WhatsApp: send ack reactions only for handled messages and ignore legacy `messages.ackReaction` (doctor copies to `whatsapp.ackReaction`). (#629) — thanks @pasogott.
+- Sandbox/Skills: mirror skills into sandbox workspaces for read-only mounts so SKILL.md stays accessible.
+- Terminal/Table: ANSI-safe wrapping to prevent table clipping/color loss; add regression coverage.
+- Docker: allow optional apt packages during image build and document the build arg. (#697) — thanks @gabriel-trigo.
+- Gateway/Heartbeat: deliver reasoning even when the main heartbeat reply is `HEARTBEAT_OK`. (#694) — thanks @antons.
+- macOS: clear unsigned launchd overrides on signed restarts and warn via doctor when attach-only/disable markers are set. (#695) — thanks @jeffersonwarrior.
+- Agents: enforce single-writer session locks and drop orphan tool results to prevent tool-call ID failures (MiniMax/Anthropic-compatible APIs).
+- Docs: make `clawdbot status` the first diagnostic step, clarify `status --deep` behavior, and document `/whoami` + `/id`.
+- Docs/Testing: clarify live tool+image probes and how to list your testable `provider/model` ids.
+- Tests/Live: make gateway bash+read probes resilient to provider formatting while still validating real tool calls.
+- WhatsApp: detect @lid mentions in groups using authDir reverse mapping + resolve self JID E.164 for mention gating. (#692) — thanks @peschee.
+- Gateway/Auth: default to token auth on loopback during onboarding, add doctor token generation flow, and tighten audio transcription config to Whisper-only.
 - Providers: dedupe inbound messages across providers to avoid duplicate LLM runs on redeliveries/reconnects. (#689) — thanks @adam91holt.
 - Agents: strip `<thought>`/`<antthinking>` tags from hidden reasoning output and cover tag variants in tests. (#688) — thanks @theglove44.
 - macOS: save model picker selections as normalized provider/model IDs and keep manual entries aligned. (#683) — thanks @benithors.
 - Agents: recognize "usage limit" errors as rate limits for failover. (#687) — thanks @evalexpr.
 - CLI: avoid success message when daemon restart is skipped. (#685) — thanks @carlulsoe.
+- Commands: disable `/config` + `/debug` by default; gate via `commands.config`/`commands.debug` and hide from native registration/help output.
+- Agents/System: clarify that sub-agents remain sandboxed and cannot use elevated host access.
 - Gateway: disable the OpenAI-compatible `/v1/chat/completions` endpoint by default; enable via `gateway.http.endpoints.chatCompletions.enabled=true`.
 - macOS: stabilize bridge tunnels, guard invoke senders on disconnect, and drain stdout/stderr to avoid deadlocks. (#676) — thanks @ngutman.
 - Agents/System: clarify sandboxed runtime in system prompt and surface elevated availability when sandboxed.
@@ -64,7 +75,7 @@
 - WhatsApp: fix group reactions by preserving message IDs and sender JIDs in history; normalize participant phone numbers to JIDs in outbound reactions. (#640) — thanks @mcinteerj.
 - WhatsApp: expose group participant IDs to the model so reactions can target the right sender.
 - Cron: `wakeMode: "now"` waits for heartbeat completion (and retries when the main lane is busy). (#666) — thanks @roshanasingh4.
-- Agents/OpenAI: fix Responses tool-only → follow-up turn handling (avoid standalone `reasoning` items that trigger 400 “required following item”).
+- Agents/OpenAI: fix Responses tool-only → follow-up turn handling (avoid standalone `reasoning` items that trigger 400 “required following item”) and replay reasoning items in Responses/Codex Responses history for tool-call-only turns.
 - Sandbox: add `clawdbot sandbox explain` (effective policy inspector + fix-it keys); improve “sandbox jail” tool-policy/elevated errors with actionable config key paths; link to docs.
 - Hooks/Gmail: keep Tailscale serve path at `/` while preserving the public path. (#668) — thanks @antons.
 - Hooks/Gmail: allow Tailscale target URLs to preserve internal serve paths.
@@ -87,6 +98,7 @@
 - Models/Auth: allow MiniMax API configs without `models.providers.minimax.apiKey` (auth profiles / `MINIMAX_API_KEY`). (#656) — thanks @mneves75.
 - Agents: avoid duplicate replies when the message tool sends. (#659) — thanks @mickahouan.
 - Agents: harden Cloud Code Assist tool ID sanitization (toolUse/toolCall/toolResult) and scrub extra JSON Schema constraints. (#665) — thanks @sebslight.
+- Agents: sanitize tool results + Cloud Code Assist tool IDs at context-build time (prevents mid-run strict-provider request rejects).
 - Agents/Tools: resolve workspace-relative Read/Write/Edit paths; align bash default cwd. (#642) — thanks @mukhtharcm.
 - Discord: include forwarded message snapshots in agent session context. (#667) — thanks @rubyrunsstuff.
 - Telegram: add `telegram.draftChunk` to tune draft streaming chunking for `streamMode: "block"`. (#667) — thanks @rubyrunsstuff.
@@ -98,6 +110,8 @@
 - Docs: showcase entries for ParentPay, R2 Upload, iOS TestFlight, and Oura Health. (#650) — thanks @henrino3.
 - Agents: repair session transcripts by dropping duplicate tool results across the whole history (unblocks Anthropic-compatible APIs after retries).
 - Tests/Live: reset the gateway session between model runs to avoid cross-provider transcript incompatibilities (notably OpenAI Responses reasoning replay rules).
+
+
 ## 2026.1.9
 
 ### Highlights

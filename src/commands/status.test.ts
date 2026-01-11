@@ -31,12 +31,95 @@ const mocks = vi.hoisted(() => ({
     presence: null,
     configSnapshot: null,
   }),
+  callGateway: vi.fn().mockResolvedValue({}),
 }));
 
 vi.mock("../config/sessions.js", () => ({
   loadSessionStore: mocks.loadSessionStore,
   resolveMainSessionKey: mocks.resolveMainSessionKey,
   resolveStorePath: mocks.resolveStorePath,
+}));
+vi.mock("../providers/plugins/index.js", () => ({
+  listProviderPlugins: () =>
+    [
+      {
+        id: "whatsapp",
+        meta: {
+          id: "whatsapp",
+          label: "WhatsApp",
+          selectionLabel: "WhatsApp",
+          docsPath: "/platforms/whatsapp",
+          blurb: "mock",
+        },
+        config: {
+          listAccountIds: () => ["default"],
+          resolveAccount: () => ({}),
+        },
+        status: {
+          buildProviderSummary: async () => ({ linked: true, authAgeMs: 5000 }),
+        },
+      },
+      {
+        id: "signal",
+        meta: {
+          id: "signal",
+          label: "Signal",
+          selectionLabel: "Signal",
+          docsPath: "/platforms/signal",
+          blurb: "mock",
+        },
+        config: {
+          listAccountIds: () => ["default"],
+          resolveAccount: () => ({}),
+        },
+        status: {
+          collectStatusIssues: (accounts: Array<Record<string, unknown>>) =>
+            accounts
+              .filter(
+                (account) =>
+                  typeof account.lastError === "string" && account.lastError,
+              )
+              .map((account) => ({
+                provider: "signal",
+                accountId:
+                  typeof account.accountId === "string"
+                    ? account.accountId
+                    : "default",
+                message: `Provider error: ${String(account.lastError)}`,
+              })),
+        },
+      },
+      {
+        id: "imessage",
+        meta: {
+          id: "imessage",
+          label: "iMessage",
+          selectionLabel: "iMessage",
+          docsPath: "/platforms/mac",
+          blurb: "mock",
+        },
+        config: {
+          listAccountIds: () => ["default"],
+          resolveAccount: () => ({}),
+        },
+        status: {
+          collectStatusIssues: (accounts: Array<Record<string, unknown>>) =>
+            accounts
+              .filter(
+                (account) =>
+                  typeof account.lastError === "string" && account.lastError,
+              )
+              .map((account) => ({
+                provider: "imessage",
+                accountId:
+                  typeof account.accountId === "string"
+                    ? account.accountId
+                    : "default",
+                message: `Provider error: ${String(account.lastError)}`,
+              })),
+        },
+      },
+    ] as unknown,
 }));
 vi.mock("../web/session.js", () => ({
   webAuthExists: mocks.webAuthExists,
@@ -47,6 +130,10 @@ vi.mock("../web/session.js", () => ({
 vi.mock("../gateway/probe.js", () => ({
   probeGateway: mocks.probeGateway,
 }));
+vi.mock("../gateway/call.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../gateway/call.js")>();
+  return { ...actual, callGateway: mocks.callGateway };
+});
 vi.mock("../gateway/session-utils.js", () => ({
   listAgentsForGateway: () => ({
     defaultId: "main",
@@ -123,7 +210,7 @@ describe("statusCommand", () => {
   it("prints JSON when requested", async () => {
     await statusCommand({ json: true }, runtime as never);
     const payload = JSON.parse((runtime.log as vi.Mock).mock.calls[0][0]);
-    expect(payload.web.linked).toBe(true);
+    expect(payload.linkProvider.linked).toBe(true);
     expect(payload.sessions.count).toBe(1);
     expect(payload.sessions.path).toBe("/tmp/sessions.json");
     expect(payload.sessions.defaults.model).toBeTruthy();
@@ -142,12 +229,83 @@ describe("statusCommand", () => {
     expect(logs.some((l) => l.includes("Dashboard"))).toBe(true);
     expect(logs.some((l) => l.includes("macos 14.0 (arm64)"))).toBe(true);
     expect(logs.some((l) => l.includes("Providers"))).toBe(true);
-    expect(logs.some((l) => l.includes("Telegram"))).toBe(true);
+    expect(logs.some((l) => l.includes("WhatsApp"))).toBe(true);
     expect(logs.some((l) => l.includes("Sessions"))).toBe(true);
     expect(logs.some((l) => l.includes("+1000"))).toBe(true);
     expect(logs.some((l) => l.includes("50%"))).toBe(true);
     expect(logs.some((l) => l.includes("LaunchAgent"))).toBe(true);
     expect(logs.some((l) => l.includes("FAQ:"))).toBe(true);
     expect(logs.some((l) => l.includes("Troubleshooting:"))).toBe(true);
+    expect(logs.some((l) => l.includes("Next steps:"))).toBe(true);
+    expect(logs.some((l) => l.includes("clawdbot status --all"))).toBe(true);
+  });
+
+  it("shows gateway auth when reachable", async () => {
+    const prevToken = process.env.CLAWDBOT_GATEWAY_TOKEN;
+    process.env.CLAWDBOT_GATEWAY_TOKEN = "abcd1234";
+    try {
+      mocks.probeGateway.mockResolvedValueOnce({
+        ok: true,
+        url: "ws://127.0.0.1:18789",
+        connectLatencyMs: 123,
+        error: null,
+        close: null,
+        health: {},
+        status: {},
+        presence: [],
+        configSnapshot: null,
+      });
+      (runtime.log as vi.Mock).mockClear();
+      await statusCommand({}, runtime as never);
+      const logs = (runtime.log as vi.Mock).mock.calls.map((c) => String(c[0]));
+      expect(logs.some((l) => l.includes("auth token"))).toBe(true);
+    } finally {
+      if (prevToken === undefined) delete process.env.CLAWDBOT_GATEWAY_TOKEN;
+      else process.env.CLAWDBOT_GATEWAY_TOKEN = prevToken;
+    }
+  });
+
+  it("surfaces provider runtime errors from the gateway", async () => {
+    mocks.probeGateway.mockResolvedValueOnce({
+      ok: true,
+      url: "ws://127.0.0.1:18789",
+      connectLatencyMs: 10,
+      error: null,
+      close: null,
+      health: {},
+      status: {},
+      presence: [],
+      configSnapshot: null,
+    });
+    mocks.callGateway.mockResolvedValueOnce({
+      providerAccounts: {
+        signal: [
+          {
+            accountId: "default",
+            enabled: true,
+            configured: true,
+            running: false,
+            lastError: "signal-cli unreachable",
+          },
+        ],
+        imessage: [
+          {
+            accountId: "default",
+            enabled: true,
+            configured: true,
+            running: false,
+            lastError: "imessage permission denied",
+          },
+        ],
+      },
+    });
+
+    (runtime.log as vi.Mock).mockClear();
+    await statusCommand({}, runtime as never);
+    const logs = (runtime.log as vi.Mock).mock.calls.map((c) => String(c[0]));
+    expect(logs.join("\n")).toMatch(/Signal/i);
+    expect(logs.join("\n")).toMatch(/iMessage/i);
+    expect(logs.join("\n")).toMatch(/gateway:/i);
+    expect(logs.join("\n")).toMatch(/WARN/);
   });
 });

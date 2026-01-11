@@ -60,10 +60,16 @@ export async function loadProviders(state: ConnectionsState, probe: boolean) {
     })) as ProvidersStatusSnapshot;
     state.providersSnapshot = res;
     state.providersLastSuccess = Date.now();
-    state.telegramTokenLocked = res.telegram.tokenSource === "env";
-    state.discordTokenLocked = res.discord?.tokenSource === "env";
-    state.slackTokenLocked = res.slack?.botTokenSource === "env";
-    state.slackAppTokenLocked = res.slack?.appTokenSource === "env";
+    const providers = res.providers as Record<string, unknown>;
+    const telegram = providers.telegram as { tokenSource?: string | null };
+    const discord = providers.discord as { tokenSource?: string | null } | null;
+    const slack = providers.slack as
+      | { botTokenSource?: string | null; appTokenSource?: string | null }
+      | null;
+    state.telegramTokenLocked = telegram?.tokenSource === "env";
+    state.discordTokenLocked = discord?.tokenSource === "env";
+    state.slackTokenLocked = slack?.botTokenSource === "env";
+    state.slackAppTokenLocked = slack?.appTokenSource === "env";
   } catch (err) {
     state.providersError = String(err);
   } finally {
@@ -113,7 +119,7 @@ export async function logoutWhatsApp(state: ConnectionsState) {
   if (!state.client || !state.connected || state.whatsappBusy) return;
   state.whatsappBusy = true;
   try {
-    await state.client.request("web.logout", {});
+    await state.client.request("providers.logout", { provider: "whatsapp" });
     state.whatsappLoginMessage = "Logged out.";
     state.whatsappLoginQrDataUrl = null;
     state.whatsappLoginConnected = null;
@@ -181,6 +187,15 @@ export async function saveTelegramConfig(state: ConnectionsState) {
   state.telegramSaving = true;
   state.telegramConfigStatus = null;
   try {
+    if (state.telegramForm.groupsWildcardEnabled) {
+      const confirmed = window.confirm(
+        'Telegram groups wildcard "*" allows all groups. Continue?',
+      );
+      if (!confirmed) {
+        state.telegramConfigStatus = "Save cancelled.";
+        return;
+      }
+    }
     const base = state.configSnapshot?.config ?? {};
     const config = { ...base } as Record<string, unknown>;
     const telegram = { ...(config.telegram ?? {}) } as Record<string, unknown>;
@@ -196,16 +211,22 @@ export async function saveTelegramConfig(state: ConnectionsState) {
             unknown
           >)
         : {};
-    const defaultGroup =
-      groups["*"] && typeof groups["*"] === "object"
-        ? ({ ...(groups["*"] as Record<string, unknown>) } as Record<
-            string,
-            unknown
-          >)
-        : {};
-    defaultGroup.requireMention = state.telegramForm.requireMention;
-    groups["*"] = defaultGroup;
-    telegram.groups = groups;
+    if (state.telegramForm.groupsWildcardEnabled) {
+      const defaultGroup =
+        groups["*"] && typeof groups["*"] === "object"
+          ? ({ ...(groups["*"] as Record<string, unknown>) } as Record<
+              string,
+              unknown
+            >)
+          : {};
+      defaultGroup.requireMention = state.telegramForm.requireMention;
+      groups["*"] = defaultGroup;
+      telegram.groups = groups;
+    } else if (groups["*"]) {
+      delete groups["*"];
+      if (Object.keys(groups).length > 0) telegram.groups = groups;
+      else delete telegram.groups;
+    }
     delete telegram.requireMention;
     const allowFrom = parseList(state.telegramForm.allowFrom);
     if (allowFrom.length > 0) telegram.allowFrom = allowFrom;

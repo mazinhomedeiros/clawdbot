@@ -173,6 +173,22 @@ extension OnboardingView {
                 .shadow(color: .black.opacity(0.06), radius: 8, y: 3))
     }
 
+    func onboardingGlassCard(
+        spacing: CGFloat = 12,
+        padding: CGFloat = 16,
+        @ViewBuilder _ content: () -> some View) -> some View
+    {
+        let shape = RoundedRectangle(cornerRadius: 16, style: .continuous)
+        return VStack(alignment: .leading, spacing: spacing) {
+            content()
+        }
+        .padding(padding)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color.clear)
+        .clipShape(shape)
+        .overlay(shape.strokeBorder(Color.white.opacity(0.10), lineWidth: 1))
+    }
+
     func featureRow(title: String, subtitle: String, systemImage: String) -> some View {
         HStack(alignment: .top, spacing: 12) {
             Image(systemName: systemImage)

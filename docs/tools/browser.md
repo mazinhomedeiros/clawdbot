@@ -157,8 +157,8 @@ All endpoints accept `?profile=<name>`.
 ### Playwright requirement
 
 Some features (navigate/act/ai snapshot, element screenshots, PDF) require
-Playwright. In embedded gateway builds, Playwright may be unavailable; those
-endpoints return a clear 501 error. ARIA snapshots and basic screenshots still work.
+Playwright. If Playwright isn’t installed, those endpoints return a clear 501
+error. ARIA snapshots and basic screenshots still work.
 
 ## How it works (internal)
 
@@ -244,5 +244,7 @@ How it maps:
   - `controlUrl` sets `target: "custom"` implicitly (remote control server).
   - In sandboxed sessions, `target: "host"` requires `agents.defaults.sandbox.browser.allowHostControl=true`.
   - If `target` is omitted: sandboxed sessions default to `sandbox`, non-sandbox sessions default to `host`.
+  - Sandbox allowlists can restrict `target: "custom"` to specific URLs/hosts/ports.
+  - Defaults: allowlists unset (no restriction), and sandbox host control is disabled.
 
 This keeps the agent deterministic and avoids brittle selectors.

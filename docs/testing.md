@@ -122,6 +122,11 @@ Live tests are split into two layers so we can isolate failures:
     - a real tool invocation works (read probe)
     - optional extra tool probes (bash+read probe)
     - OpenAI regression paths (tool-call-only → follow-up) keep working
+- Probe details (so you can explain failures quickly):
+  - `read` probe: the test writes a nonce file in the workspace and asks the agent to `read` it and echo the nonce back.
+  - `bash+read` probe: the test asks the agent to `bash`-write a nonce into a temp file, then `read` it back.
+  - image probe: the test attaches a generated PNG (cat + randomized code) and expects the model to return `cat <CODE>`.
+  - Implementation reference: `src/gateway/gateway-models.profiles.live.test.ts` and `src/gateway/live-image-probe.ts`.
 - How to enable:
   - `CLAWDBOT_LIVE_TEST=1` or `LIVE=1`
   - `CLAWDBOT_LIVE_GATEWAY=1` (required for this test to run)
@@ -133,7 +138,7 @@ Live tests are split into two layers so we can isolate failures:
 - Optional tool-calling stress:
   - `CLAWDBOT_LIVE_GATEWAY_TOOL_PROBE=1` enables an extra “bash writes file → read reads it back → echo nonce” check.
   - This is specifically meant to catch tool-calling compatibility issues across providers (formatting, history replay, tool_result pairing, etc.).
-  - Optional image send smoke:
+- Optional image send smoke:
   - `CLAWDBOT_LIVE_GATEWAY_IMAGE_PROBE=1` sends a real image attachment through the gateway agent pipeline (multimodal message) and asserts the model can read back a per-run code from the image.
   - Flow (high level):
     - Test generates a tiny PNG with “CAT” + random code (`src/gateway/live-image-probe.ts`)
@@ -141,6 +146,13 @@ Live tests are split into two layers so we can isolate failures:
     - Gateway parses attachments into `images[]` (`src/gateway/server-methods/agent.ts` + `src/gateway/chat-attachments.ts`)
     - Embedded agent forwards a multimodal user message to the model
     - Assertion: reply contains `cat` + the code (OCR tolerance: minor mistakes allowed)
+
+Tip: to see what you can test on your machine (and the exact `provider/model` ids), run:
+
+```bash
+pnpm clawdbot models list
+pnpm clawdbot models list --json
+```
 
 ## Live: Anthropic setup-token smoke
 
@@ -162,6 +174,37 @@ clawdbot models auth paste-token --provider anthropic --profile-id anthropic:set
 CLAWDBOT_LIVE_TEST=1 CLAWDBOT_LIVE_SETUP_TOKEN=1 CLAWDBOT_LIVE_SETUP_TOKEN_PROFILE=anthropic:setup-token-test pnpm test:live src/agents/anthropic.setup-token.live.test.ts
 ```
 
+## Live: CLI backend smoke (Claude CLI or other local CLIs)
+
+- Test: `src/gateway/gateway-cli-backend.live.test.ts`
+- Goal: validate the Gateway + agent pipeline using a local CLI backend, without touching your default config.
+- Enable:
+  - `CLAWDBOT_LIVE_TEST=1` or `LIVE=1`
+  - `CLAWDBOT_LIVE_CLI_BACKEND=1`
+- Defaults:
+  - Model: `claude-cli/claude-sonnet-4-5`
+  - Command: `claude`
+  - Args: `["-p","--output-format","json","--dangerously-skip-permissions"]`
+- Overrides (optional):
+  - `CLAWDBOT_LIVE_CLI_BACKEND_MODEL="claude-cli/claude-opus-4-5"`
+  - `CLAWDBOT_LIVE_CLI_BACKEND_MODEL="codex-cli/gpt-5.2-codex"`
+  - `CLAWDBOT_LIVE_CLI_BACKEND_COMMAND="/full/path/to/claude"`
+  - `CLAWDBOT_LIVE_CLI_BACKEND_ARGS='["-p","--output-format","json","--permission-mode","bypassPermissions"]'`
+  - `CLAWDBOT_LIVE_CLI_BACKEND_CLEAR_ENV='["ANTHROPIC_API_KEY","ANTHROPIC_API_KEY_OLD"]'`
+  - `CLAWDBOT_LIVE_CLI_BACKEND_IMAGE_PROBE=1` to send a real image attachment (paths are injected into the prompt).
+  - `CLAWDBOT_LIVE_CLI_BACKEND_IMAGE_ARG="--image"` to pass image file paths as CLI args instead of prompt injection.
+  - `CLAWDBOT_LIVE_CLI_BACKEND_IMAGE_MODE="repeat"` (or `"list"`) to control how image args are passed when `IMAGE_ARG` is set.
+  - `CLAWDBOT_LIVE_CLI_BACKEND_RESUME_PROBE=1` to send a second turn and validate resume flow.
+  - `CLAWDBOT_LIVE_CLI_BACKEND_DISABLE_MCP_CONFIG=0` to keep Claude CLI MCP config enabled (default disables MCP config with a temporary empty file).
+
+Example:
+
+```bash
+CLAWDBOT_LIVE_TEST=1 CLAWDBOT_LIVE_CLI_BACKEND=1 \
+  CLAWDBOT_LIVE_CLI_BACKEND_MODEL="claude-cli/claude-sonnet-4-5" \
+  pnpm test:live src/gateway/gateway-cli-backend.live.test.ts
+```
+
 ### Recommended live recipes
 
 Narrow, explicit allowlists are fastest and least flaky:
@@ -173,16 +216,19 @@ Narrow, explicit allowlists are fastest and least flaky:
   - `LIVE=1 CLAWDBOT_LIVE_GATEWAY=1 CLAWDBOT_LIVE_GATEWAY_ALL_MODELS=1 CLAWDBOT_LIVE_GATEWAY_MODELS="openai/gpt-5.2" pnpm test:live src/gateway/gateway-models.profiles.live.test.ts`
 
 - Tool calling across several providers (bash + read probe):
-  - `LIVE=1 CLAWDBOT_LIVE_GATEWAY=1 CLAWDBOT_LIVE_GATEWAY_ALL_MODELS=1 CLAWDBOT_LIVE_GATEWAY_TOOL_PROBE=1 CLAWDBOT_LIVE_GATEWAY_MODELS="openai/gpt-5.2,anthropic/claude-opus-4-5,google/gemini-3-flash-preview,zai/glm-4.7,minimax/minimax-m2.1" pnpm test:live src/gateway/gateway-models.profiles.live.test.ts`
+  - `LIVE=1 CLAWDBOT_LIVE_GATEWAY=1 CLAWDBOT_LIVE_GATEWAY_ALL_MODELS=1 CLAWDBOT_LIVE_GATEWAY_TOOL_PROBE=1 CLAWDBOT_LIVE_GATEWAY_MODELS="openai/gpt-5.2,anthropic/claude-opus-4-5,google/gemini-3-flash,zai/glm-4.7,minimax/minimax-m2.1" pnpm test:live src/gateway/gateway-models.profiles.live.test.ts`
 
 - Google focus (Gemini API key + Antigravity):
-  - Gemini (API key): `LIVE=1 CLAWDBOT_LIVE_GATEWAY=1 CLAWDBOT_LIVE_GATEWAY_ALL_MODELS=1 CLAWDBOT_LIVE_GATEWAY_TOOL_PROBE=1 CLAWDBOT_LIVE_GATEWAY_IMAGE_PROBE=1 CLAWDBOT_LIVE_GATEWAY_MODELS="google/gemini-3-flash-preview" pnpm test:live src/gateway/gateway-models.profiles.live.test.ts`
+  - Gemini (API key): `LIVE=1 CLAWDBOT_LIVE_GATEWAY=1 CLAWDBOT_LIVE_GATEWAY_ALL_MODELS=1 CLAWDBOT_LIVE_GATEWAY_TOOL_PROBE=1 CLAWDBOT_LIVE_GATEWAY_IMAGE_PROBE=1 CLAWDBOT_LIVE_GATEWAY_MODELS="google/gemini-3-flash" pnpm test:live src/gateway/gateway-models.profiles.live.test.ts`
   - Antigravity (OAuth): `LIVE=1 CLAWDBOT_LIVE_GATEWAY=1 CLAWDBOT_LIVE_GATEWAY_ALL_MODELS=1 CLAWDBOT_LIVE_GATEWAY_TOOL_PROBE=1 CLAWDBOT_LIVE_GATEWAY_IMAGE_PROBE=1 CLAWDBOT_LIVE_GATEWAY_MODELS="google-antigravity/claude-opus-4-5-thinking,google-antigravity/gemini-3-pro-high" pnpm test:live src/gateway/gateway-models.profiles.live.test.ts`
 
 Notes:
 - `google/...` uses the Gemini API (API key).
 - `google-antigravity/...` uses the Antigravity OAuth bridge (Cloud Code Assist-style agent endpoint).
 - `google-gemini-cli/...` uses the local Gemini CLI on your machine (separate auth + tooling quirks).
+- Gemini API vs Gemini CLI:
+  - API: Clawdbot calls Google’s hosted Gemini API over HTTP (API key / profile auth); this is what most users mean by “Gemini”.
+  - CLI: Clawdbot shells out to a local `gemini` binary; it has its own auth and can behave differently (streaming/tool support/version skew).
 
 ## Live: model matrix (what we cover)
 
@@ -194,20 +240,20 @@ This is the “common models” run we expect to keep working:
 - OpenAI (non-Codex): `openai/gpt-5.2` (optional: `openai/gpt-5.1`)
 - OpenAI Codex: `openai-codex/gpt-5.2` (optional: `openai-codex/gpt-5.2-codex`)
 - Anthropic: `anthropic/claude-opus-4-5` (or `anthropic/claude-sonnet-4-5`)
-- Google (Gemini API): `google/gemini-3-pro-preview` and `google/gemini-3-flash-preview`
+- Google (Gemini API): `google/gemini-3-pro` and `google/gemini-3-flash` (avoid older Gemini 2.x models)
 - Google (Antigravity): `google-antigravity/claude-opus-4-5-thinking` and `google-antigravity/gemini-3-flash`
 - Z.AI (GLM): `zai/glm-4.7`
 - MiniMax: `minimax/minimax-m2.1`
 
 Run gateway smoke with tools + image:
-`LIVE=1 CLAWDBOT_LIVE_GATEWAY=1 CLAWDBOT_LIVE_GATEWAY_TOOL_PROBE=1 CLAWDBOT_LIVE_GATEWAY_IMAGE_PROBE=1 CLAWDBOT_LIVE_GATEWAY_MODELS="openai/gpt-5.2,openai-codex/gpt-5.2,anthropic/claude-opus-4-5,google/gemini-3-pro-preview,google/gemini-3-flash-preview,google-antigravity/claude-opus-4-5-thinking,google-antigravity/gemini-3-flash,zai/glm-4.7,minimax/minimax-m2.1" pnpm test:live src/gateway/gateway-models.profiles.live.test.ts`
+`LIVE=1 CLAWDBOT_LIVE_GATEWAY=1 CLAWDBOT_LIVE_GATEWAY_TOOL_PROBE=1 CLAWDBOT_LIVE_GATEWAY_IMAGE_PROBE=1 CLAWDBOT_LIVE_GATEWAY_MODELS="openai/gpt-5.2,openai-codex/gpt-5.2,anthropic/claude-opus-4-5,google/gemini-3-pro,google/gemini-3-flash,google-antigravity/claude-opus-4-5-thinking,google-antigravity/gemini-3-flash,zai/glm-4.7,minimax/minimax-m2.1" pnpm test:live src/gateway/gateway-models.profiles.live.test.ts`
 
 ### Baseline: tool calling (Read + optional Bash)
 
 Pick at least one per provider family:
 - OpenAI: `openai/gpt-5.2` (or `openai/gpt-5-mini`)
 - Anthropic: `anthropic/claude-opus-4-5` (or `anthropic/claude-sonnet-4-5`)
-- Google: `google/gemini-3-flash-preview` (or `google/gemini-3-pro-preview`)
+- Google: `google/gemini-3-flash` (or `google/gemini-3-pro`)
 - Z.AI (GLM): `zai/glm-4.7`
 - MiniMax: `minimax/minimax-m2.1`
 
@@ -225,7 +271,11 @@ Run with `CLAWDBOT_LIVE_GATEWAY_IMAGE_PROBE=1` and include at least one image-ca
 
 If you have keys enabled, we also support testing via:
 - OpenRouter: `openrouter/...` (hundreds of models; use `clawdbot models scan` to find tool+image capable candidates)
-- OpenCode Zen: `opencode-zen/...` (requires `OPENCODE_ZEN_API_KEY`)
+- OpenCode Zen: `opencode/...` (auth via `OPENCODE_API_KEY` / `OPENCODE_ZEN_API_KEY`)
+
+More providers you can include in the live matrix (if you have creds/config):
+- Built-in: `openai`, `openai-codex`, `anthropic`, `google`, `google-vertex`, `google-antigravity`, `google-gemini-cli`, `zai`, `openrouter`, `opencode`, `xai`, `groq`, `cerebras`, `mistral`, `github-copilot`
+- Via `models.providers` (custom endpoints): `minimax` (cloud/API), plus any OpenAI/Anthropic-compatible proxy (LM Studio, vLLM, LiteLLM, etc.)
 
 Tip: don’t try to hardcode “all models” in docs. The authoritative list is whatever `discoverModels(...)` returns on your machine + whatever keys are available.
 
@@ -248,6 +298,7 @@ These run `pnpm test:live` inside the repo Docker image, mounting your local con
 - Gateway + dev agent: `pnpm test:docker:live-gateway` (script: `scripts/test-live-gateway-models-docker.sh`)
 - Onboarding wizard (TTY, full scaffolding): `pnpm test:docker:onboard` (script: `scripts/e2e/onboard-docker.sh`)
 - Gateway networking (two containers, WS auth + health): `pnpm test:docker:gateway-network` (script: `scripts/e2e/gateway-network-docker.sh`)
+- Plugins (custom extension load + registry smoke): `pnpm test:docker:plugins` (script: `scripts/e2e/plugins-docker.sh`)
 
 Useful env vars:
 

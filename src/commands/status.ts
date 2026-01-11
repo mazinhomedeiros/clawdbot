@@ -10,7 +10,11 @@ import {
 } from "../agents/defaults.js";
 import { resolveConfiguredModelRef } from "../agents/model-selection.js";
 import { withProgress } from "../cli/progress.js";
-import { loadConfig, resolveGatewayPort } from "../config/config.js";
+import {
+  type ClawdbotConfig,
+  loadConfig,
+  resolveGatewayPort,
+} from "../config/config.js";
 import {
   loadSessionStore,
   resolveMainSessionKey,
@@ -19,6 +23,7 @@ import {
 } from "../config/sessions.js";
 import { resolveGatewayService } from "../daemon/service.js";
 import { buildGatewayConnectionDetails, callGateway } from "../gateway/call.js";
+import { normalizeControlUiBasePath } from "../gateway/control-ui.js";
 import { probeGateway } from "../gateway/probe.js";
 import { listAgentsForGateway } from "../gateway/session-utils.js";
 import { info } from "../globals.js";
@@ -29,21 +34,30 @@ import {
   formatUsageReportLines,
   loadProviderUsageSummary,
 } from "../infra/provider-usage.js";
+import { collectProvidersStatusIssues } from "../infra/providers-status-issues.js";
 import { peekSystemEvents } from "../infra/system-events.js";
+import { getTailnetHostname } from "../infra/tailscale.js";
 import {
   checkUpdateStatus,
   compareSemverStrings,
   type UpdateCheckResult,
 } from "../infra/update-check.js";
+import { runExec } from "../process/exec.js";
+import { resolveProviderDefaultAccountId } from "../providers/plugins/helpers.js";
+import { listProviderPlugins } from "../providers/plugins/index.js";
+import type {
+  ProviderAccountSnapshot,
+  ProviderId,
+  ProviderPlugin,
+} from "../providers/plugins/types.js";
 import type { RuntimeEnv } from "../runtime.js";
 import { renderTable } from "../terminal/table.js";
 import { theme } from "../terminal/theme.js";
 import { VERSION } from "../version.js";
-import { resolveWhatsAppAccount } from "../web/accounts.js";
 import { resolveHeartbeatSeconds } from "../web/reconnect.js";
-import { getWebAuthAgeMs, webAuthExists } from "../web/session.js";
-import type { HealthSummary } from "./health.js";
+import { formatHealthProviderLines, type HealthSummary } from "./health.js";
 import { resolveControlUiLinks } from "./onboard-helpers.js";
+import { formatGatewayAuthUsed } from "./status-all/format.js";
 import { buildProvidersTable } from "./status-all/providers.js";
 import { statusAllCommand } from "./status-all.js";
 
@@ -70,7 +84,12 @@ export type SessionStatus = {
 };
 
 export type StatusSummary = {
-  web: { linked: boolean; authAgeMs: number | null };
+  linkProvider?: {
+    id: ProviderId;
+    label: string;
+    linked: boolean;
+    authAgeMs: number | null;
+  };
   heartbeatSeconds: number;
   providerSummary: string[];
   queuedSystemEvents: string[];
@@ -82,11 +101,64 @@ export type StatusSummary = {
   };
 };
 
+type LinkProviderContext = {
+  linked: boolean;
+  authAgeMs: number | null;
+  account?: unknown;
+  accountId?: string;
+  plugin: ProviderPlugin;
+};
+
+async function resolveLinkProviderContext(
+  cfg: ClawdbotConfig,
+): Promise<LinkProviderContext | null> {
+  for (const plugin of listProviderPlugins()) {
+    const accountIds = plugin.config.listAccountIds(cfg);
+    const defaultAccountId = resolveProviderDefaultAccountId({
+      plugin,
+      cfg,
+      accountIds,
+    });
+    const account = plugin.config.resolveAccount(cfg, defaultAccountId);
+    const enabled = plugin.config.isEnabled
+      ? plugin.config.isEnabled(account, cfg)
+      : true;
+    const configured = plugin.config.isConfigured
+      ? await plugin.config.isConfigured(account, cfg)
+      : true;
+    const snapshot = plugin.config.describeAccount
+      ? plugin.config.describeAccount(account, cfg)
+      : ({
+          accountId: defaultAccountId,
+          enabled,
+          configured,
+        } as ProviderAccountSnapshot);
+    const summary = plugin.status?.buildProviderSummary
+      ? await plugin.status.buildProviderSummary({
+          account,
+          cfg,
+          defaultAccountId,
+          snapshot,
+        })
+      : undefined;
+    const summaryRecord = summary as Record<string, unknown> | undefined;
+    const linked =
+      summaryRecord && typeof summaryRecord.linked === "boolean"
+        ? summaryRecord.linked
+        : null;
+    if (linked === null) continue;
+    const authAgeMs =
+      summaryRecord && typeof summaryRecord.authAgeMs === "number"
+        ? summaryRecord.authAgeMs
+        : null;
+    return { linked, authAgeMs, account, accountId: defaultAccountId, plugin };
+  }
+  return null;
+}
+
 export async function getStatusSummary(): Promise<StatusSummary> {
   const cfg = loadConfig();
-  const account = resolveWhatsAppAccount({ cfg });
-  const linked = await webAuthExists(account.authDir);
-  const authAgeMs = getWebAuthAgeMs(account.authDir);
+  const linkContext = await resolveLinkProviderContext(cfg);
   const heartbeatSeconds = resolveHeartbeatSeconds(cfg, undefined);
   const providerSummary = await buildProviderSummary(cfg, {
     colorize: true,
@@ -156,7 +228,14 @@ export async function getStatusSummary(): Promise<StatusSummary> {
   const recent = sessions.slice(0, 5);
 
   return {
-    web: { linked, authAgeMs },
+    linkProvider: linkContext
+      ? {
+          id: linkContext.plugin.id,
+          label: linkContext.plugin.meta.label ?? "Provider",
+          linked: linkContext.linked,
+          authAgeMs: linkContext.authAgeMs,
+        }
+      : undefined,
     heartbeatSeconds,
     providerSummary,
     queuedSystemEvents,
@@ -256,7 +335,9 @@ async function getDaemonStatusSummary(): Promise<{
   try {
     const service = resolveGatewayService();
     const [loaded, runtime, command] = await Promise.all([
-      service.isLoaded({ env: process.env }).catch(() => false),
+      service
+        .isLoaded({ profile: process.env.CLAWDBOT_PROFILE })
+        .catch(() => false),
       service.readRuntime(process.env).catch(() => undefined),
       service.readCommand(process.env).catch(() => null),
     ]);
@@ -530,13 +611,27 @@ export async function statusCommand(
   const scan = await withProgress(
     {
       label: "Scanning status…",
-      total: 7,
+      total: 9,
       enabled: opts.json !== true,
     },
     async (progress) => {
       progress.setLabel("Loading config…");
       const cfg = loadConfig();
       const osSummary = resolveOsSummary();
+      progress.tick();
+
+      progress.setLabel("Checking Tailscale…");
+      const tailscaleMode = cfg.gateway?.tailscale?.mode ?? "off";
+      const tailscaleDns =
+        tailscaleMode === "off"
+          ? null
+          : await getTailnetHostname((cmd, args) =>
+              runExec(cmd, args, { timeoutMs: 1200, maxBuffer: 200_000 }),
+            ).catch(() => null);
+      const tailscaleHttpsUrl =
+        tailscaleMode !== "off" && tailscaleDns
+          ? `https://${tailscaleDns}${normalizeControlUiBasePath(cfg.gateway?.controlUi?.basePath)}`
+          : null;
       progress.tick();
 
       progress.setLabel("Checking for updates…");
@@ -577,6 +672,25 @@ export async function statusCommand(
         : null;
       progress.tick();
 
+      progress.setLabel("Querying provider status…");
+      const providersStatus = gatewayReachable
+        ? await callGateway<Record<string, unknown>>({
+            method: "providers.status",
+            params: {
+              probe: false,
+              timeoutMs: Math.min(8000, opts.timeoutMs ?? 10_000),
+            },
+            timeoutMs: Math.min(
+              opts.all ? 5000 : 2500,
+              opts.timeoutMs ?? 10_000,
+            ),
+          }).catch(() => null)
+        : null;
+      const providerIssues = providersStatus
+        ? collectProvidersStatusIssues(providersStatus)
+        : [];
+      progress.tick();
+
       progress.setLabel("Summarizing providers…");
       const providers = await buildProvidersTable(cfg, {
         // Show token previews in regular status; keep `status --all` redacted.
@@ -595,6 +709,9 @@ export async function statusCommand(
       return {
         cfg,
         osSummary,
+        tailscaleMode,
+        tailscaleDns,
+        tailscaleHttpsUrl,
         update,
         gatewayConnection,
         remoteUrlMissing,
@@ -602,6 +719,7 @@ export async function statusCommand(
         gatewayProbe,
         gatewayReachable,
         gatewaySelf,
+        providerIssues,
         agentStatus,
         providers,
         summary,
@@ -612,6 +730,9 @@ export async function statusCommand(
   const {
     cfg,
     osSummary,
+    tailscaleMode,
+    tailscaleDns,
+    tailscaleHttpsUrl,
     update,
     gatewayConnection,
     remoteUrlMissing,
@@ -619,6 +740,7 @@ export async function statusCommand(
     gatewayProbe,
     gatewayReachable,
     gatewaySelf,
+    providerIssues,
     agentStatus,
     providers,
     summary,
@@ -714,6 +836,10 @@ export async function statusCommand(
               ? `unreachable (${gatewayProbe.error})`
               : "unreachable",
           );
+    const auth =
+      gatewayReachable && !remoteUrlMissing
+        ? ` · auth ${formatGatewayAuthUsed(resolveGatewayProbeAuth(cfg))}`
+        : "";
     const self =
       gatewaySelf?.host || gatewaySelf?.version || gatewaySelf?.platform
         ? [
@@ -726,7 +852,7 @@ export async function statusCommand(
             .join(" ")
         : null;
     const suffix = self ? ` · ${self}` : "";
-    return `${gatewayMode} · ${target} · ${reach}${suffix}`;
+    return `${gatewayMode} · ${target} · ${reach}${auth}${suffix}`;
   })();
 
   const agentsValue = (() => {
@@ -763,6 +889,15 @@ export async function statusCommand(
     { Item: "Dashboard", Value: dashboard },
     { Item: "OS", Value: `${osSummary.label} · node ${process.versions.node}` },
     {
+      Item: "Tailscale",
+      Value:
+        tailscaleMode === "off"
+          ? muted("off")
+          : tailscaleDns && tailscaleHttpsUrl
+            ? `${tailscaleMode} · ${tailscaleDns} · ${tailscaleHttpsUrl}`
+            : warn(`${tailscaleMode} · magicdns unknown`),
+    },
+    {
       Item: "Update",
       Value: formatUpdateOneLiner(update).replace(/^Update:\s*/i, ""),
     },
@@ -794,6 +929,16 @@ export async function statusCommand(
 
   runtime.log("");
   runtime.log(theme.heading("Providers"));
+  const providerIssuesByProvider = (() => {
+    const map = new Map<string, typeof providerIssues>();
+    for (const issue of providerIssues) {
+      const key = issue.provider;
+      const list = map.get(key);
+      if (list) list.push(issue);
+      else map.set(key, [issue]);
+    }
+    return map;
+  })();
   runtime.log(
     renderTable({
       width: tableWidth,
@@ -803,19 +948,28 @@ export async function statusCommand(
         { key: "State", header: "State", minWidth: 8 },
         { key: "Detail", header: "Detail", flex: true, minWidth: 24 },
       ],
-      rows: providers.rows.map((row) => ({
-        Provider: row.provider,
-        Enabled: row.enabled ? ok("ON") : muted("OFF"),
-        State:
-          row.state === "ok"
-            ? ok("OK")
-            : row.state === "warn"
-              ? warn("WARN")
-              : row.state === "off"
-                ? muted("OFF")
-                : theme.accentDim("SETUP"),
-        Detail: row.detail,
-      })),
+      rows: providers.rows.map((row) => {
+        const issues = providerIssuesByProvider.get(row.id) ?? [];
+        const effectiveState =
+          row.state === "off" ? "off" : issues.length > 0 ? "warn" : row.state;
+        const issueSuffix =
+          issues.length > 0
+            ? ` · ${warn(`gateway: ${shortenText(issues[0]?.message ?? "issue", 84)}`)}`
+            : "";
+        return {
+          Provider: row.provider,
+          Enabled: row.enabled ? ok("ON") : muted("OFF"),
+          State:
+            effectiveState === "ok"
+              ? ok("OK")
+              : effectiveState === "warn"
+                ? warn("WARN")
+                : effectiveState === "off"
+                  ? muted("OFF")
+                  : theme.accentDim("SETUP"),
+          Detail: `${row.detail}${issueSuffix}`,
+        };
+      }),
     }).trimEnd(),
   );
 
@@ -878,32 +1032,24 @@ export async function statusCommand(
       Status: ok("reachable"),
       Detail: `${health.durationMs}ms`,
     });
-    rows.push({
-      Provider: "Telegram",
-      Status: health.telegram.configured
-        ? health.telegram.probe?.ok
-          ? ok("OK")
-          : warn("WARN")
-        : muted("OFF"),
-      Detail: health.telegram.configured
-        ? health.telegram.probe?.ok
-          ? `@${health.telegram.probe.bot?.username ?? "unknown"} · ${health.telegram.probe.elapsedMs}ms`
-          : (health.telegram.probe?.error ?? "probe failed")
-        : "not configured",
-    });
-    rows.push({
-      Provider: "Discord",
-      Status: health.discord.configured
-        ? health.discord.probe?.ok
-          ? ok("OK")
-          : warn("WARN")
-        : muted("OFF"),
-      Detail: health.discord.configured
-        ? health.discord.probe?.ok
-          ? `@${health.discord.probe.bot?.username ?? "unknown"} · ${health.discord.probe.elapsedMs}ms`
-          : (health.discord.probe?.error ?? "probe failed")
-        : "not configured",
-    });
+
+    for (const line of formatHealthProviderLines(health)) {
+      const colon = line.indexOf(":");
+      if (colon === -1) continue;
+      const provider = line.slice(0, colon).trim();
+      const detail = line.slice(colon + 1).trim();
+      const normalized = detail.toLowerCase();
+      const status = (() => {
+        if (normalized.startsWith("ok")) return ok("OK");
+        if (normalized.startsWith("failed")) return warn("WARN");
+        if (normalized.startsWith("not configured")) return muted("OFF");
+        if (normalized.startsWith("configured")) return ok("OK");
+        if (normalized.startsWith("linked")) return ok("LINKED");
+        if (normalized.startsWith("not linked")) return warn("UNLINKED");
+        return warn("WARN");
+      })();
+      rows.push({ Provider: provider, Status: status, Detail: detail });
+    }
 
     runtime.log(
       renderTable({
@@ -929,7 +1075,13 @@ export async function statusCommand(
   runtime.log("");
   runtime.log("FAQ: https://docs.clawd.bot/faq");
   runtime.log("Troubleshooting: https://docs.clawd.bot/troubleshooting");
-  runtime.log(
-    "More: clawdbot status --all · clawdbot status --deep · clawdbot gateway status · clawdbot providers status --probe · clawdbot daemon status · clawdbot logs --follow",
-  );
+  runtime.log("");
+  runtime.log("Next steps:");
+  runtime.log("  Need to share?      clawdbot status --all");
+  runtime.log("  Need to debug live? clawdbot logs --follow");
+  if (gatewayReachable) {
+    runtime.log("  Need to test providers? clawdbot status --deep");
+  } else {
+    runtime.log("  Fix reachability first: clawdbot gateway status");
+  }
 }

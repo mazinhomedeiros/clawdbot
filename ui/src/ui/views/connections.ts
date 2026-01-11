@@ -1,7 +1,15 @@
 import { html, nothing } from "lit";
 
 import { formatAgo } from "../format";
-import type { ProvidersStatusSnapshot } from "../types";
+import type {
+  DiscordStatus,
+  IMessageStatus,
+  ProvidersStatusSnapshot,
+  SignalStatus,
+  SlackStatus,
+  TelegramStatus,
+  WhatsAppStatus,
+} from "../types";
 import type {
   DiscordActionForm,
   DiscordForm,
@@ -84,12 +92,17 @@ export type ConnectionsProps = {
 };
 
 export function renderConnections(props: ConnectionsProps) {
-  const whatsapp = props.snapshot?.whatsapp;
-  const telegram = props.snapshot?.telegram;
-  const discord = props.snapshot?.discord ?? null;
-  const slack = props.snapshot?.slack ?? null;
-  const signal = props.snapshot?.signal ?? null;
-  const imessage = props.snapshot?.imessage ?? null;
+  const providers = props.snapshot?.providers as Record<string, unknown> | null;
+  const whatsapp = (providers?.whatsapp ?? undefined) as
+    | WhatsAppStatus
+    | undefined;
+  const telegram = (providers?.telegram ?? undefined) as
+    | TelegramStatus
+    | undefined;
+  const discord = (providers?.discord ?? null) as DiscordStatus | null;
+  const slack = (providers?.slack ?? null) as SlackStatus | null;
+  const signal = (providers?.signal ?? null) as SignalStatus | null;
+  const imessage = (providers?.imessage ?? null) as IMessageStatus | null;
   const providerOrder: ProviderKey[] = [
     "whatsapp",
     "telegram",
@@ -163,24 +176,31 @@ type ProviderKey =
 
 function providerEnabled(key: ProviderKey, props: ConnectionsProps) {
   const snapshot = props.snapshot;
-  if (!snapshot) return false;
+  const providers = snapshot?.providers as Record<string, unknown> | null;
+  if (!snapshot || !providers) return false;
+  const whatsapp = providers.whatsapp as WhatsAppStatus | undefined;
+  const telegram = providers.telegram as TelegramStatus | undefined;
+  const discord = (providers.discord ?? null) as DiscordStatus | null;
+  const slack = (providers.slack ?? null) as SlackStatus | null;
+  const signal = (providers.signal ?? null) as SignalStatus | null;
+  const imessage = (providers.imessage ?? null) as IMessageStatus | null;
   switch (key) {
     case "whatsapp":
       return (
-        snapshot.whatsapp.configured ||
-        snapshot.whatsapp.linked ||
-        snapshot.whatsapp.running
+        Boolean(whatsapp?.configured) ||
+        Boolean(whatsapp?.linked) ||
+        Boolean(whatsapp?.running)
       );
     case "telegram":
-      return snapshot.telegram.configured || snapshot.telegram.running;
+      return Boolean(telegram?.configured) || Boolean(telegram?.running);
     case "discord":
-      return Boolean(snapshot.discord?.configured || snapshot.discord?.running);
+      return Boolean(discord?.configured || discord?.running);
     case "slack":
-      return Boolean(snapshot.slack?.configured || snapshot.slack?.running);
+      return Boolean(slack?.configured || slack?.running);
     case "signal":
-      return Boolean(snapshot.signal?.configured || snapshot.signal?.running);
+      return Boolean(signal?.configured || signal?.running);
     case "imessage":
-      return Boolean(snapshot.imessage?.configured || snapshot.imessage?.running);
+      return Boolean(imessage?.configured || imessage?.running);
     default:
       return false;
   }
@@ -190,12 +210,12 @@ function renderProvider(
   key: ProviderKey,
   props: ConnectionsProps,
   data: {
-    whatsapp?: ProvidersStatusSnapshot["whatsapp"];
-    telegram?: ProvidersStatusSnapshot["telegram"];
-    discord?: ProvidersStatusSnapshot["discord"] | null;
-    slack?: ProvidersStatusSnapshot["slack"] | null;
-    signal?: ProvidersStatusSnapshot["signal"] | null;
-    imessage?: ProvidersStatusSnapshot["imessage"] | null;
+    whatsapp?: WhatsAppStatus;
+    telegram?: TelegramStatus;
+    discord?: DiscordStatus | null;
+    slack?: SlackStatus | null;
+    signal?: SignalStatus | null;
+    imessage?: IMessageStatus | null;
   },
 ) {
   switch (key) {
@@ -357,9 +377,24 @@ function renderProvider(
               />
             </label>
             <label class="field">
+              <span>Apply default group rules</span>
+              <select
+                .value=${props.telegramForm.groupsWildcardEnabled ? "yes" : "no"}
+                @change=${(e: Event) =>
+                  props.onTelegramChange({
+                    groupsWildcardEnabled:
+                      (e.target as HTMLSelectElement).value === "yes",
+                  })}
+              >
+                <option value="no">No</option>
+                <option value="yes">Yes (allow all groups)</option>
+              </select>
+            </label>
+            <label class="field">
               <span>Require mention in groups</span>
               <select
                 .value=${props.telegramForm.requireMention ? "yes" : "no"}
+                ?disabled=${!props.telegramForm.groupsWildcardEnabled}
                 @change=${(e: Event) =>
                   props.onTelegramChange({
                     requireMention: (e.target as HTMLSelectElement).value === "yes",
@@ -377,7 +412,7 @@ function renderProvider(
                   props.onTelegramChange({
                     allowFrom: (e.target as HTMLInputElement).value,
                   })}
-                placeholder="123456789, @team"
+                placeholder="123456789, @team, tg:123"
               />
             </label>
             <label class="field">
@@ -426,9 +461,30 @@ function renderProvider(
             </label>
           </div>
 
+          <div class="callout" style="margin-top: 12px;">
+            Allow from supports numeric user IDs (recommended) or @usernames. DM the bot
+            to get your ID, or run /whoami.
+          </div>
+
           ${props.telegramTokenLocked
             ? html`<div class="callout" style="margin-top: 12px;">
                 TELEGRAM_BOT_TOKEN is set in the environment. Config edits will not override it.
+              </div>`
+            : nothing}
+
+          ${props.telegramForm.groupsWildcardEnabled
+            ? html`<div class="callout danger" style="margin-top: 12px;">
+                This writes telegram.groups["*"] and allows all groups. Remove it
+                if you only want specific groups.
+                <div class="row" style="margin-top: 8px;">
+                  <button
+                    class="btn"
+                    @click=${() =>
+                      props.onTelegramChange({ groupsWildcardEnabled: false })}
+                  >
+                    Remove wildcard
+                  </button>
+                </div>
               </div>`
             : nothing}
 

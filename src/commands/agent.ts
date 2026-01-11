@@ -4,7 +4,8 @@ import {
   resolveAgentWorkspaceDir,
 } from "../agents/agent-scope.js";
 import { ensureAuthProfileStore } from "../agents/auth-profiles.js";
-import { runClaudeCliAgent } from "../agents/claude-cli-runner.js";
+import { runCliAgent } from "../agents/cli-runner.js";
+import { getCliSessionId, setCliSessionId } from "../agents/cli-session.js";
 import { lookupContextTokens } from "../agents/context.js";
 import {
   DEFAULT_CONTEXT_TOKENS,
@@ -15,6 +16,7 @@ import { loadModelCatalog } from "../agents/model-catalog.js";
 import { runWithModelFallback } from "../agents/model-fallback.js";
 import {
   buildAllowedModelSet,
+  isCliProvider,
   modelKey,
   resolveConfiguredModelRef,
   resolveThinkingDefault,
@@ -31,7 +33,11 @@ import {
   type ThinkLevel,
   type VerboseLevel,
 } from "../auto-reply/thinking.js";
-import { type CliDeps, createDefaultDeps } from "../cli/deps.js";
+import {
+  type CliDeps,
+  createDefaultDeps,
+  createOutboundSendDeps,
+} from "../cli/deps.js";
 import { type ClawdbotConfig, loadConfig } from "../config/config.js";
 import {
   DEFAULT_IDLE_MINUTES,
@@ -56,15 +62,21 @@ import {
   normalizeOutboundPayloadsForJson,
 } from "../infra/outbound/payloads.js";
 import { resolveOutboundTarget } from "../infra/outbound/targets.js";
+import {
+  getProviderPlugin,
+  normalizeProviderId,
+} from "../providers/plugins/index.js";
+import type { ProviderOutboundTargetMode } from "../providers/plugins/types.js";
+import { DEFAULT_CHAT_PROVIDER } from "../providers/registry.js";
 import { normalizeMainKey } from "../routing/session-key.js";
 import { defaultRuntime, type RuntimeEnv } from "../runtime.js";
 import { applyVerboseOverride } from "../sessions/level-overrides.js";
 import { resolveSendPolicy } from "../sessions/send-policy.js";
 import {
-  normalizeMessageProvider,
+  isInternalMessageProvider,
+  resolveGatewayMessageProvider,
   resolveMessageProvider,
 } from "../utils/message-provider.js";
-import { normalizeE164 } from "../utils.js";
 
 /** Image content block for Claude API multimodal messages. */
 type ImageContent = {
@@ -89,6 +101,7 @@ type AgentCommandOpts = {
   /** Message provider context (webchat|voicewake|whatsapp|...). */
   messageProvider?: string;
   provider?: string; // delivery provider (whatsapp|telegram|...)
+  deliveryTargetMode?: ProviderOutboundTargetMode;
   bestEffortDeliver?: boolean;
   abortSignal?: AbortSignal;
   lane?: string;
@@ -201,10 +214,6 @@ export async function agentCommand(
     ensureBootstrapFiles: !agentCfg?.skipBootstrap,
   });
   const workspaceDir = workspace.dir;
-
-  const allowFrom = (cfg.whatsapp?.allowFrom ?? [])
-    .map((val) => normalizeE164(val))
-    .filter((val) => val.length > 1);
 
   const thinkOverride = normalizeThinkLevel(opts.thinking);
   const thinkOnce = normalizeThinkLevel(opts.thinkingOnce);
@@ -361,7 +370,7 @@ export async function agentCommand(
     if (overrideModel) {
       const key = modelKey(overrideProvider, overrideModel);
       if (
-        overrideProvider !== "claude-cli" &&
+        !isCliProvider(overrideProvider, cfg) &&
         allowedModelKeys.size > 0 &&
         !allowedModelKeys.has(key)
       ) {
@@ -380,7 +389,7 @@ export async function agentCommand(
     const candidateProvider = storedProviderOverride || defaultProvider;
     const key = modelKey(candidateProvider, storedModelOverride);
     if (
-      candidateProvider === "claude-cli" ||
+      isCliProvider(candidateProvider, cfg) ||
       allowedModelKeys.size === 0 ||
       allowedModelKeys.has(key)
     ) {
@@ -414,7 +423,9 @@ export async function agentCommand(
       catalog: catalogForThinking,
     });
   }
-  const sessionFile = resolveSessionFilePath(sessionId, sessionEntry);
+  const sessionFile = resolveSessionFilePath(sessionId, sessionEntry, {
+    agentId: sessionAgentId,
+  });
 
   const startedAt = Date.now();
   let lifecycleEnded = false;
@@ -422,7 +433,6 @@ export async function agentCommand(
   let result: Awaited<ReturnType<typeof runEmbeddedPiAgent>>;
   let fallbackProvider = provider;
   let fallbackModel = model;
-  const claudeSessionId = sessionEntry?.claudeCliSessionId?.trim();
   try {
     const messageProvider = resolveMessageProvider(
       opts.messageProvider,
@@ -433,8 +443,9 @@ export async function agentCommand(
       provider,
       model,
       run: (providerOverride, modelOverride) => {
-        if (providerOverride === "claude-cli") {
-          return runClaudeCliAgent({
+        if (isCliProvider(providerOverride, cfg)) {
+          const cliSessionId = getCliSessionId(sessionEntry, providerOverride);
+          return runCliAgent({
             sessionId,
             sessionKey,
             sessionFile,
@@ -447,7 +458,8 @@ export async function agentCommand(
             timeoutMs,
             runId,
             extraSystemPrompt: opts.extraSystemPrompt,
-            claudeSessionId,
+            cliSessionId,
+            images: opts.images,
           });
         }
         return runEmbeddedPiAgent({
@@ -542,9 +554,9 @@ export async function agentCommand(
       model: modelUsed,
       contextTokens,
     };
-    if (providerUsed === "claude-cli") {
+    if (isCliProvider(providerUsed, cfg)) {
       const cliSessionId = result.meta.agentMeta?.sessionId?.trim();
-      if (cliSessionId) next.claudeCliSessionId = cliSessionId;
+      if (cliSessionId) setCliSessionId(next, providerUsed, cliSessionId);
     }
     next.abortedLastRun = result.meta.aborted ?? false;
     if (hasNonzeroUsage(usage)) {
@@ -565,7 +577,13 @@ export async function agentCommand(
   const deliver = opts.deliver === true;
   const bestEffortDeliver = opts.bestEffortDeliver === true;
   const deliveryProvider =
-    normalizeMessageProvider(opts.provider) ?? "whatsapp";
+    resolveGatewayMessageProvider(opts.provider) ?? DEFAULT_CHAT_PROVIDER;
+  // Provider docking: delivery providers are resolved via plugin registry.
+  const deliveryPlugin = !isInternalMessageProvider(deliveryProvider)
+    ? getProviderPlugin(
+        normalizeProviderId(deliveryProvider) ?? deliveryProvider,
+      )
+    : undefined;
 
   const logDeliveryError = (err: unknown) => {
     const message = `Delivery failed (${deliveryProvider}${deliveryTarget ? ` to ${deliveryTarget}` : ""}): ${String(err)}`;
@@ -574,20 +592,19 @@ export async function agentCommand(
   };
 
   const isDeliveryProviderKnown =
-    deliveryProvider === "whatsapp" ||
-    deliveryProvider === "telegram" ||
-    deliveryProvider === "discord" ||
-    deliveryProvider === "slack" ||
-    deliveryProvider === "signal" ||
-    deliveryProvider === "imessage" ||
-    deliveryProvider === "webchat";
+    isInternalMessageProvider(deliveryProvider) || Boolean(deliveryPlugin);
 
+  const targetMode: ProviderOutboundTargetMode =
+    opts.deliveryTargetMode ?? (opts.to ? "explicit" : "implicit");
   const resolvedTarget =
-    deliver && isDeliveryProviderKnown
+    deliver && isDeliveryProviderKnown && deliveryProvider
       ? resolveOutboundTarget({
           provider: deliveryProvider,
           to: opts.to,
-          allowFrom,
+          cfg,
+          accountId:
+            targetMode === "implicit" ? sessionEntry?.lastAccountId : undefined,
+          mode: targetMode,
         })
       : null;
   const deliveryTarget = resolvedTarget?.ok ? resolvedTarget.to : undefined;
@@ -638,12 +655,8 @@ export async function agentCommand(
   }
   if (
     deliver &&
-    (deliveryProvider === "whatsapp" ||
-      deliveryProvider === "telegram" ||
-      deliveryProvider === "discord" ||
-      deliveryProvider === "slack" ||
-      deliveryProvider === "signal" ||
-      deliveryProvider === "imessage")
+    deliveryProvider &&
+    !isInternalMessageProvider(deliveryProvider)
   ) {
     if (deliveryTarget) {
       await deliverOutboundPayloads({
@@ -654,14 +667,7 @@ export async function agentCommand(
         bestEffort: bestEffortDeliver,
         onError: (err) => logDeliveryError(err),
         onPayload: logPayload,
-        deps: {
-          sendWhatsApp: deps.sendMessageWhatsApp,
-          sendTelegram: deps.sendMessageTelegram,
-          sendDiscord: deps.sendMessageDiscord,
-          sendSlack: deps.sendMessageSlack,
-          sendSignal: deps.sendMessageSignal,
-          sendIMessage: deps.sendMessageIMessage,
-        },
+        deps: createOutboundSendDeps(deps, cfg),
       });
     }
   }

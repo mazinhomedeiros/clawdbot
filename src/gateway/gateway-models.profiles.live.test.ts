@@ -14,6 +14,10 @@ import { resolveClawdbotAgentDir } from "../agents/agent-paths.js";
 import { getApiKeyForModel } from "../agents/model-auth.js";
 import { ensureClawdbotModelsJson } from "../agents/models-config.js";
 import { loadConfig } from "../config/config.js";
+import {
+  GATEWAY_CLIENT_MODES,
+  GATEWAY_CLIENT_NAMES,
+} from "../utils/message-provider.js";
 import { resolveUserPath } from "../utils.js";
 import { GatewayClient } from "./client.js";
 import { renderCatNoncePngBase64 } from "./live-image-probe.js";
@@ -27,6 +31,7 @@ const ALL_MODELS =
 const EXTRA_TOOL_PROBES = process.env.CLAWDBOT_LIVE_GATEWAY_TOOL_PROBE === "1";
 const EXTRA_IMAGE_PROBES =
   process.env.CLAWDBOT_LIVE_GATEWAY_IMAGE_PROBE === "1";
+const ZAI_FALLBACK = process.env.CLAWDBOT_LIVE_GATEWAY_ZAI_FALLBACK === "1";
 const PROVIDERS = parseFilter(process.env.CLAWDBOT_LIVE_GATEWAY_PROVIDERS);
 
 const describeLive = LIVE && GATEWAY_LIVE ? describe : describe.skip;
@@ -74,6 +79,10 @@ function isGoogleModelNotFoundText(text: string): boolean {
   return false;
 }
 
+function isRefreshTokenReused(error: string): boolean {
+  return /refresh_token_reused/i.test(error);
+}
+
 function randomImageProbeCode(len = 10): string {
   const alphabet = "2345689ABCEF";
   const bytes = randomBytes(len);
@@ -110,7 +119,6 @@ function editDistance(a: string, b: string): number {
 
   return prev[bLen] ?? Number.POSITIVE_INFINITY;
 }
-
 async function getFreePort(): Promise<number> {
   return await new Promise((resolve, reject) => {
     const srv = createServer();
@@ -174,9 +182,10 @@ async function connectClient(params: { url: string; token: string }) {
     const client = new GatewayClient({
       url: params.url,
       token: params.token,
-      clientName: "vitest-live",
+      clientName: GATEWAY_CLIENT_NAMES.TEST,
+      clientDisplayName: "vitest-live",
       clientVersion: "dev",
-      mode: "test",
+      mode: GATEWAY_CLIENT_MODES.TEST,
       onHelloOk: () => stop(undefined, client),
       onConnectError: (err) => stop(err),
       onClose: (code, reason) =>
@@ -386,8 +395,9 @@ describeLive("gateway live (dev agent, profile keys)", () => {
                 sessionKey,
                 idempotencyKey: `idem-${runIdTool}-tool`,
                 message:
-                  `Call the tool named \`read\` (or \`Read\` if \`read\` is unavailable) with JSON arguments {"path":"${toolProbePath}"}. ` +
-                  `Then reply with exactly: ${nonceA} ${nonceB}. No extra text.`,
+                  "Clawdbot live tool probe (local, safe): " +
+                  `use the tool named \`read\` (or \`Read\`) with JSON arguments {"path":"${toolProbePath}"}. ` +
+                  "Then reply with the two nonce values you read (include both).",
                 deliver: false,
               },
               { expectFinal: true },
@@ -403,7 +413,7 @@ describeLive("gateway live (dev agent, profile keys)", () => {
             }
 
             if (EXTRA_TOOL_PROBES) {
-              const nonceC = `nonceC=${randomUUID()}`;
+              const nonceC = randomUUID();
               const toolWritePath = path.join(
                 tempDir,
                 `write-${runIdTool}.txt`,
@@ -415,10 +425,11 @@ describeLive("gateway live (dev agent, profile keys)", () => {
                   sessionKey,
                   idempotencyKey: `idem-${runIdTool}-bash-read`,
                   message:
-                    `Call the tool named \`bash\` (or \`Bash\` if \`bash\` is unavailable) and run: ` +
-                    `mkdir -p "${tempDir}" && printf '%s' '${nonceC}' > "${toolWritePath}" ` +
-                    `Then call the tool named \`read\` (or \`Read\` if \`read\` is unavailable) with JSON arguments: {"path":"${toolWritePath}"} ` +
-                    `Finally reply with exactly: ${nonceC}.`,
+                    "Clawdbot live tool probe (local, safe): " +
+                    "use the tool named `bash` (or `Bash`) to run this command: " +
+                    `mkdir -p "${tempDir}" && printf '%s' '${nonceC}' > "${toolWritePath}". ` +
+                    `Then use the tool named \`read\` (or \`Read\`) with JSON arguments {"path":"${toolWritePath}"}. ` +
+                    "Finally reply including the nonce text you read back.",
                   deliver: false,
                 },
                 { expectFinal: true },
@@ -484,7 +495,6 @@ describeLive("gateway live (dev agent, profile keys)", () => {
                 );
               }
             }
-
             // Regression: tool-call-only turn followed by a user message (OpenAI responses bug class).
             if (
               (model.provider === "openai" &&
@@ -530,7 +540,15 @@ describeLive("gateway live (dev agent, profile keys)", () => {
               }
             }
           } catch (err) {
-            failures.push({ model: modelKey, error: String(err) });
+            const message = String(err);
+            // OpenAI Codex refresh tokens can become single-use; skip instead of failing all live tests.
+            if (
+              model.provider === "openai-codex" &&
+              isRefreshTokenReused(message)
+            ) {
+              continue;
+            }
+            failures.push({ model: modelKey, error: message });
           }
         }
 
@@ -559,4 +577,142 @@ describeLive("gateway live (dev agent, profile keys)", () => {
     },
     20 * 60 * 1000,
   );
+
+  it("z.ai fallback handles anthropic tool history", async () => {
+    if (!ZAI_FALLBACK) return;
+    const previous = {
+      configPath: process.env.CLAWDBOT_CONFIG_PATH,
+      token: process.env.CLAWDBOT_GATEWAY_TOKEN,
+      skipProviders: process.env.CLAWDBOT_SKIP_PROVIDERS,
+      skipGmail: process.env.CLAWDBOT_SKIP_GMAIL_WATCHER,
+      skipCron: process.env.CLAWDBOT_SKIP_CRON,
+      skipCanvas: process.env.CLAWDBOT_SKIP_CANVAS_HOST,
+    };
+
+    process.env.CLAWDBOT_SKIP_PROVIDERS = "1";
+    process.env.CLAWDBOT_SKIP_GMAIL_WATCHER = "1";
+    process.env.CLAWDBOT_SKIP_CRON = "1";
+    process.env.CLAWDBOT_SKIP_CANVAS_HOST = "1";
+
+    const token = `test-${randomUUID()}`;
+    process.env.CLAWDBOT_GATEWAY_TOKEN = token;
+
+    const cfg = loadConfig();
+    await ensureClawdbotModelsJson(cfg);
+
+    const agentDir = resolveClawdbotAgentDir();
+    const authStorage = discoverAuthStorage(agentDir);
+    const modelRegistry = discoverModels(authStorage, agentDir);
+    const anthropic = modelRegistry.find(
+      "anthropic",
+      "claude-opus-4-5",
+    ) as Model<Api> | null;
+    const zai = modelRegistry.find("zai", "glm-4.7") as Model<Api> | null;
+
+    if (!anthropic || !zai) return;
+    try {
+      await getApiKeyForModel({ model: anthropic, cfg });
+      await getApiKeyForModel({ model: zai, cfg });
+    } catch {
+      return;
+    }
+
+    const workspaceDir = resolveUserPath(
+      cfg.agents?.defaults?.workspace ?? path.join(os.homedir(), "clawd"),
+    );
+    await fs.mkdir(workspaceDir, { recursive: true });
+    const nonceA = randomUUID();
+    const nonceB = randomUUID();
+    const toolProbePath = path.join(
+      workspaceDir,
+      `.clawdbot-live-zai-fallback.${nonceA}.txt`,
+    );
+    await fs.writeFile(toolProbePath, `nonceA=${nonceA}\nnonceB=${nonceB}\n`);
+
+    const port = await getFreeGatewayPort();
+    const server = await startGatewayServer({
+      configPath: cfg.__meta?.path,
+      port,
+      token,
+    });
+
+    const client = await connectClient({
+      url: `ws://127.0.0.1:${port}`,
+      token,
+    });
+
+    try {
+      const sessionKey = "agent:dev:live-zai-fallback";
+
+      await client.request<Record<string, unknown>>("sessions.patch", {
+        key: sessionKey,
+        model: "anthropic/claude-opus-4-5",
+      });
+      await client.request<Record<string, unknown>>("sessions.reset", {
+        key: sessionKey,
+      });
+
+      const runId = randomUUID();
+      const toolProbe = await client.request<AgentFinalPayload>(
+        "agent",
+        {
+          sessionKey,
+          idempotencyKey: `idem-${runId}-tool`,
+          message:
+            `Call the tool named \`read\` (or \`Read\` if \`read\` is unavailable) with JSON arguments {"path":"${toolProbePath}"}. ` +
+            `Then reply with exactly: ${nonceA} ${nonceB}. No extra text.`,
+          deliver: false,
+        },
+        { expectFinal: true },
+      );
+      if (toolProbe?.status !== "ok") {
+        throw new Error(
+          `anthropic tool probe failed: status=${String(toolProbe?.status)}`,
+        );
+      }
+      const toolText = extractPayloadText(toolProbe?.result);
+      if (!toolText.includes(nonceA) || !toolText.includes(nonceB)) {
+        throw new Error(`anthropic tool probe missing nonce: ${toolText}`);
+      }
+
+      await client.request<Record<string, unknown>>("sessions.patch", {
+        key: sessionKey,
+        model: "zai/glm-4.7",
+      });
+
+      const followupId = randomUUID();
+      const followup = await client.request<AgentFinalPayload>(
+        "agent",
+        {
+          sessionKey,
+          idempotencyKey: `idem-${followupId}-followup`,
+          message:
+            `What are the values of nonceA and nonceB in "${toolProbePath}"? ` +
+            `Reply with exactly: ${nonceA} ${nonceB}.`,
+          deliver: false,
+        },
+        { expectFinal: true },
+      );
+      if (followup?.status !== "ok") {
+        throw new Error(
+          `zai followup failed: status=${String(followup?.status)}`,
+        );
+      }
+      const followupText = extractPayloadText(followup?.result);
+      if (!followupText.includes(nonceA) || !followupText.includes(nonceB)) {
+        throw new Error(`zai followup missing nonce: ${followupText}`);
+      }
+    } finally {
+      client.stop();
+      await server.close({ reason: "live test complete" });
+      await fs.rm(toolProbePath, { force: true });
+
+      process.env.CLAWDBOT_CONFIG_PATH = previous.configPath;
+      process.env.CLAWDBOT_GATEWAY_TOKEN = previous.token;
+      process.env.CLAWDBOT_SKIP_PROVIDERS = previous.skipProviders;
+      process.env.CLAWDBOT_SKIP_GMAIL_WATCHER = previous.skipGmail;
+      process.env.CLAWDBOT_SKIP_CRON = previous.skipCron;
+      process.env.CLAWDBOT_SKIP_CANVAS_HOST = previous.skipCanvas;
+    }
+  }, 180_000);
 });

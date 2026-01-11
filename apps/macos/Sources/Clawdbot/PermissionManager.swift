@@ -10,8 +10,16 @@ import Speech
 import UserNotifications
 
 enum PermissionManager {
-    static func isLocationAuthorized(status: CLAuthorizationStatus, requireAlways _: Bool) -> Bool {
-        status == .authorizedAlways
+    static func isLocationAuthorized(status: CLAuthorizationStatus, requireAlways: Bool) -> Bool {
+        if requireAlways { return status == .authorizedAlways }
+        switch status {
+        case .authorizedAlways, .authorizedWhenInUse:
+            return true
+        case .authorized: // deprecated, but still shows up on some macOS versions
+            return true
+        default:
+            return false
+        }
     }
 
     static func ensure(_ caps: [Capability], interactive: Bool) async -> [Capability: Bool] {
@@ -150,7 +158,7 @@ enum PermissionManager {
         }
         let status = CLLocationManager().authorizationStatus
         switch status {
-        case .authorizedAlways:
+        case .authorizedAlways, .authorizedWhenInUse, .authorized:
             return true
         case .notDetermined:
             guard interactive else { return false }
@@ -284,6 +292,7 @@ final class LocationPermissionRequester: NSObject, CLLocationManagerDelegate {
     static let shared = LocationPermissionRequester()
     private let manager = CLLocationManager()
     private var continuation: CheckedContinuation<CLAuthorizationStatus, Never>?
+    private var timeoutTask: Task<Void, Never>?
 
     override init() {
         super.init()
@@ -298,6 +307,16 @@ final class LocationPermissionRequester: NSObject, CLLocationManagerDelegate {
 
         return await withCheckedContinuation { cont in
             self.continuation = cont
+            self.timeoutTask?.cancel()
+            self.timeoutTask = Task { [weak self] in
+                try? await Task.sleep(nanoseconds: 3_000_000_000)
+                await MainActor.run { [weak self] in
+                    guard let self else { return }
+                    guard self.continuation != nil else { return }
+                    LocationPermissionHelper.openSettings()
+                    self.finish(status: self.manager.authorizationStatus)
+                }
+            }
             if always {
                 self.manager.requestAlwaysAuthorization()
             } else {
@@ -309,13 +328,46 @@ final class LocationPermissionRequester: NSObject, CLLocationManagerDelegate {
         }
     }
 
+    private func finish(status: CLAuthorizationStatus) {
+        self.timeoutTask?.cancel()
+        self.timeoutTask = nil
+        guard let cont = self.continuation else { return }
+        self.continuation = nil
+        cont.resume(returning: status)
+    }
+
     // nonisolated for Swift 6 strict concurrency compatibility
     nonisolated func locationManagerDidChangeAuthorization(_ manager: CLLocationManager) {
         let status = manager.authorizationStatus
         Task { @MainActor in
-            guard let cont = self.continuation else { return }
-            self.continuation = nil
-            cont.resume(returning: status)
+            self.finish(status: status)
+        }
+    }
+
+    // Legacy callback (still used on some macOS versions / configurations).
+    nonisolated func locationManager(
+        _ manager: CLLocationManager,
+        didChangeAuthorization status: CLAuthorizationStatus)
+    {
+        Task { @MainActor in
+            self.finish(status: status)
+        }
+    }
+
+    nonisolated func locationManager(_ manager: CLLocationManager, didFailWithError error: Error) {
+        let status = manager.authorizationStatus
+        Task { @MainActor in
+            if status == .denied || status == .restricted {
+                LocationPermissionHelper.openSettings()
+            }
+            self.finish(status: status)
+        }
+    }
+
+    nonisolated func locationManager(_ manager: CLLocationManager, didUpdateLocations locations: [CLLocation]) {
+        let status = manager.authorizationStatus
+        Task { @MainActor in
+            self.finish(status: status)
         }
     }
 }

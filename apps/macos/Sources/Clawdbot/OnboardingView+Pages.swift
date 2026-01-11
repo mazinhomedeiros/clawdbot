@@ -116,6 +116,11 @@ extension OnboardingView {
                             .foregroundStyle(.secondary)
                         if self.gatewayDiscovery.gateways.isEmpty {
                             ProgressView().controlSize(.small)
+                            Button("Refresh") {
+                                self.gatewayDiscovery.refreshWideAreaFallbackNow(timeoutSeconds: 5.0)
+                            }
+                            .buttonStyle(.link)
+                            .help("Retry Tailscale discovery (DNS-SD).")
                         }
                         Spacer(minLength: 0)
                     }
@@ -489,9 +494,9 @@ extension OnboardingView {
 
     func cliPage() -> some View {
         self.onboardingPage {
-            Text("Install the helper CLI")
+            Text("Install the CLI")
                 .font(.largeTitle.weight(.semibold))
-            Text("Optional, but recommended: link `clawdbot` so scripts can reach the local gateway.")
+            Text("Required for local mode: installs `clawdbot` so launchd can run the gateway.")
                 .font(.body)
                 .foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)
@@ -517,7 +522,7 @@ extension OnboardingView {
                     .buttonStyle(.borderedProminent)
                     .disabled(self.installingCLI)
 
-                    Button(self.copied ? "Copied" : "Copy dev link") {
+                    Button(self.copied ? "Copied" : "Copy install command") {
                         self.copyToPasteboard(self.devLinkCommand)
                     }
                     .disabled(self.installingCLI)
@@ -536,8 +541,8 @@ extension OnboardingView {
                 } else if !self.cliInstalled, self.cliInstallLocation == nil {
                     Text(
                         """
-                        We install into /usr/local/bin and /opt/homebrew/bin.
-                        Rerun anytime if you move the build output.
+                        Installs a user-space Node 22+ runtime and the CLI (no Homebrew).
+                        Rerun anytime to reinstall or update.
                         """)
                         .font(.footnote)
                         .foregroundStyle(.secondary)
@@ -649,7 +654,7 @@ extension OnboardingView {
                 .frame(maxWidth: 520)
                 .fixedSize(horizontal: false, vertical: true)
 
-            self.onboardingCard(padding: 8) {
+            self.onboardingGlassCard(padding: 8) {
                 ClawdbotChatView(viewModel: self.onboardingChatModel, style: .onboarding)
                     .frame(maxHeight: .infinity)
             }
