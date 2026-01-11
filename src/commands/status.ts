@@ -1,3 +1,7 @@
+import fs from "node:fs/promises";
+import path from "node:path";
+
+import { resolveAgentWorkspaceDir } from "../agents/agent-scope.js";
 import { lookupContextTokens } from "../agents/context.js";
 import {
   DEFAULT_CONTEXT_TOKENS,
@@ -5,25 +9,43 @@ import {
   DEFAULT_PROVIDER,
 } from "../agents/defaults.js";
 import { resolveConfiguredModelRef } from "../agents/model-selection.js";
-import { loadConfig } from "../config/config.js";
+import { withProgress } from "../cli/progress.js";
+import { loadConfig, resolveGatewayPort } from "../config/config.js";
 import {
   loadSessionStore,
+  resolveMainSessionKey,
   resolveStorePath,
   type SessionEntry,
 } from "../config/sessions.js";
-import { callGateway } from "../gateway/call.js";
+import { resolveGatewayService } from "../daemon/service.js";
+import { buildGatewayConnectionDetails, callGateway } from "../gateway/call.js";
+import { probeGateway } from "../gateway/probe.js";
+import { listAgentsForGateway } from "../gateway/session-utils.js";
 import { info } from "../globals.js";
+import { resolveClawdbotPackageRoot } from "../infra/clawdbot-root.js";
+import { resolveOsSummary } from "../infra/os-summary.js";
 import { buildProviderSummary } from "../infra/provider-summary.js";
+import {
+  formatUsageReportLines,
+  loadProviderUsageSummary,
+} from "../infra/provider-usage.js";
 import { peekSystemEvents } from "../infra/system-events.js";
+import {
+  checkUpdateStatus,
+  compareSemverStrings,
+  type UpdateCheckResult,
+} from "../infra/update-check.js";
 import type { RuntimeEnv } from "../runtime.js";
+import { renderTable } from "../terminal/table.js";
+import { theme } from "../terminal/theme.js";
+import { VERSION } from "../version.js";
 import { resolveWhatsAppAccount } from "../web/accounts.js";
 import { resolveHeartbeatSeconds } from "../web/reconnect.js";
-import {
-  getWebAuthAgeMs,
-  logWebSelfId,
-  webAuthExists,
-} from "../web/session.js";
+import { getWebAuthAgeMs, webAuthExists } from "../web/session.js";
 import type { HealthSummary } from "./health.js";
+import { resolveControlUiLinks } from "./onboard-helpers.js";
+import { buildProvidersTable } from "./status-all/providers.js";
+import { statusAllCommand } from "./status-all.js";
 
 export type SessionStatus = {
   key: string;
@@ -33,6 +55,7 @@ export type SessionStatus = {
   age: number | null;
   thinkingLevel?: string;
   verboseLevel?: string;
+  reasoningLevel?: string;
   elevatedLevel?: string;
   systemSent?: boolean;
   abortedLastRun?: boolean;
@@ -65,8 +88,12 @@ export async function getStatusSummary(): Promise<StatusSummary> {
   const linked = await webAuthExists(account.authDir);
   const authAgeMs = getWebAuthAgeMs(account.authDir);
   const heartbeatSeconds = resolveHeartbeatSeconds(cfg, undefined);
-  const providerSummary = await buildProviderSummary(cfg);
-  const queuedSystemEvents = peekSystemEvents();
+  const providerSummary = await buildProviderSummary(cfg, {
+    colorize: true,
+    includeAllowFrom: true,
+  });
+  const mainSessionKey = resolveMainSessionKey(cfg);
+  const queuedSystemEvents = peekSystemEvents(mainSessionKey);
 
   const resolved = resolveConfiguredModelRef({
     cfg,
@@ -75,7 +102,7 @@ export async function getStatusSummary(): Promise<StatusSummary> {
   });
   const configModel = resolved.model ?? DEFAULT_MODEL;
   const configContextTokens =
-    cfg.agent?.contextTokens ??
+    cfg.agents?.defaults?.contextTokens ??
     lookupContextTokens(configModel) ??
     DEFAULT_CONTEXT_TOKENS;
 
@@ -111,6 +138,7 @@ export async function getStatusSummary(): Promise<StatusSummary> {
         age,
         thinkingLevel: entry?.thinkingLevel,
         verboseLevel: entry?.verboseLevel,
+        reasoningLevel: entry?.reasoningLevel,
         elevatedLevel: entry?.elevatedLevel,
         systemSent: entry?.systemSent,
         abortedLastRun: entry?.abortedLastRun,
@@ -158,19 +186,26 @@ const formatAge = (ms: number | null | undefined) => {
   return `${days}d ago`;
 };
 
-const formatContextUsage = (
-  total: number | null | undefined,
-  contextTokens: number | null | undefined,
-  remaining: number | null | undefined,
-  pct: number | null | undefined,
+const formatDuration = (ms: number | null | undefined) => {
+  if (ms == null || !Number.isFinite(ms)) return "unknown";
+  if (ms < 1000) return `${Math.round(ms)}ms`;
+  return `${(ms / 1000).toFixed(1)}s`;
+};
+
+const shortenText = (value: string, maxLen: number) => {
+  const chars = Array.from(value);
+  if (chars.length <= maxLen) return value;
+  return `${chars.slice(0, Math.max(0, maxLen - 1)).join("")}…`;
+};
+
+const formatTokensCompact = (
+  sess: Pick<SessionStatus, "totalTokens" | "contextTokens" | "percentUsed">,
 ) => {
-  const used = total ?? 0;
-  if (!contextTokens) {
-    return `tokens: ${formatKTokens(used)} used (ctx unknown)`;
-  }
-  const left = remaining ?? Math.max(0, contextTokens - used);
-  const pctLabel = pct != null ? `${pct}%` : "?%";
-  return `tokens: ${formatKTokens(used)} used, ${formatKTokens(left)} left of ${formatKTokens(contextTokens)} (${pctLabel})`;
+  const used = sess.totalTokens ?? 0;
+  const ctx = sess.contextTokens;
+  if (!ctx) return `${formatKTokens(used)} used`;
+  const pctLabel = sess.percentUsed != null ? `${sess.percentUsed}%` : "?%";
+  return `${formatKTokens(used)}/${formatKTokens(ctx)} (${pctLabel})`;
 };
 
 const classifyKey = (
@@ -190,6 +225,270 @@ const classifyKey = (
   return "direct";
 };
 
+const formatDaemonRuntimeShort = (runtime?: {
+  status?: string;
+  pid?: number;
+  state?: string;
+  detail?: string;
+  missingUnit?: boolean;
+}) => {
+  if (!runtime) return null;
+  const status = runtime.status ?? "unknown";
+  const details: string[] = [];
+  if (runtime.pid) details.push(`pid ${runtime.pid}`);
+  if (runtime.state && runtime.state.toLowerCase() !== status) {
+    details.push(`state ${runtime.state}`);
+  }
+  const detail = runtime.detail?.replace(/\s+/g, " ").trim() || "";
+  const noisyLaunchctlDetail =
+    runtime.missingUnit === true &&
+    detail.toLowerCase().includes("could not find service");
+  if (detail && !noisyLaunchctlDetail) details.push(detail);
+  return details.length > 0 ? `${status} (${details.join(", ")})` : status;
+};
+
+async function getDaemonStatusSummary(): Promise<{
+  label: string;
+  installed: boolean | null;
+  loadedText: string;
+  runtimeShort: string | null;
+}> {
+  try {
+    const service = resolveGatewayService();
+    const [loaded, runtime, command] = await Promise.all([
+      service.isLoaded({ env: process.env }).catch(() => false),
+      service.readRuntime(process.env).catch(() => undefined),
+      service.readCommand(process.env).catch(() => null),
+    ]);
+    const installed = command != null;
+    const loadedText = loaded ? service.loadedText : service.notLoadedText;
+    const runtimeShort = formatDaemonRuntimeShort(runtime);
+    return { label: service.label, installed, loadedText, runtimeShort };
+  } catch {
+    return {
+      label: "Daemon",
+      installed: null,
+      loadedText: "unknown",
+      runtimeShort: null,
+    };
+  }
+}
+
+type AgentLocalStatus = {
+  id: string;
+  name?: string;
+  workspaceDir: string | null;
+  bootstrapPending: boolean | null;
+  sessionsPath: string;
+  sessionsCount: number;
+  lastUpdatedAt: number | null;
+  lastActiveAgeMs: number | null;
+};
+
+async function fileExists(p: string): Promise<boolean> {
+  try {
+    await fs.access(p);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function getAgentLocalStatuses(): Promise<{
+  defaultId: string;
+  agents: AgentLocalStatus[];
+  totalSessions: number;
+  bootstrapPendingCount: number;
+}> {
+  const cfg = loadConfig();
+  const agentList = listAgentsForGateway(cfg);
+  const now = Date.now();
+
+  const statuses: AgentLocalStatus[] = [];
+  for (const agent of agentList.agents) {
+    const agentId = agent.id;
+    const workspaceDir = (() => {
+      try {
+        return resolveAgentWorkspaceDir(cfg, agentId);
+      } catch {
+        return null;
+      }
+    })();
+
+    const bootstrapPath =
+      workspaceDir != null ? path.join(workspaceDir, "BOOTSTRAP.md") : null;
+    const bootstrapPending =
+      bootstrapPath != null ? await fileExists(bootstrapPath) : null;
+
+    const sessionsPath = resolveStorePath(cfg.session?.store, { agentId });
+    const store = (() => {
+      try {
+        return loadSessionStore(sessionsPath);
+      } catch {
+        return {};
+      }
+    })();
+    const sessions = Object.entries(store)
+      .filter(([key]) => key !== "global" && key !== "unknown")
+      .map(([, entry]) => entry);
+    const sessionsCount = sessions.length;
+    const lastUpdatedAt = sessions.reduce(
+      (max, e) => Math.max(max, e?.updatedAt ?? 0),
+      0,
+    );
+    const resolvedLastUpdatedAt = lastUpdatedAt > 0 ? lastUpdatedAt : null;
+    const lastActiveAgeMs = resolvedLastUpdatedAt
+      ? now - resolvedLastUpdatedAt
+      : null;
+
+    statuses.push({
+      id: agentId,
+      name: agent.name,
+      workspaceDir,
+      bootstrapPending,
+      sessionsPath,
+      sessionsCount,
+      lastUpdatedAt: resolvedLastUpdatedAt,
+      lastActiveAgeMs,
+    });
+  }
+
+  const totalSessions = statuses.reduce((sum, s) => sum + s.sessionsCount, 0);
+  const bootstrapPendingCount = statuses.reduce(
+    (sum, s) => sum + (s.bootstrapPending ? 1 : 0),
+    0,
+  );
+  return {
+    defaultId: agentList.defaultId,
+    agents: statuses,
+    totalSessions,
+    bootstrapPendingCount,
+  };
+}
+
+function resolveGatewayProbeAuth(cfg: ReturnType<typeof loadConfig>): {
+  token?: string;
+  password?: string;
+} {
+  const isRemoteMode = cfg.gateway?.mode === "remote";
+  const remote = isRemoteMode ? cfg.gateway?.remote : undefined;
+  const authToken = cfg.gateway?.auth?.token;
+  const authPassword = cfg.gateway?.auth?.password;
+  const token = isRemoteMode
+    ? typeof remote?.token === "string" && remote.token.trim().length > 0
+      ? remote.token.trim()
+      : undefined
+    : process.env.CLAWDBOT_GATEWAY_TOKEN?.trim() ||
+      (typeof authToken === "string" && authToken.trim().length > 0
+        ? authToken.trim()
+        : undefined);
+  const password =
+    process.env.CLAWDBOT_GATEWAY_PASSWORD?.trim() ||
+    (isRemoteMode
+      ? typeof remote?.password === "string" &&
+        remote.password.trim().length > 0
+        ? remote.password.trim()
+        : undefined
+      : typeof authPassword === "string" && authPassword.trim().length > 0
+        ? authPassword.trim()
+        : undefined);
+  return { token, password };
+}
+
+function pickGatewaySelfPresence(presence: unknown): {
+  host?: string;
+  ip?: string;
+  version?: string;
+  platform?: string;
+} | null {
+  if (!Array.isArray(presence)) return null;
+  const entries = presence as Array<Record<string, unknown>>;
+  const self =
+    entries.find((e) => e.mode === "gateway" && e.reason === "self") ?? null;
+  if (!self) return null;
+  return {
+    host: typeof self.host === "string" ? self.host : undefined,
+    ip: typeof self.ip === "string" ? self.ip : undefined,
+    version: typeof self.version === "string" ? self.version : undefined,
+    platform: typeof self.platform === "string" ? self.platform : undefined,
+  };
+}
+
+async function getUpdateCheckResult(params: {
+  timeoutMs: number;
+  fetchGit: boolean;
+  includeRegistry: boolean;
+}): Promise<UpdateCheckResult> {
+  const root = await resolveClawdbotPackageRoot({
+    moduleUrl: import.meta.url,
+    argv1: process.argv[1],
+    cwd: process.cwd(),
+  });
+  return await checkUpdateStatus({
+    root,
+    timeoutMs: params.timeoutMs,
+    fetchGit: params.fetchGit,
+    includeRegistry: params.includeRegistry,
+  });
+}
+
+function formatUpdateOneLiner(update: UpdateCheckResult): string {
+  const parts: string[] = [];
+  if (update.installKind === "git" && update.git) {
+    const branch = update.git.branch ? `git ${update.git.branch}` : "git";
+    parts.push(branch);
+    if (update.git.upstream) parts.push(`↔ ${update.git.upstream}`);
+    if (update.git.dirty === true) parts.push("dirty");
+    if (update.git.behind != null && update.git.ahead != null) {
+      if (update.git.behind === 0 && update.git.ahead === 0) {
+        parts.push("up to date");
+      } else if (update.git.behind > 0 && update.git.ahead === 0) {
+        parts.push(`behind ${update.git.behind}`);
+      } else if (update.git.behind === 0 && update.git.ahead > 0) {
+        parts.push(`ahead ${update.git.ahead}`);
+      } else if (update.git.behind > 0 && update.git.ahead > 0) {
+        parts.push(
+          `diverged (ahead ${update.git.ahead}, behind ${update.git.behind})`,
+        );
+      }
+    }
+    if (update.git.fetchOk === false) parts.push("fetch failed");
+
+    if (update.registry?.latestVersion) {
+      const cmp = compareSemverStrings(VERSION, update.registry.latestVersion);
+      if (cmp === 0) parts.push(`npm latest ${update.registry.latestVersion}`);
+      else if (cmp != null && cmp < 0)
+        parts.push(`npm update ${update.registry.latestVersion}`);
+      else
+        parts.push(`npm latest ${update.registry.latestVersion} (local newer)`);
+    } else if (update.registry?.error) {
+      parts.push("npm latest unknown");
+    }
+  } else {
+    parts.push(
+      update.packageManager !== "unknown" ? update.packageManager : "pkg",
+    );
+    if (update.registry?.latestVersion) {
+      const cmp = compareSemverStrings(VERSION, update.registry.latestVersion);
+      if (cmp === 0) parts.push(`npm latest ${update.registry.latestVersion}`);
+      else if (cmp != null && cmp < 0) {
+        parts.push(`npm update ${update.registry.latestVersion}`);
+      } else {
+        parts.push(`npm latest ${update.registry.latestVersion} (local newer)`);
+      }
+    } else if (update.registry?.error) {
+      parts.push("npm latest unknown");
+    }
+  }
+
+  if (update.deps) {
+    if (update.deps.status === "ok") parts.push("deps ok");
+    if (update.deps.status === "missing") parts.push("deps missing");
+    if (update.deps.status === "stale") parts.push("deps stale");
+  }
+  return `Update: ${parts.join(" · ")}`;
+}
+
 const buildFlags = (entry: SessionEntry): string[] => {
   const flags: string[] = [];
   const think = entry?.thinkingLevel;
@@ -198,6 +497,9 @@ const buildFlags = (entry: SessionEntry): string[] => {
   const verbose = entry?.verboseLevel;
   if (typeof verbose === "string" && verbose.length > 0)
     flags.push(`verbose:${verbose}`);
+  const reasoning = entry?.reasoningLevel;
+  if (typeof reasoning === "string" && reasoning.length > 0)
+    flags.push(`reasoning:${reasoning}`);
   const elevated = entry?.elevatedLevel;
   if (typeof elevated === "string" && elevated.length > 0)
     flags.push(`elevated:${elevated}`);
@@ -210,88 +512,424 @@ const buildFlags = (entry: SessionEntry): string[] => {
 };
 
 export async function statusCommand(
-  opts: { json?: boolean; deep?: boolean; timeoutMs?: number },
+  opts: {
+    json?: boolean;
+    deep?: boolean;
+    usage?: boolean;
+    timeoutMs?: number;
+    verbose?: boolean;
+    all?: boolean;
+  },
   runtime: RuntimeEnv,
 ) {
-  const summary = await getStatusSummary();
+  if (opts.all && !opts.json) {
+    await statusAllCommand(runtime, { timeoutMs: opts.timeoutMs });
+    return;
+  }
+
+  const scan = await withProgress(
+    {
+      label: "Scanning status…",
+      total: 7,
+      enabled: opts.json !== true,
+    },
+    async (progress) => {
+      progress.setLabel("Loading config…");
+      const cfg = loadConfig();
+      const osSummary = resolveOsSummary();
+      progress.tick();
+
+      progress.setLabel("Checking for updates…");
+      const updateTimeoutMs = opts.all ? 6500 : 2500;
+      const update = await getUpdateCheckResult({
+        timeoutMs: updateTimeoutMs,
+        fetchGit: true,
+        includeRegistry: true,
+      });
+      progress.tick();
+
+      progress.setLabel("Resolving agents…");
+      const agentStatus = await getAgentLocalStatuses();
+      progress.tick();
+
+      progress.setLabel("Probing gateway…");
+      const gatewayConnection = buildGatewayConnectionDetails();
+      const isRemoteMode = cfg.gateway?.mode === "remote";
+      const remoteUrlRaw =
+        typeof cfg.gateway?.remote?.url === "string"
+          ? cfg.gateway.remote.url
+          : "";
+      const remoteUrlMissing = isRemoteMode && !remoteUrlRaw.trim();
+      const gatewayMode = isRemoteMode ? "remote" : "local";
+      const gatewayProbe = remoteUrlMissing
+        ? null
+        : await probeGateway({
+            url: gatewayConnection.url,
+            auth: resolveGatewayProbeAuth(cfg),
+            timeoutMs: Math.min(
+              opts.all ? 5000 : 2500,
+              opts.timeoutMs ?? 10_000,
+            ),
+          }).catch(() => null);
+      const gatewayReachable = gatewayProbe?.ok === true;
+      const gatewaySelf = gatewayProbe?.presence
+        ? pickGatewaySelfPresence(gatewayProbe.presence)
+        : null;
+      progress.tick();
+
+      progress.setLabel("Summarizing providers…");
+      const providers = await buildProvidersTable(cfg, {
+        // Show token previews in regular status; keep `status --all` redacted.
+        // Set `CLAWDBOT_SHOW_SECRETS=0` to force redaction.
+        showSecrets: process.env.CLAWDBOT_SHOW_SECRETS?.trim() !== "0",
+      });
+      progress.tick();
+
+      progress.setLabel("Reading sessions…");
+      const summary = await getStatusSummary();
+      progress.tick();
+
+      progress.setLabel("Rendering…");
+      progress.tick();
+
+      return {
+        cfg,
+        osSummary,
+        update,
+        gatewayConnection,
+        remoteUrlMissing,
+        gatewayMode,
+        gatewayProbe,
+        gatewayReachable,
+        gatewaySelf,
+        agentStatus,
+        providers,
+        summary,
+      };
+    },
+  );
+
+  const {
+    cfg,
+    osSummary,
+    update,
+    gatewayConnection,
+    remoteUrlMissing,
+    gatewayMode,
+    gatewayProbe,
+    gatewayReachable,
+    gatewaySelf,
+    agentStatus,
+    providers,
+    summary,
+  } = scan;
+  const usage = opts.usage
+    ? await withProgress(
+        {
+          label: "Fetching usage snapshot…",
+          indeterminate: true,
+          enabled: opts.json !== true,
+        },
+        async () =>
+          await loadProviderUsageSummary({ timeoutMs: opts.timeoutMs }),
+      )
+    : undefined;
   const health: HealthSummary | undefined = opts.deep
-    ? await callGateway<HealthSummary>({
-        method: "health",
-        timeoutMs: opts.timeoutMs,
-      })
+    ? await withProgress(
+        {
+          label: "Checking gateway health…",
+          indeterminate: true,
+          enabled: opts.json !== true,
+        },
+        async () =>
+          await callGateway<HealthSummary>({
+            method: "health",
+            timeoutMs: opts.timeoutMs,
+          }),
+      )
     : undefined;
 
   if (opts.json) {
     runtime.log(
-      JSON.stringify(health ? { ...summary, health } : summary, null, 2),
+      JSON.stringify(
+        {
+          ...summary,
+          os: osSummary,
+          update,
+          gateway: {
+            mode: gatewayMode,
+            url: gatewayConnection.url,
+            urlSource: gatewayConnection.urlSource,
+            misconfigured: remoteUrlMissing,
+            reachable: gatewayReachable,
+            connectLatencyMs: gatewayProbe?.connectLatencyMs ?? null,
+            self: gatewaySelf,
+            error: gatewayProbe?.error ?? null,
+          },
+          agents: agentStatus,
+          ...(health || usage ? { health, usage } : {}),
+        },
+        null,
+        2,
+      ),
     );
     return;
   }
 
-  runtime.log(
-    `Web session: ${summary.web.linked ? "linked" : "not linked"}${summary.web.linked ? ` (last refreshed ${formatAge(summary.web.authAgeMs)})` : ""}`,
-  );
-  if (summary.web.linked) {
-    const cfg = loadConfig();
-    const account = resolveWhatsAppAccount({ cfg });
-    logWebSelfId(account.authDir, runtime, true);
-  }
-  runtime.log(info("System:"));
-  for (const line of summary.providerSummary) {
-    runtime.log(`  ${line}`);
-  }
-  if (health) {
-    runtime.log(info("Gateway health: reachable"));
+  const rich = true;
+  const muted = (value: string) => (rich ? theme.muted(value) : value);
+  const ok = (value: string) => (rich ? theme.success(value) : value);
+  const warn = (value: string) => (rich ? theme.warn(value) : value);
 
-    const tgLine = health.telegram.configured
-      ? health.telegram.probe?.ok
-        ? info(
-            `Telegram: ok${health.telegram.probe.bot?.username ? ` (@${health.telegram.probe.bot.username})` : ""} (${health.telegram.probe.elapsedMs}ms)` +
-              (health.telegram.probe.webhook?.url
-                ? ` - webhook ${health.telegram.probe.webhook.url}`
-                : ""),
-          )
-        : `Telegram: failed (${health.telegram.probe?.status ?? "unknown"})${health.telegram.probe?.error ? ` - ${health.telegram.probe.error}` : ""}`
-      : info("Telegram: not configured");
-    runtime.log(tgLine);
+  if (opts.verbose) {
+    const details = buildGatewayConnectionDetails();
+    runtime.log(info("Gateway connection:"));
+    for (const line of details.message.split("\n")) runtime.log(`  ${line}`);
+    runtime.log("");
+  }
 
-    const discordLine = health.discord.configured
-      ? health.discord.probe?.ok
-        ? info(
-            `Discord: ok${health.discord.probe.bot?.username ? ` (@${health.discord.probe.bot.username})` : ""} (${health.discord.probe.elapsedMs}ms)`,
-          )
-        : `Discord: failed (${health.discord.probe?.status ?? "unknown"})${health.discord.probe?.error ? ` - ${health.discord.probe.error}` : ""}`
-      : info("Discord: not configured");
-    runtime.log(discordLine);
-  } else {
-    runtime.log(info("Provider probes: skipped (use --deep)"));
-  }
-  if (summary.queuedSystemEvents.length > 0) {
-    const preview = summary.queuedSystemEvents.slice(0, 3).join(" | ");
-    runtime.log(
-      info(
-        `Queued system events (${summary.queuedSystemEvents.length}): ${preview}`,
-      ),
-    );
-  }
-  runtime.log(info(`Heartbeat: ${summary.heartbeatSeconds}s`));
-  runtime.log(info(`Session store: ${summary.sessions.path}`));
+  const tableWidth = Math.max(60, (process.stdout.columns ?? 120) - 1);
+
+  const dashboard = (() => {
+    const controlUiEnabled = cfg.gateway?.controlUi?.enabled ?? true;
+    if (!controlUiEnabled) return "disabled";
+    const links = resolveControlUiLinks({
+      port: resolveGatewayPort(cfg),
+      bind: cfg.gateway?.bind,
+      basePath: cfg.gateway?.controlUi?.basePath,
+    });
+    return links.httpUrl;
+  })();
+
+  const gatewayValue = (() => {
+    const target = remoteUrlMissing
+      ? `fallback ${gatewayConnection.url}`
+      : `${gatewayConnection.url}${gatewayConnection.urlSource ? ` (${gatewayConnection.urlSource})` : ""}`;
+    const reach = remoteUrlMissing
+      ? warn("misconfigured (remote.url missing)")
+      : gatewayReachable
+        ? ok(`reachable ${formatDuration(gatewayProbe?.connectLatencyMs)}`)
+        : warn(
+            gatewayProbe?.error
+              ? `unreachable (${gatewayProbe.error})`
+              : "unreachable",
+          );
+    const self =
+      gatewaySelf?.host || gatewaySelf?.version || gatewaySelf?.platform
+        ? [
+            gatewaySelf?.host ? gatewaySelf.host : null,
+            gatewaySelf?.ip ? `(${gatewaySelf.ip})` : null,
+            gatewaySelf?.version ? `app ${gatewaySelf.version}` : null,
+            gatewaySelf?.platform ? gatewaySelf.platform : null,
+          ]
+            .filter(Boolean)
+            .join(" ")
+        : null;
+    const suffix = self ? ` · ${self}` : "";
+    return `${gatewayMode} · ${target} · ${reach}${suffix}`;
+  })();
+
+  const agentsValue = (() => {
+    const pending =
+      agentStatus.bootstrapPendingCount > 0
+        ? `${agentStatus.bootstrapPendingCount} bootstrapping`
+        : "no bootstraps";
+    const def = agentStatus.agents.find((a) => a.id === agentStatus.defaultId);
+    const defActive =
+      def?.lastActiveAgeMs != null ? formatAge(def.lastActiveAgeMs) : "unknown";
+    const defSuffix = def ? ` · default ${def.id} active ${defActive}` : "";
+    return `${agentStatus.agents.length} · ${pending} · sessions ${agentStatus.totalSessions}${defSuffix}`;
+  })();
+
+  const daemon = await getDaemonStatusSummary();
+  const daemonValue = (() => {
+    if (daemon.installed === false) return `${daemon.label} not installed`;
+    const installedPrefix = daemon.installed === true ? "installed · " : "";
+    return `${daemon.label} ${installedPrefix}${daemon.loadedText}${daemon.runtimeShort ? ` · ${daemon.runtimeShort}` : ""}`;
+  })();
+
   const defaults = summary.sessions.defaults;
   const defaultCtx = defaults.contextTokens
     ? ` (${formatKTokens(defaults.contextTokens)} ctx)`
     : "";
+  const eventsValue =
+    summary.queuedSystemEvents.length > 0
+      ? `${summary.queuedSystemEvents.length} queued`
+      : "none";
+
+  const probesValue = health ? ok("enabled") : muted("skipped (use --deep)");
+
+  const overviewRows = [
+    { Item: "Dashboard", Value: dashboard },
+    { Item: "OS", Value: `${osSummary.label} · node ${process.versions.node}` },
+    {
+      Item: "Update",
+      Value: formatUpdateOneLiner(update).replace(/^Update:\s*/i, ""),
+    },
+    { Item: "Gateway", Value: gatewayValue },
+    { Item: "Daemon", Value: daemonValue },
+    { Item: "Agents", Value: agentsValue },
+    { Item: "Probes", Value: probesValue },
+    { Item: "Events", Value: eventsValue },
+    { Item: "Heartbeat", Value: `${summary.heartbeatSeconds}s` },
+    {
+      Item: "Sessions",
+      Value: `${summary.sessions.count} active · default ${defaults.model ?? "unknown"}${defaultCtx} · store ${summary.sessions.path}`,
+    },
+  ];
+
+  runtime.log(theme.heading("Clawdbot status"));
+  runtime.log("");
+  runtime.log(theme.heading("Overview"));
   runtime.log(
-    info(`Default model: ${defaults.model ?? "unknown"}${defaultCtx}`),
+    renderTable({
+      width: tableWidth,
+      columns: [
+        { key: "Item", header: "Item", minWidth: 12 },
+        { key: "Value", header: "Value", flex: true, minWidth: 32 },
+      ],
+      rows: overviewRows,
+    }).trimEnd(),
   );
-  runtime.log(info(`Active sessions: ${summary.sessions.count}`));
-  if (summary.sessions.recent.length > 0) {
-    runtime.log("Recent sessions:");
-    for (const r of summary.sessions.recent) {
-      runtime.log(
-        `- ${r.key} [${r.kind}] | ${r.updatedAt ? formatAge(r.age) : "no activity"} | model ${r.model ?? "unknown"} | ${formatContextUsage(r.totalTokens, r.contextTokens, r.remainingTokens, r.percentUsed)}${r.flags.length ? ` | flags: ${r.flags.join(", ")}` : ""}`,
-      );
+
+  runtime.log("");
+  runtime.log(theme.heading("Providers"));
+  runtime.log(
+    renderTable({
+      width: tableWidth,
+      columns: [
+        { key: "Provider", header: "Provider", minWidth: 10 },
+        { key: "Enabled", header: "Enabled", minWidth: 7 },
+        { key: "State", header: "State", minWidth: 8 },
+        { key: "Detail", header: "Detail", flex: true, minWidth: 24 },
+      ],
+      rows: providers.rows.map((row) => ({
+        Provider: row.provider,
+        Enabled: row.enabled ? ok("ON") : muted("OFF"),
+        State:
+          row.state === "ok"
+            ? ok("OK")
+            : row.state === "warn"
+              ? warn("WARN")
+              : row.state === "off"
+                ? muted("OFF")
+                : theme.accentDim("SETUP"),
+        Detail: row.detail,
+      })),
+    }).trimEnd(),
+  );
+
+  runtime.log("");
+  runtime.log(theme.heading("Sessions"));
+  runtime.log(
+    renderTable({
+      width: tableWidth,
+      columns: [
+        { key: "Key", header: "Key", minWidth: 20, flex: true },
+        { key: "Kind", header: "Kind", minWidth: 6 },
+        { key: "Age", header: "Age", minWidth: 9 },
+        { key: "Model", header: "Model", minWidth: 14 },
+        { key: "Tokens", header: "Tokens", minWidth: 16 },
+      ],
+      rows:
+        summary.sessions.recent.length > 0
+          ? summary.sessions.recent.map((sess) => ({
+              Key: shortenText(sess.key, 32),
+              Kind: sess.kind,
+              Age: sess.updatedAt ? formatAge(sess.age) : "no activity",
+              Model: sess.model ?? "unknown",
+              Tokens: formatTokensCompact(sess),
+            }))
+          : [
+              {
+                Key: muted("no sessions yet"),
+                Kind: "",
+                Age: "",
+                Model: "",
+                Tokens: "",
+              },
+            ],
+    }).trimEnd(),
+  );
+
+  if (summary.queuedSystemEvents.length > 0) {
+    runtime.log("");
+    runtime.log(theme.heading("System events"));
+    runtime.log(
+      renderTable({
+        width: tableWidth,
+        columns: [{ key: "Event", header: "Event", flex: true, minWidth: 24 }],
+        rows: summary.queuedSystemEvents.slice(0, 5).map((event) => ({
+          Event: event,
+        })),
+      }).trimEnd(),
+    );
+    if (summary.queuedSystemEvents.length > 5) {
+      runtime.log(muted(`… +${summary.queuedSystemEvents.length - 5} more`));
     }
-  } else {
-    runtime.log("No session activity yet.");
   }
+
+  if (health) {
+    runtime.log("");
+    runtime.log(theme.heading("Health"));
+    const rows: Array<Record<string, string>> = [];
+    rows.push({
+      Provider: "Gateway",
+      Status: ok("reachable"),
+      Detail: `${health.durationMs}ms`,
+    });
+    rows.push({
+      Provider: "Telegram",
+      Status: health.telegram.configured
+        ? health.telegram.probe?.ok
+          ? ok("OK")
+          : warn("WARN")
+        : muted("OFF"),
+      Detail: health.telegram.configured
+        ? health.telegram.probe?.ok
+          ? `@${health.telegram.probe.bot?.username ?? "unknown"} · ${health.telegram.probe.elapsedMs}ms`
+          : (health.telegram.probe?.error ?? "probe failed")
+        : "not configured",
+    });
+    rows.push({
+      Provider: "Discord",
+      Status: health.discord.configured
+        ? health.discord.probe?.ok
+          ? ok("OK")
+          : warn("WARN")
+        : muted("OFF"),
+      Detail: health.discord.configured
+        ? health.discord.probe?.ok
+          ? `@${health.discord.probe.bot?.username ?? "unknown"} · ${health.discord.probe.elapsedMs}ms`
+          : (health.discord.probe?.error ?? "probe failed")
+        : "not configured",
+    });
+
+    runtime.log(
+      renderTable({
+        width: tableWidth,
+        columns: [
+          { key: "Provider", header: "Provider", minWidth: 10 },
+          { key: "Status", header: "Status", minWidth: 8 },
+          { key: "Detail", header: "Detail", flex: true, minWidth: 28 },
+        ],
+        rows,
+      }).trimEnd(),
+    );
+  }
+
+  if (usage) {
+    runtime.log("");
+    runtime.log(theme.heading("Usage"));
+    for (const line of formatUsageReportLines(usage)) {
+      runtime.log(line);
+    }
+  }
+
+  runtime.log("");
+  runtime.log("FAQ: https://docs.clawd.bot/faq");
+  runtime.log("Troubleshooting: https://docs.clawd.bot/troubleshooting");
+  runtime.log(
+    "More: clawdbot status --all · clawdbot status --deep · clawdbot gateway status · clawdbot providers status --probe · clawdbot daemon status · clawdbot logs --follow",
+  );
 }

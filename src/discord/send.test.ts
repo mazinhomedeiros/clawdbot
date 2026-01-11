@@ -1,4 +1,5 @@
-import { PermissionsBitField, Routes } from "discord.js";
+import { RateLimitError } from "@buape/carbon";
+import { PermissionFlagsBits, Routes } from "discord-api-types/v10";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
@@ -14,6 +15,8 @@ import {
   pinMessageDiscord,
   reactMessageDiscord,
   readMessagesDiscord,
+  removeOwnReactionsDiscord,
+  removeReactionDiscord,
   removeRoleDiscord,
   searchMessagesDiscord,
   sendMessageDiscord,
@@ -53,7 +56,7 @@ const makeRest = () => {
       get: getMock,
       patch: patchMock,
       delete: deleteMock,
-    } as unknown as import("discord.js").REST,
+    } as unknown as import("@buape/carbon").RequestClient,
     postMock,
     putMock,
     getMock,
@@ -106,11 +109,22 @@ describe("sendMessageDiscord", () => {
     expect(res.channelId).toBe("chan1");
   });
 
+  it("rejects bare numeric IDs as ambiguous", async () => {
+    const { rest } = makeRest();
+    await expect(
+      sendMessageDiscord("273512430271856640", "hello", { rest, token: "t" }),
+    ).rejects.toThrow(/Ambiguous Discord recipient/);
+    await expect(
+      sendMessageDiscord("273512430271856640", "hello", { rest, token: "t" }),
+    ).rejects.toThrow(/user:273512430271856640/);
+    await expect(
+      sendMessageDiscord("273512430271856640", "hello", { rest, token: "t" }),
+    ).rejects.toThrow(/channel:273512430271856640/);
+  });
+
   it("adds missing permission hints on 50013", async () => {
     const { rest, postMock, getMock } = makeRest();
-    const perms = new PermissionsBitField([
-      PermissionsBitField.Flags.ViewChannel,
-    ]);
+    const perms = PermissionFlagsBits.ViewChannel;
     const apiError = Object.assign(new Error("Missing Permissions"), {
       code: 50013,
       status: 403,
@@ -126,7 +140,7 @@ describe("sendMessageDiscord", () => {
       .mockResolvedValueOnce({ id: "bot1" })
       .mockResolvedValueOnce({
         id: "guild1",
-        roles: [{ id: "guild1", permissions: perms.bitfield.toString() }],
+        roles: [{ id: "guild1", permissions: perms.toString() }],
       })
       .mockResolvedValueOnce({ roles: [] });
 
@@ -152,7 +166,9 @@ describe("sendMessageDiscord", () => {
     expect(postMock).toHaveBeenCalledWith(
       Routes.channelMessages("789"),
       expect.objectContaining({
-        files: [expect.objectContaining({ name: "photo.jpg" })],
+        body: expect.objectContaining({
+          files: [expect.objectContaining({ name: "photo.jpg" })],
+        }),
       }),
     );
   });
@@ -224,6 +240,47 @@ describe("reactMessageDiscord", () => {
   });
 });
 
+describe("removeReactionDiscord", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it("removes a unicode emoji reaction", async () => {
+    const { rest, deleteMock } = makeRest();
+    await removeReactionDiscord("chan1", "msg1", "✅", { rest, token: "t" });
+    expect(deleteMock).toHaveBeenCalledWith(
+      Routes.channelMessageOwnReaction("chan1", "msg1", "%E2%9C%85"),
+    );
+  });
+});
+
+describe("removeOwnReactionsDiscord", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it("removes all own reactions on a message", async () => {
+    const { rest, getMock, deleteMock } = makeRest();
+    getMock.mockResolvedValue({
+      reactions: [
+        { emoji: { name: "✅", id: null } },
+        { emoji: { name: "party_blob", id: "123" } },
+      ],
+    });
+    const res = await removeOwnReactionsDiscord("chan1", "msg1", {
+      rest,
+      token: "t",
+    });
+    expect(res).toEqual({ ok: true, removed: ["✅", "party_blob:123"] });
+    expect(deleteMock).toHaveBeenCalledWith(
+      Routes.channelMessageOwnReaction("chan1", "msg1", "%E2%9C%85"),
+    );
+    expect(deleteMock).toHaveBeenCalledWith(
+      Routes.channelMessageOwnReaction("chan1", "msg1", "party_blob%3A123"),
+    );
+  });
+});
+
 describe("fetchReactionsDiscord", () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -268,10 +325,8 @@ describe("fetchChannelPermissionsDiscord", () => {
 
   it("calculates permissions from guild roles", async () => {
     const { rest, getMock } = makeRest();
-    const perms = new PermissionsBitField([
-      PermissionsBitField.Flags.ViewChannel,
-      PermissionsBitField.Flags.SendMessages,
-    ]);
+    const perms =
+      PermissionFlagsBits.ViewChannel | PermissionFlagsBits.SendMessages;
     getMock
       .mockResolvedValueOnce({
         id: "chan1",
@@ -282,7 +337,7 @@ describe("fetchChannelPermissionsDiscord", () => {
       .mockResolvedValueOnce({
         id: "guild1",
         roles: [
-          { id: "guild1", permissions: perms.bitfield.toString() },
+          { id: "guild1", permissions: perms.toString() },
           { id: "role2", permissions: "0" },
         ],
       })
@@ -303,7 +358,7 @@ describe("readMessagesDiscord", () => {
     vi.clearAllMocks();
   });
 
-  it("passes query params as URLSearchParams", async () => {
+  it("passes query params as an object", async () => {
     const { rest, getMock } = makeRest();
     getMock.mockResolvedValue([]);
     await readMessagesDiscord(
@@ -312,8 +367,8 @@ describe("readMessagesDiscord", () => {
       { rest, token: "t" },
     );
     const call = getMock.mock.calls[0];
-    const options = call?.[1] as { query?: URLSearchParams };
-    expect(options.query?.toString()).toBe("limit=5&before=10");
+    const options = call?.[1] as Record<string, unknown>;
+    expect(options).toEqual({ limit: 5, before: "10" });
   });
 });
 
@@ -376,8 +431,7 @@ describe("searchMessagesDiscord", () => {
       { rest, token: "t" },
     );
     const call = getMock.mock.calls[0];
-    const options = call?.[1] as { query?: URLSearchParams };
-    expect(options.query?.toString()).toBe("content=hello&limit=5");
+    expect(call?.[0]).toBe("/guilds/g1/messages/search?content=hello&limit=5");
   });
 
   it("supports channel/author arrays and clamps limit", async () => {
@@ -394,9 +448,8 @@ describe("searchMessagesDiscord", () => {
       { rest, token: "t" },
     );
     const call = getMock.mock.calls[0];
-    const options = call?.[1] as { query?: URLSearchParams };
-    expect(options.query?.toString()).toBe(
-      "content=hello&channel_id=c1&channel_id=c2&author_id=u1&limit=25",
+    expect(call?.[0]).toBe(
+      "/guilds/g1/messages/search?content=hello&channel_id=c1&channel_id=c2&author_id=u1&limit=25",
     );
   });
 });
@@ -546,13 +599,13 @@ describe("uploadStickerDiscord", () => {
           name: "clawdbot_wave",
           description: "Clawdbot waving",
           tags: "👋",
+          files: [
+            expect.objectContaining({
+              name: "asset.png",
+              contentType: "image/png",
+            }),
+          ],
         },
-        files: [
-          expect.objectContaining({
-            name: "asset.png",
-            contentType: "image/png",
-          }),
-        ],
       }),
     );
   });
@@ -621,5 +674,135 @@ describe("sendPollDiscord", () => {
         }),
       }),
     );
+  });
+});
+
+function createMockRateLimitError(retryAfter = 0.001): RateLimitError {
+  const response = new Response(null, {
+    status: 429,
+    headers: {
+      "X-RateLimit-Scope": "user",
+      "X-RateLimit-Bucket": "test-bucket",
+    },
+  });
+  return new RateLimitError(response, {
+    message: "You are being rate limited.",
+    retry_after: retryAfter,
+    global: false,
+  });
+}
+
+describe("retry rate limits", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it("retries on Discord rate limits", async () => {
+    const { rest, postMock } = makeRest();
+    const rateLimitError = createMockRateLimitError(0);
+
+    postMock
+      .mockRejectedValueOnce(rateLimitError)
+      .mockResolvedValueOnce({ id: "msg1", channel_id: "789" });
+
+    const res = await sendMessageDiscord("channel:789", "hello", {
+      rest,
+      token: "t",
+      retry: { attempts: 2, minDelayMs: 0, maxDelayMs: 0, jitter: 0 },
+    });
+
+    expect(res.messageId).toBe("msg1");
+    expect(postMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("uses retry_after delays when rate limited", async () => {
+    vi.useFakeTimers();
+    const setTimeoutSpy = vi.spyOn(global, "setTimeout");
+    const { rest, postMock } = makeRest();
+    const rateLimitError = createMockRateLimitError(0.5);
+
+    postMock
+      .mockRejectedValueOnce(rateLimitError)
+      .mockResolvedValueOnce({ id: "msg1", channel_id: "789" });
+
+    const promise = sendMessageDiscord("channel:789", "hello", {
+      rest,
+      token: "t",
+      retry: { attempts: 2, minDelayMs: 0, maxDelayMs: 1000, jitter: 0 },
+    });
+
+    await vi.runAllTimersAsync();
+    await expect(promise).resolves.toEqual({
+      messageId: "msg1",
+      channelId: "789",
+    });
+    expect(setTimeoutSpy.mock.calls[0]?.[1]).toBe(500);
+    setTimeoutSpy.mockRestore();
+    vi.useRealTimers();
+  });
+
+  it("stops after max retry attempts", async () => {
+    const { rest, postMock } = makeRest();
+    const rateLimitError = createMockRateLimitError(0);
+
+    postMock.mockRejectedValue(rateLimitError);
+
+    await expect(
+      sendMessageDiscord("channel:789", "hello", {
+        rest,
+        token: "t",
+        retry: { attempts: 2, minDelayMs: 0, maxDelayMs: 0, jitter: 0 },
+      }),
+    ).rejects.toBeInstanceOf(RateLimitError);
+    expect(postMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("does not retry non-rate-limit errors", async () => {
+    const { rest, postMock } = makeRest();
+    postMock.mockRejectedValueOnce(new Error("network error"));
+
+    await expect(
+      sendMessageDiscord("channel:789", "hello", { rest, token: "t" }),
+    ).rejects.toThrow("network error");
+    expect(postMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("retries reactions on rate limits", async () => {
+    const { rest, putMock } = makeRest();
+    const rateLimitError = createMockRateLimitError(0);
+
+    putMock
+      .mockRejectedValueOnce(rateLimitError)
+      .mockResolvedValueOnce(undefined);
+
+    const res = await reactMessageDiscord("chan1", "msg1", "ok", {
+      rest,
+      token: "t",
+      retry: { attempts: 2, minDelayMs: 0, maxDelayMs: 0, jitter: 0 },
+    });
+
+    expect(res.ok).toBe(true);
+    expect(putMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("retries media upload without duplicating overflow text", async () => {
+    const { rest, postMock } = makeRest();
+    const rateLimitError = createMockRateLimitError(0);
+    const text = "a".repeat(2005);
+
+    postMock
+      .mockRejectedValueOnce(rateLimitError)
+      .mockResolvedValueOnce({ id: "msg1", channel_id: "789" })
+      .mockResolvedValueOnce({ id: "msg2", channel_id: "789" });
+
+    const res = await sendMessageDiscord("channel:789", text, {
+      rest,
+      token: "t",
+      mediaUrl: "https://example.com/photo.jpg",
+      retry: { attempts: 2, minDelayMs: 0, maxDelayMs: 0, jitter: 0 },
+    });
+
+    expect(res.messageId).toBe("msg1");
+    expect(postMock).toHaveBeenCalledTimes(3);
   });
 });

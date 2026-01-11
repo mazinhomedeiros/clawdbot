@@ -6,7 +6,17 @@ import {
   Text,
   TUI,
 } from "@mariozechner/pi-tui";
+import { resolveDefaultAgentId } from "../agents/agent-scope.js";
+import { normalizeUsageDisplay } from "../auto-reply/thinking.js";
 import { loadConfig } from "../config/config.js";
+import { formatAge } from "../infra/provider-summary.js";
+import {
+  buildAgentMainSessionKey,
+  normalizeAgentId,
+  normalizeMainKey,
+  parseAgentSessionKey,
+} from "../routing/session-key.js";
+import { formatTokenCount } from "../utils/usage-format.js";
 import { getSlashCommands, helpText, parseCommand } from "./commands.js";
 import { ChatLog } from "./components/chat-log.js";
 import { CustomEditor } from "./components/custom-editor.js";
@@ -14,7 +24,7 @@ import {
   createSelectList,
   createSettingsList,
 } from "./components/selectors.js";
-import { GatewayChatClient } from "./gateway-chat.js";
+import { type GatewayAgentsList, GatewayChatClient } from "./gateway-chat.js";
 import { editorTheme, theme } from "./theme/theme.js";
 
 export type TuiOptions = {
@@ -26,6 +36,7 @@ export type TuiOptions = {
   thinking?: string;
   timeoutMs?: number;
   historyLimit?: number;
+  message?: string;
 };
 
 type ChatEvent = {
@@ -45,11 +56,47 @@ type AgentEvent = {
 type SessionInfo = {
   thinkingLevel?: string;
   verboseLevel?: string;
+  reasoningLevel?: string;
   model?: string;
+  modelProvider?: string;
   contextTokens?: number | null;
+  inputTokens?: number | null;
+  outputTokens?: number | null;
   totalTokens?: number | null;
+  responseUsage?: "on" | "off";
   updatedAt?: number | null;
   displayName?: string;
+};
+
+type SessionScope = "per-sender" | "global";
+
+type AgentSummary = {
+  id: string;
+  name?: string;
+};
+
+type GatewayStatusSummary = {
+  web?: { linked?: boolean; authAgeMs?: number | null };
+  heartbeatSeconds?: number;
+  providerSummary?: string[];
+  queuedSystemEvents?: string[];
+  sessions?: {
+    path?: string;
+    count?: number;
+    defaults?: { model?: string | null; contextTokens?: number | null };
+    recent?: Array<{
+      key: string;
+      kind?: string;
+      updatedAt?: number | null;
+      age?: number | null;
+      model?: string | null;
+      totalTokens?: number | null;
+      contextTokens?: number | null;
+      remainingTokens?: number | null;
+      percentUsed?: number | null;
+      flags?: string[];
+    }>;
+  };
 };
 
 function extractTextBlocks(
@@ -86,13 +133,39 @@ function extractTextFromMessage(
 }
 
 function formatTokens(total?: number | null, context?: number | null) {
-  if (!total && !context) return "tokens ?";
-  if (!context) return `tokens ${total ?? 0}`;
+  if (total == null && context == null) return "tokens ?";
+  const totalLabel = total == null ? "?" : formatTokenCount(total);
+  if (context == null) return `tokens ${totalLabel}`;
   const pct =
     typeof total === "number" && context > 0
       ? Math.min(999, Math.round((total / context) * 100))
       : null;
-  return `tokens ${total ?? 0}/${context}${pct !== null ? ` (${pct}%)` : ""}`;
+  return `tokens ${totalLabel}/${formatTokenCount(context)}${
+    pct !== null ? ` (${pct}%)` : ""
+  }`;
+}
+
+function formatContextUsageLine(params: {
+  total?: number | null;
+  context?: number | null;
+  remaining?: number | null;
+  percent?: number | null;
+}) {
+  const totalLabel =
+    typeof params.total === "number" ? formatTokenCount(params.total) : "?";
+  const ctxLabel =
+    typeof params.context === "number" ? formatTokenCount(params.context) : "?";
+  const pct =
+    typeof params.percent === "number"
+      ? Math.min(999, Math.round(params.percent))
+      : null;
+  const remainingLabel =
+    typeof params.remaining === "number"
+      ? `${formatTokenCount(params.remaining)} left`
+      : null;
+  const pctLabel = pct !== null ? `${pct}%` : null;
+  const extra = [remainingLabel, pctLabel].filter(Boolean).join(", ");
+  return `tokens ${totalLabel}/${ctxLabel}${extra ? ` (${extra})` : ""}`;
 }
 
 function asString(value: unknown, fallback = ""): string {
@@ -105,9 +178,16 @@ function asString(value: unknown, fallback = ""): string {
 
 export async function runTui(opts: TuiOptions) {
   const config = loadConfig();
-  const defaultSession =
-    (opts.session ?? config.session?.mainKey ?? "main").trim() || "main";
-  let currentSessionKey = defaultSession;
+  const initialSessionInput = (opts.session ?? "").trim();
+  let sessionScope: SessionScope = (config.session?.scope ??
+    "per-sender") as SessionScope;
+  let sessionMainKey = normalizeMainKey(config.session?.mainKey);
+  let agentDefaultId = resolveDefaultAgentId(config);
+  let currentAgentId = agentDefaultId;
+  let agents: AgentSummary[] = [];
+  const agentNames = new Map<string, string>();
+  let currentSessionKey = "";
+  let initialSessionApplied = false;
   let currentSessionId: string | null = null;
   let activeChatRunId: string | null = null;
   const finalizedRuns = new Map<string, number>();
@@ -115,9 +195,14 @@ export async function runTui(opts: TuiOptions) {
   let isConnected = false;
   let toolsExpanded = false;
   let showThinking = false;
-  let deliverDefault = Boolean(opts.deliver);
+  const deliverDefault = opts.deliver ?? true;
+  const autoMessage = opts.message?.trim();
+  let autoMessageSent = false;
   let sessionInfo: SessionInfo = {};
   let lastCtrlCAt = 0;
+  let activityStatus = "idle";
+  let connectionStatus = "connecting";
+  let statusTimeout: NodeJS.Timeout | null = null;
 
   const client = new GatewayChatClient({
     url: opts.url,
@@ -143,10 +228,39 @@ export async function runTui(opts: TuiOptions) {
   tui.addChild(root);
   tui.setFocus(editor);
 
+  const formatSessionKey = (key: string) => {
+    if (key === "global" || key === "unknown") return key;
+    const parsed = parseAgentSessionKey(key);
+    return parsed?.rest ?? key;
+  };
+
+  const formatAgentLabel = (id: string) => {
+    const name = agentNames.get(id);
+    return name ? `${id} (${name})` : id;
+  };
+
+  const resolveSessionKey = (raw?: string) => {
+    const trimmed = (raw ?? "").trim();
+    if (sessionScope === "global") return "global";
+    if (!trimmed) {
+      return buildAgentMainSessionKey({
+        agentId: currentAgentId,
+        mainKey: sessionMainKey,
+      });
+    }
+    if (trimmed === "global" || trimmed === "unknown") return trimmed;
+    if (trimmed.startsWith("agent:")) return trimmed;
+    return `agent:${currentAgentId}:${trimmed}`;
+  };
+
+  currentSessionKey = resolveSessionKey(initialSessionInput);
+
   const updateHeader = () => {
+    const sessionLabel = formatSessionKey(currentSessionKey);
+    const agentLabel = formatAgentLabel(currentAgentId);
     header.setText(
       theme.header(
-        `clawdbot tui - ${client.connection.url} - session ${currentSessionKey}`,
+        `clawdbot tui - ${client.connection.url} - agent ${agentLabel} - session ${sessionLabel}`,
       ),
     );
   };
@@ -155,24 +269,135 @@ export async function runTui(opts: TuiOptions) {
     status.setText(theme.dim(text));
   };
 
+  const renderStatus = () => {
+    const text = activityStatus
+      ? `${connectionStatus} | ${activityStatus}`
+      : connectionStatus;
+    setStatus(text);
+  };
+
+  const setConnectionStatus = (text: string, ttlMs?: number) => {
+    connectionStatus = text;
+    renderStatus();
+    if (statusTimeout) clearTimeout(statusTimeout);
+    if (ttlMs && ttlMs > 0) {
+      statusTimeout = setTimeout(() => {
+        connectionStatus = isConnected ? "connected" : "disconnected";
+        renderStatus();
+      }, ttlMs);
+    }
+  };
+
+  const setActivityStatus = (text: string) => {
+    activityStatus = text;
+    renderStatus();
+  };
+
   const updateFooter = () => {
-    const connection = isConnected ? "connected" : "disconnected";
+    const sessionKeyLabel = formatSessionKey(currentSessionKey);
     const sessionLabel = sessionInfo.displayName
-      ? `${currentSessionKey} (${sessionInfo.displayName})`
-      : currentSessionKey;
-    const modelLabel = sessionInfo.model ?? "unknown";
+      ? `${sessionKeyLabel} (${sessionInfo.displayName})`
+      : sessionKeyLabel;
+    const agentLabel = formatAgentLabel(currentAgentId);
+    const modelLabel = sessionInfo.model
+      ? sessionInfo.modelProvider
+        ? `${sessionInfo.modelProvider}/${sessionInfo.model}`
+        : sessionInfo.model
+      : "unknown";
     const tokens = formatTokens(
       sessionInfo.totalTokens ?? null,
       sessionInfo.contextTokens ?? null,
     );
     const think = sessionInfo.thinkingLevel ?? "off";
     const verbose = sessionInfo.verboseLevel ?? "off";
-    const deliver = deliverDefault ? "on" : "off";
+    const reasoning = sessionInfo.reasoningLevel ?? "off";
+    const reasoningLabel =
+      reasoning === "on"
+        ? "reasoning"
+        : reasoning === "stream"
+          ? "reasoning:stream"
+          : null;
     footer.setText(
       theme.dim(
-        `${connection} | session ${sessionLabel} | model ${modelLabel} | think ${think} | verbose ${verbose} | ${tokens} | deliver ${deliver}`,
+        `agent ${agentLabel} | session ${sessionLabel} | ${modelLabel} | think ${think} | verbose ${verbose}${reasoningLabel ? ` | ${reasoningLabel}` : ""} | ${tokens}`,
       ),
     );
+  };
+
+  const formatStatusSummary = (summary: GatewayStatusSummary) => {
+    const lines: string[] = [];
+    lines.push("Gateway status");
+
+    const webLinked = summary.web?.linked === true;
+    const authAge =
+      webLinked && typeof summary.web?.authAgeMs === "number"
+        ? ` (last refreshed ${formatAge(summary.web.authAgeMs)})`
+        : "";
+    lines.push(`Web session: ${webLinked ? "linked" : "not linked"}${authAge}`);
+
+    const providerSummary = Array.isArray(summary.providerSummary)
+      ? summary.providerSummary
+      : [];
+    if (providerSummary.length > 0) {
+      lines.push("");
+      lines.push("System:");
+      for (const line of providerSummary) {
+        lines.push(`  ${line}`);
+      }
+    }
+
+    if (typeof summary.heartbeatSeconds === "number") {
+      lines.push("");
+      lines.push(`Heartbeat: ${summary.heartbeatSeconds}s`);
+    }
+
+    const sessionPath = summary.sessions?.path;
+    if (sessionPath) lines.push(`Session store: ${sessionPath}`);
+
+    const defaults = summary.sessions?.defaults;
+    const defaultModel = defaults?.model ?? "unknown";
+    const defaultCtx =
+      typeof defaults?.contextTokens === "number"
+        ? ` (${formatTokenCount(defaults.contextTokens)} ctx)`
+        : "";
+    lines.push(`Default model: ${defaultModel}${defaultCtx}`);
+
+    const sessionCount = summary.sessions?.count ?? 0;
+    lines.push(`Active sessions: ${sessionCount}`);
+
+    const recent = Array.isArray(summary.sessions?.recent)
+      ? summary.sessions?.recent
+      : [];
+    if (recent.length > 0) {
+      lines.push("Recent sessions:");
+      for (const entry of recent) {
+        const ageLabel =
+          typeof entry.age === "number" ? formatAge(entry.age) : "no activity";
+        const model = entry.model ?? "unknown";
+        const usage = formatContextUsageLine({
+          total: entry.totalTokens ?? null,
+          context: entry.contextTokens ?? null,
+          remaining: entry.remainingTokens ?? null,
+          percent: entry.percentUsed ?? null,
+        });
+        const flags = entry.flags?.length
+          ? ` | flags: ${entry.flags.join(", ")}`
+          : "";
+        lines.push(
+          `- ${entry.key}${entry.kind ? ` [${entry.kind}]` : ""} | ${ageLabel} | model ${model} | ${usage}${flags}`,
+        );
+      }
+    }
+
+    const queued = Array.isArray(summary.queuedSystemEvents)
+      ? summary.queuedSystemEvents
+      : [];
+    if (queued.length > 0) {
+      const preview = queued.slice(0, 3).join(" | ");
+      lines.push(`Queued system events (${queued.length}): ${preview}`);
+    }
+
+    return lines;
   };
 
   const closeOverlay = () => {
@@ -186,21 +411,93 @@ export async function runTui(opts: TuiOptions) {
     tui.setFocus(component);
   };
 
+  const initialSessionAgentId = (() => {
+    if (!initialSessionInput) return null;
+    const parsed = parseAgentSessionKey(initialSessionInput);
+    return parsed ? normalizeAgentId(parsed.agentId) : null;
+  })();
+
+  const applyAgentsResult = (result: GatewayAgentsList) => {
+    agentDefaultId = normalizeAgentId(result.defaultId);
+    sessionMainKey = normalizeMainKey(result.mainKey);
+    sessionScope = result.scope ?? sessionScope;
+    agents = result.agents.map((agent) => ({
+      id: normalizeAgentId(agent.id),
+      name: agent.name?.trim() || undefined,
+    }));
+    agentNames.clear();
+    for (const agent of agents) {
+      if (agent.name) agentNames.set(agent.id, agent.name);
+    }
+    if (!initialSessionApplied) {
+      if (initialSessionAgentId) {
+        if (agents.some((agent) => agent.id === initialSessionAgentId)) {
+          currentAgentId = initialSessionAgentId;
+        }
+      } else if (!agents.some((agent) => agent.id === currentAgentId)) {
+        currentAgentId =
+          agents[0]?.id ?? normalizeAgentId(result.defaultId ?? currentAgentId);
+      }
+      const nextSessionKey = resolveSessionKey(initialSessionInput);
+      if (nextSessionKey !== currentSessionKey) {
+        currentSessionKey = nextSessionKey;
+      }
+      initialSessionApplied = true;
+    } else if (!agents.some((agent) => agent.id === currentAgentId)) {
+      currentAgentId =
+        agents[0]?.id ?? normalizeAgentId(result.defaultId ?? currentAgentId);
+    }
+    updateHeader();
+    updateFooter();
+  };
+
+  const refreshAgents = async () => {
+    try {
+      const result = await client.listAgents();
+      applyAgentsResult(result);
+    } catch (err) {
+      chatLog.addSystem(`agents list failed: ${String(err)}`);
+    }
+  };
+
+  const updateAgentFromSessionKey = (key: string) => {
+    const parsed = parseAgentSessionKey(key);
+    if (!parsed) return;
+    const next = normalizeAgentId(parsed.agentId);
+    if (next !== currentAgentId) {
+      currentAgentId = next;
+    }
+  };
+
   const refreshSessionInfo = async () => {
     try {
+      const listAgentId =
+        currentSessionKey === "global" || currentSessionKey === "unknown"
+          ? undefined
+          : currentAgentId;
       const result = await client.listSessions({
         includeGlobal: false,
         includeUnknown: false,
+        agentId: listAgentId,
       });
-      const entry = result.sessions.find(
-        (row) => row.key === currentSessionKey,
-      );
+      const entry = result.sessions.find((row) => {
+        // Exact match
+        if (row.key === currentSessionKey) return true;
+        // Also match canonical keys like "agent:default:main" against "main"
+        const parsed = parseAgentSessionKey(row.key);
+        return parsed?.rest === currentSessionKey;
+      });
       sessionInfo = {
         thinkingLevel: entry?.thinkingLevel,
         verboseLevel: entry?.verboseLevel,
+        reasoningLevel: entry?.reasoningLevel,
         model: entry?.model ?? result.defaults?.model ?? undefined,
+        modelProvider: entry?.modelProvider,
         contextTokens: entry?.contextTokens ?? result.defaults?.contextTokens,
+        inputTokens: entry?.inputTokens ?? null,
+        outputTokens: entry?.outputTokens ?? null,
         totalTokens: entry?.totalTokens ?? null,
+        responseUsage: entry?.responseUsage,
         updatedAt: entry?.updatedAt ?? null,
         displayName: entry?.displayName,
       };
@@ -269,12 +566,15 @@ export async function runTui(opts: TuiOptions) {
     tui.requestRender();
   };
 
-  const setSession = async (key: string) => {
-    currentSessionKey = key;
+  const setSession = async (rawKey: string) => {
+    const nextKey = resolveSessionKey(rawKey);
+    updateAgentFromSessionKey(nextKey);
+    currentSessionKey = nextKey;
     activeChatRunId = null;
     currentSessionId = null;
     historyLoaded = false;
     updateHeader();
+    updateFooter();
     await loadHistory();
   };
 
@@ -289,10 +589,10 @@ export async function runTui(opts: TuiOptions) {
         sessionKey: currentSessionKey,
         runId: activeChatRunId,
       });
-      setStatus("aborted");
+      setActivityStatus("aborted");
     } catch (err) {
       chatLog.addSystem(`abort failed: ${String(err)}`);
-      setStatus("abort failed");
+      setActivityStatus("abort failed");
     }
     tui.requestRender();
   };
@@ -327,7 +627,7 @@ export async function runTui(opts: TuiOptions) {
       });
       if (!text) return;
       chatLog.updateAssistant(text, evt.runId);
-      setStatus("streaming");
+      setActivityStatus("streaming");
     }
     if (evt.state === "final") {
       const text = extractTextFromMessage(evt.message, {
@@ -336,17 +636,17 @@ export async function runTui(opts: TuiOptions) {
       chatLog.finalizeAssistant(text || "(no output)", evt.runId);
       noteFinalizedRun(evt.runId);
       activeChatRunId = null;
-      setStatus("idle");
+      setActivityStatus("idle");
     }
     if (evt.state === "aborted") {
       chatLog.addSystem("run aborted");
       activeChatRunId = null;
-      setStatus("aborted");
+      setActivityStatus("aborted");
     }
     if (evt.state === "error") {
       chatLog.addSystem(`run error: ${evt.errorMessage ?? "unknown"}`);
       activeChatRunId = null;
-      setStatus("error");
+      setActivityStatus("error");
     }
     tui.requestRender();
   };
@@ -377,9 +677,9 @@ export async function runTui(opts: TuiOptions) {
     }
     if (evt.stream === "lifecycle") {
       const phase = typeof evt.data?.phase === "string" ? evt.data.phase : "";
-      if (phase === "start") setStatus("running");
-      if (phase === "end") setStatus("idle");
-      if (phase === "error") setStatus("error");
+      if (phase === "start") setActivityStatus("running");
+      if (phase === "end") setActivityStatus("idle");
+      if (phase === "error") setActivityStatus("error");
       tui.requestRender();
     }
   };
@@ -426,15 +726,51 @@ export async function runTui(opts: TuiOptions) {
     }
   };
 
+  const setAgent = async (id: string) => {
+    currentAgentId = normalizeAgentId(id);
+    await setSession("");
+  };
+
+  const openAgentSelector = async () => {
+    await refreshAgents();
+    if (agents.length === 0) {
+      chatLog.addSystem("no agents found");
+      tui.requestRender();
+      return;
+    }
+    const items = agents.map((agent) => ({
+      value: agent.id,
+      label: agent.name ? `${agent.id} (${agent.name})` : agent.id,
+      description: agent.id === agentDefaultId ? "default" : "",
+    }));
+    const selector = createSelectList(items, 9);
+    selector.onSelect = (item) => {
+      void (async () => {
+        closeOverlay();
+        await setAgent(item.value);
+        tui.requestRender();
+      })();
+    };
+    selector.onCancel = () => {
+      closeOverlay();
+      tui.requestRender();
+    };
+    openOverlay(selector);
+    tui.requestRender();
+  };
+
   const openSessionSelector = async () => {
     try {
       const result = await client.listSessions({
         includeGlobal: false,
         includeUnknown: false,
+        agentId: currentAgentId,
       });
       const items = result.sessions.map((session) => ({
         value: session.key,
-        label: session.displayName ?? session.key,
+        label: session.displayName
+          ? `${session.displayName} (${formatSessionKey(session.key)})`
+          : formatSessionKey(session.key),
         description: session.updatedAt
           ? new Date(session.updatedAt).toLocaleString()
           : "",
@@ -462,12 +798,6 @@ export async function runTui(opts: TuiOptions) {
   const openSettings = () => {
     const items = [
       {
-        id: "deliver",
-        label: "Deliver replies",
-        currentValue: deliverDefault ? "on" : "off",
-        values: ["off", "on"],
-      },
-      {
         id: "tools",
         label: "Tool output",
         currentValue: toolsExpanded ? "expanded" : "collapsed",
@@ -483,10 +813,6 @@ export async function runTui(opts: TuiOptions) {
     const settings = createSettingsList(
       items,
       (id, value) => {
-        if (id === "deliver") {
-          deliverDefault = value === "on";
-          updateFooter();
-        }
         if (id === "tools") {
           toolsExpanded = value === "expanded";
           chatLog.setToolsExpanded(toolsExpanded);
@@ -516,14 +842,29 @@ export async function runTui(opts: TuiOptions) {
       case "status":
         try {
           const status = await client.getStatus();
-          chatLog.addSystem(
-            typeof status === "string"
-              ? status
-              : JSON.stringify(status, null, 2),
-          );
+          if (typeof status === "string") {
+            chatLog.addSystem(status);
+            break;
+          }
+          if (status && typeof status === "object") {
+            const lines = formatStatusSummary(status as GatewayStatusSummary);
+            for (const line of lines) chatLog.addSystem(line);
+            break;
+          }
+          chatLog.addSystem("status: unknown response");
         } catch (err) {
           chatLog.addSystem(`status failed: ${String(err)}`);
         }
+        break;
+      case "agent":
+        if (!args) {
+          await openAgentSelector();
+        } else {
+          await setAgent(args);
+        }
+        break;
+      case "agents":
+        await openAgentSelector();
         break;
       case "session":
         if (!args) {
@@ -586,6 +927,44 @@ export async function runTui(opts: TuiOptions) {
           chatLog.addSystem(`verbose failed: ${String(err)}`);
         }
         break;
+      case "reasoning":
+        if (!args) {
+          chatLog.addSystem("usage: /reasoning <on|off>");
+          break;
+        }
+        try {
+          await client.patchSession({
+            key: currentSessionKey,
+            reasoningLevel: args,
+          });
+          chatLog.addSystem(`reasoning set to ${args}`);
+          await refreshSessionInfo();
+        } catch (err) {
+          chatLog.addSystem(`reasoning failed: ${String(err)}`);
+        }
+        break;
+      case "cost": {
+        const normalized = args ? normalizeUsageDisplay(args) : undefined;
+        if (args && !normalized) {
+          chatLog.addSystem("usage: /cost <on|off>");
+          break;
+        }
+        const current = sessionInfo.responseUsage === "on" ? "on" : "off";
+        const next = normalized ?? (current === "on" ? "off" : "on");
+        try {
+          await client.patchSession({
+            key: currentSessionKey,
+            responseUsage: next === "off" ? null : next,
+          });
+          chatLog.addSystem(
+            next === "on" ? "usage line enabled" : "usage line disabled",
+          );
+          await refreshSessionInfo();
+        } catch (err) {
+          chatLog.addSystem(`cost failed: ${String(err)}`);
+        }
+        break;
+      }
       case "elevated":
         if (!args) {
           chatLog.addSystem("usage: /elevated <on|off>");
@@ -617,15 +996,6 @@ export async function runTui(opts: TuiOptions) {
         } catch (err) {
           chatLog.addSystem(`activation failed: ${String(err)}`);
         }
-        break;
-      case "deliver":
-        if (!args) {
-          chatLog.addSystem("usage: /deliver <on|off>");
-          break;
-        }
-        deliverDefault = args === "on";
-        updateFooter();
-        chatLog.addSystem(`deliver ${deliverDefault ? "on" : "off"}`);
         break;
       case "new":
       case "reset":
@@ -660,7 +1030,7 @@ export async function runTui(opts: TuiOptions) {
     try {
       chatLog.addUser(text);
       tui.requestRender();
-      setStatus("sending");
+      setActivityStatus("sending");
       const { runId } = await client.sendChat({
         sessionKey: currentSessionKey,
         message: text,
@@ -669,10 +1039,10 @@ export async function runTui(opts: TuiOptions) {
         timeoutMs: opts.timeoutMs,
       });
       activeChatRunId = runId;
-      setStatus("waiting");
+      setActivityStatus("waiting");
     } catch (err) {
       chatLog.addSystem(`send failed: ${String(err)}`);
-      setStatus("error");
+      setActivityStatus("error");
     }
     tui.requestRender();
   };
@@ -698,7 +1068,7 @@ export async function runTui(opts: TuiOptions) {
     const now = Date.now();
     if (editor.getText().trim().length > 0) {
       editor.setText("");
-      setStatus("cleared input");
+      setActivityStatus("cleared input");
       tui.requestRender();
       return;
     }
@@ -708,7 +1078,7 @@ export async function runTui(opts: TuiOptions) {
       process.exit(0);
     }
     lastCtrlCAt = now;
-    setStatus("press ctrl+c again to exit");
+    setActivityStatus("press ctrl+c again to exit");
     tui.requestRender();
   };
   editor.onCtrlD = () => {
@@ -719,11 +1089,14 @@ export async function runTui(opts: TuiOptions) {
   editor.onCtrlO = () => {
     toolsExpanded = !toolsExpanded;
     chatLog.setToolsExpanded(toolsExpanded);
-    setStatus(toolsExpanded ? "tools expanded" : "tools collapsed");
+    setActivityStatus(toolsExpanded ? "tools expanded" : "tools collapsed");
     tui.requestRender();
   };
   editor.onCtrlL = () => {
     void openModelSelector();
+  };
+  editor.onCtrlG = () => {
+    void openAgentSelector();
   };
   editor.onCtrlP = () => {
     void openSessionSelector();
@@ -740,39 +1113,46 @@ export async function runTui(opts: TuiOptions) {
 
   client.onConnected = () => {
     isConnected = true;
-    setStatus("connected");
-    updateHeader();
-    if (!historyLoaded) {
-      void loadHistory().then(() => {
-        chatLog.addSystem("gateway connected");
+    setConnectionStatus("connected");
+    void (async () => {
+      await refreshAgents();
+      updateHeader();
+      if (!historyLoaded) {
+        await loadHistory();
+        setConnectionStatus("gateway connected", 4000);
         tui.requestRender();
-      });
-    } else {
-      chatLog.addSystem("gateway reconnected");
-    }
-    updateFooter();
-    tui.requestRender();
+        if (!autoMessageSent && autoMessage) {
+          autoMessageSent = true;
+          await sendMessage(autoMessage);
+        }
+      } else {
+        setConnectionStatus("gateway reconnected", 4000);
+      }
+      updateFooter();
+      tui.requestRender();
+    })();
   };
 
   client.onDisconnected = (reason) => {
     isConnected = false;
-    chatLog.addSystem(`gateway disconnected: ${reason || "closed"}`);
-    setStatus("disconnected");
+    const reasonLabel = reason?.trim() ? reason.trim() : "closed";
+    setConnectionStatus(`gateway disconnected: ${reasonLabel}`, 5000);
+    setActivityStatus("idle");
     updateFooter();
     tui.requestRender();
   };
 
   client.onGap = (info) => {
-    chatLog.addSystem(
+    setConnectionStatus(
       `event gap: expected ${info.expected}, got ${info.received}`,
+      5000,
     );
     tui.requestRender();
   };
 
   updateHeader();
-  setStatus("connecting");
+  setConnectionStatus("connecting");
   updateFooter();
-  chatLog.addSystem("connecting...");
   tui.start();
   client.start();
 }

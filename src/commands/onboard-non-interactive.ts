@@ -1,5 +1,12 @@
 import path from "node:path";
-
+import {
+  CLAUDE_CLI_PROFILE_ID,
+  CODEX_CLI_PROFILE_ID,
+  ensureAuthProfileStore,
+  resolveApiKeyForProfile,
+  resolveAuthProfileOrder,
+} from "../agents/auth-profiles.js";
+import { resolveEnvApiKey } from "../agents/model-auth.js";
 import {
   type ClawdbotConfig,
   CONFIG_PATH_CLAWDBOT,
@@ -9,15 +16,32 @@ import {
 } from "../config/config.js";
 import { GATEWAY_LAUNCH_AGENT_LABEL } from "../daemon/constants.js";
 import { resolveGatewayProgramArguments } from "../daemon/program-args.js";
+import { resolvePreferredNodePath } from "../daemon/runtime-paths.js";
 import { resolveGatewayService } from "../daemon/service.js";
+import { buildServiceEnvironment } from "../daemon/service-env.js";
+import { isSystemdUserServiceAvailable } from "../daemon/systemd.js";
+import { upsertSharedEnvVar } from "../infra/env-file.js";
 import type { RuntimeEnv } from "../runtime.js";
 import { defaultRuntime } from "../runtime.js";
 import { resolveUserPath, sleep } from "../utils.js";
+import {
+  DEFAULT_GATEWAY_DAEMON_RUNTIME,
+  isGatewayDaemonRuntime,
+} from "./daemon-runtime.js";
+import { applyGoogleGeminiModelDefault } from "./google-gemini-model-default.js";
 import { healthCommand } from "./health.js";
 import {
   applyAuthProfileConfig,
+  applyMinimaxApiConfig,
   applyMinimaxConfig,
+  applyMinimaxHostedConfig,
+  applyOpencodeZenConfig,
+  applyZaiConfig,
   setAnthropicApiKey,
+  setGeminiApiKey,
+  setMinimaxApiKey,
+  setOpencodeZenApiKey,
+  setZaiApiKey,
 } from "./onboard-auth.js";
 import {
   applyWizardMetadata,
@@ -25,12 +49,72 @@ import {
   ensureWorkspaceAndSessions,
   randomToken,
 } from "./onboard-helpers.js";
-import type {
-  AuthChoice,
-  OnboardMode,
-  OnboardOptions,
-} from "./onboard-types.js";
+import type { AuthChoice, OnboardOptions } from "./onboard-types.js";
+import { applyOpenAICodexModelDefault } from "./openai-codex-model-default.js";
 import { ensureSystemdUserLingerNonInteractive } from "./systemd-linger.js";
+
+type NonInteractiveApiKeySource = "flag" | "env" | "profile";
+
+async function resolveApiKeyFromProfiles(params: {
+  provider: string;
+  cfg: ClawdbotConfig;
+  agentDir?: string;
+}): Promise<string | null> {
+  const store = ensureAuthProfileStore(params.agentDir);
+  const order = resolveAuthProfileOrder({
+    cfg: params.cfg,
+    store,
+    provider: params.provider,
+  });
+  for (const profileId of order) {
+    const cred = store.profiles[profileId];
+    if (cred?.type !== "api_key") continue;
+    const resolved = await resolveApiKeyForProfile({
+      cfg: params.cfg,
+      store,
+      profileId,
+      agentDir: params.agentDir,
+    });
+    if (resolved?.apiKey) return resolved.apiKey;
+  }
+  return null;
+}
+
+async function resolveNonInteractiveApiKey(params: {
+  provider: string;
+  cfg: ClawdbotConfig;
+  flagValue?: string;
+  flagName: string;
+  envVar: string;
+  runtime: RuntimeEnv;
+  agentDir?: string;
+  allowProfile?: boolean;
+}): Promise<{ key: string; source: NonInteractiveApiKeySource } | null> {
+  const flagKey = params.flagValue?.trim();
+  if (flagKey) return { key: flagKey, source: "flag" };
+
+  const envResolved = resolveEnvApiKey(params.provider);
+  if (envResolved?.apiKey) return { key: envResolved.apiKey, source: "env" };
+
+  if (params.allowProfile ?? true) {
+    const profileKey = await resolveApiKeyFromProfiles({
+      provider: params.provider,
+      cfg: params.cfg,
+      agentDir: params.agentDir,
+    });
+    if (profileKey) return { key: profileKey, source: "profile" };
+  }
+
+  const profileHint =
+    params.allowProfile === false
+      ? ""
+      : `, or existing ${params.provider} API-key profile`;
+  params.runtime.error(
+    `Missing ${params.flagName} (or ${params.envVar} in env${profileHint}).`,
+  );
+  params.runtime.exit(1);
+  return null;
+}
 
 export async function runNonInteractiveOnboarding(
   opts: OnboardOptions,
@@ -38,7 +122,12 @@ export async function runNonInteractiveOnboarding(
 ) {
   const snapshot = await readConfigFileSnapshot();
   const baseConfig: ClawdbotConfig = snapshot.valid ? snapshot.config : {};
-  const mode: OnboardMode = opts.mode ?? "local";
+  const mode = opts.mode ?? "local";
+  if (mode !== "local" && mode !== "remote") {
+    runtime.error(`Invalid --mode "${String(mode)}" (use local|remote).`);
+    runtime.exit(1);
+    return;
+  }
 
   if (mode === "remote") {
     const remoteUrl = opts.remoteUrl?.trim();
@@ -78,14 +167,21 @@ export async function runNonInteractiveOnboarding(
   }
 
   const workspaceDir = resolveUserPath(
-    (opts.workspace ?? baseConfig.agent?.workspace ?? DEFAULT_WORKSPACE).trim(),
+    (
+      opts.workspace ??
+      baseConfig.agents?.defaults?.workspace ??
+      DEFAULT_WORKSPACE
+    ).trim(),
   );
 
   let nextConfig: ClawdbotConfig = {
     ...baseConfig,
-    agent: {
-      ...baseConfig.agent,
-      workspace: workspaceDir,
+    agents: {
+      ...baseConfig.agents,
+      defaults: {
+        ...baseConfig.agents?.defaults,
+        workspace: workspaceDir,
+      },
     },
     gateway: {
       ...baseConfig.gateway,
@@ -95,32 +191,182 @@ export async function runNonInteractiveOnboarding(
 
   const authChoice: AuthChoice = opts.authChoice ?? "skip";
   if (authChoice === "apiKey") {
-    const key = opts.anthropicApiKey?.trim();
-    if (!key) {
-      runtime.error("Missing --anthropic-api-key");
-      runtime.exit(1);
-      return;
+    const resolved = await resolveNonInteractiveApiKey({
+      provider: "anthropic",
+      cfg: baseConfig,
+      flagValue: opts.anthropicApiKey,
+      flagName: "--anthropic-api-key",
+      envVar: "ANTHROPIC_API_KEY",
+      runtime,
+    });
+    if (!resolved) return;
+    if (resolved.source !== "profile") {
+      await setAnthropicApiKey(resolved.key);
     }
-    await setAnthropicApiKey(key);
     nextConfig = applyAuthProfileConfig(nextConfig, {
       profileId: "anthropic:default",
       provider: "anthropic",
       mode: "api_key",
     });
+  } else if (authChoice === "gemini-api-key") {
+    const resolved = await resolveNonInteractiveApiKey({
+      provider: "google",
+      cfg: baseConfig,
+      flagValue: opts.geminiApiKey,
+      flagName: "--gemini-api-key",
+      envVar: "GEMINI_API_KEY",
+      runtime,
+    });
+    if (!resolved) return;
+    if (resolved.source !== "profile") {
+      await setGeminiApiKey(resolved.key);
+    }
+    nextConfig = applyAuthProfileConfig(nextConfig, {
+      profileId: "google:default",
+      provider: "google",
+      mode: "api_key",
+    });
+    nextConfig = applyGoogleGeminiModelDefault(nextConfig).next;
+  } else if (authChoice === "zai-api-key") {
+    const resolved = await resolveNonInteractiveApiKey({
+      provider: "zai",
+      cfg: baseConfig,
+      flagValue: opts.zaiApiKey,
+      flagName: "--zai-api-key",
+      envVar: "ZAI_API_KEY",
+      runtime,
+    });
+    if (!resolved) return;
+    if (resolved.source !== "profile") {
+      await setZaiApiKey(resolved.key);
+    }
+    nextConfig = applyAuthProfileConfig(nextConfig, {
+      profileId: "zai:default",
+      provider: "zai",
+      mode: "api_key",
+    });
+    nextConfig = applyZaiConfig(nextConfig);
+  } else if (authChoice === "openai-api-key") {
+    const resolved = await resolveNonInteractiveApiKey({
+      provider: "openai",
+      cfg: baseConfig,
+      flagValue: opts.openaiApiKey,
+      flagName: "--openai-api-key",
+      envVar: "OPENAI_API_KEY",
+      runtime,
+      allowProfile: false,
+    });
+    if (!resolved) return;
+    const key = resolved.key;
+    const result = upsertSharedEnvVar({
+      key: "OPENAI_API_KEY",
+      value: key,
+    });
+    process.env.OPENAI_API_KEY = key;
+    runtime.log(`Saved OPENAI_API_KEY to ${result.path}`);
+  } else if (authChoice === "minimax-cloud") {
+    const resolved = await resolveNonInteractiveApiKey({
+      provider: "minimax",
+      cfg: baseConfig,
+      flagValue: opts.minimaxApiKey,
+      flagName: "--minimax-api-key",
+      envVar: "MINIMAX_API_KEY",
+      runtime,
+    });
+    if (!resolved) return;
+    if (resolved.source !== "profile") {
+      await setMinimaxApiKey(resolved.key);
+    }
+    nextConfig = applyAuthProfileConfig(nextConfig, {
+      profileId: "minimax:default",
+      provider: "minimax",
+      mode: "api_key",
+    });
+    nextConfig = applyMinimaxHostedConfig(nextConfig);
+  } else if (authChoice === "minimax-api") {
+    const resolved = await resolveNonInteractiveApiKey({
+      provider: "minimax",
+      cfg: baseConfig,
+      flagValue: opts.minimaxApiKey,
+      flagName: "--minimax-api-key",
+      envVar: "MINIMAX_API_KEY",
+      runtime,
+    });
+    if (!resolved) return;
+    if (resolved.source !== "profile") {
+      await setMinimaxApiKey(resolved.key);
+    }
+    nextConfig = applyAuthProfileConfig(nextConfig, {
+      profileId: "minimax:default",
+      provider: "minimax",
+      mode: "api_key",
+    });
+    nextConfig = applyMinimaxApiConfig(nextConfig);
+  } else if (authChoice === "claude-cli") {
+    const store = ensureAuthProfileStore(undefined, {
+      allowKeychainPrompt: false,
+    });
+    if (!store.profiles[CLAUDE_CLI_PROFILE_ID]) {
+      runtime.error(
+        process.platform === "darwin"
+          ? 'No Claude CLI credentials found. Run interactive onboarding to approve Keychain access for "Claude Code-credentials".'
+          : "No Claude CLI credentials found at ~/.claude/.credentials.json",
+      );
+      runtime.exit(1);
+      return;
+    }
+    nextConfig = applyAuthProfileConfig(nextConfig, {
+      profileId: CLAUDE_CLI_PROFILE_ID,
+      provider: "anthropic",
+      mode: "token",
+    });
+  } else if (authChoice === "codex-cli") {
+    const store = ensureAuthProfileStore();
+    if (!store.profiles[CODEX_CLI_PROFILE_ID]) {
+      runtime.error("No Codex CLI credentials found at ~/.codex/auth.json");
+      runtime.exit(1);
+      return;
+    }
+    nextConfig = applyAuthProfileConfig(nextConfig, {
+      profileId: CODEX_CLI_PROFILE_ID,
+      provider: "openai-codex",
+      mode: "oauth",
+    });
+    nextConfig = applyOpenAICodexModelDefault(nextConfig).next;
   } else if (authChoice === "minimax") {
     nextConfig = applyMinimaxConfig(nextConfig);
+  } else if (authChoice === "opencode-zen") {
+    const resolved = await resolveNonInteractiveApiKey({
+      provider: "opencode",
+      cfg: baseConfig,
+      flagValue: opts.opencodeZenApiKey,
+      flagName: "--opencode-zen-api-key",
+      envVar: "OPENCODE_API_KEY (or OPENCODE_ZEN_API_KEY)",
+      runtime,
+    });
+    if (!resolved) return;
+    if (resolved.source !== "profile") {
+      await setOpencodeZenApiKey(resolved.key);
+    }
+    nextConfig = applyAuthProfileConfig(nextConfig, {
+      profileId: "opencode:default",
+      provider: "opencode",
+      mode: "api_key",
+    });
+    nextConfig = applyOpencodeZenConfig(nextConfig);
   } else if (
+    authChoice === "token" ||
     authChoice === "oauth" ||
     authChoice === "openai-codex" ||
     authChoice === "antigravity"
   ) {
-    runtime.error(
-      `${
-        authChoice === "oauth" || authChoice === "openai-codex"
-          ? "OAuth"
-          : "Antigravity"
-      } requires interactive mode.`,
-    );
+    const label =
+      authChoice === "antigravity"
+        ? "Antigravity"
+        : authChoice === "token"
+          ? "Token"
+          : "OAuth";
+    runtime.error(`${label} requires interactive mode.`);
     runtime.exit(1);
     return;
   }
@@ -159,7 +405,11 @@ export async function runNonInteractiveOnboarding(
       ...nextConfig,
       gateway: {
         ...nextConfig.gateway,
-        auth: { ...nextConfig.gateway?.auth, mode: "token" },
+        auth: {
+          ...nextConfig.gateway?.auth,
+          mode: "token",
+          token: gatewayToken,
+        },
       },
     };
   }
@@ -220,30 +470,59 @@ export async function runNonInteractiveOnboarding(
   await writeConfigFile(nextConfig);
   runtime.log(`Updated ${CONFIG_PATH_CLAWDBOT}`);
   await ensureWorkspaceAndSessions(workspaceDir, runtime, {
-    skipBootstrap: Boolean(nextConfig.agent?.skipBootstrap),
+    skipBootstrap: Boolean(nextConfig.agents?.defaults?.skipBootstrap),
   });
 
+  const daemonRuntimeRaw = opts.daemonRuntime ?? DEFAULT_GATEWAY_DAEMON_RUNTIME;
+
   if (opts.installDaemon) {
-    const service = resolveGatewayService();
-    const devMode =
-      process.argv[1]?.includes(`${path.sep}src${path.sep}`) &&
-      process.argv[1]?.endsWith(".ts");
-    const { programArguments, workingDirectory } =
-      await resolveGatewayProgramArguments({ port, dev: devMode });
-    const environment: Record<string, string | undefined> = {
-      PATH: process.env.PATH,
-      CLAWDBOT_GATEWAY_TOKEN: gatewayToken,
-      CLAWDBOT_LAUNCHD_LABEL:
-        process.platform === "darwin" ? GATEWAY_LAUNCH_AGENT_LABEL : undefined,
-    };
-    await service.install({
-      env: process.env,
-      stdout: process.stdout,
-      programArguments,
-      workingDirectory,
-      environment,
-    });
-    await ensureSystemdUserLingerNonInteractive({ runtime });
+    const systemdAvailable =
+      process.platform === "linux"
+        ? await isSystemdUserServiceAvailable()
+        : true;
+    if (process.platform === "linux" && !systemdAvailable) {
+      runtime.log(
+        "Systemd user services are unavailable; skipping daemon install.",
+      );
+    } else {
+      if (!isGatewayDaemonRuntime(daemonRuntimeRaw)) {
+        runtime.error("Invalid --daemon-runtime (use node or bun)");
+        runtime.exit(1);
+        return;
+      }
+      const service = resolveGatewayService();
+      const devMode =
+        process.argv[1]?.includes(`${path.sep}src${path.sep}`) &&
+        process.argv[1]?.endsWith(".ts");
+      const nodePath = await resolvePreferredNodePath({
+        env: process.env,
+        runtime: daemonRuntimeRaw,
+      });
+      const { programArguments, workingDirectory } =
+        await resolveGatewayProgramArguments({
+          port,
+          dev: devMode,
+          runtime: daemonRuntimeRaw,
+          nodePath,
+        });
+      const environment = buildServiceEnvironment({
+        env: process.env,
+        port,
+        token: gatewayToken,
+        launchdLabel:
+          process.platform === "darwin"
+            ? GATEWAY_LAUNCH_AGENT_LABEL
+            : undefined,
+      });
+      await service.install({
+        env: process.env,
+        stdout: process.stdout,
+        programArguments,
+        workingDirectory,
+        environment,
+      });
+      await ensureSystemdUserLingerNonInteractive({ runtime });
+    }
   }
 
   if (!opts.skipHealth) {
@@ -260,6 +539,7 @@ export async function runNonInteractiveOnboarding(
           authChoice,
           gateway: { port, bind, authMode, tailscaleMode },
           installDaemon: Boolean(opts.installDaemon),
+          daemonRuntime: opts.installDaemon ? daemonRuntimeRaw : undefined,
           skipSkills: Boolean(opts.skipSkills),
           skipHealth: Boolean(opts.skipHealth),
         },

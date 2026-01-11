@@ -29,7 +29,10 @@ final class AppState {
     }
 
     var launchAtLogin: Bool {
-        didSet { self.ifNotPreview { Task { AppStateStore.updateLaunchAtLogin(enabled: self.launchAtLogin) } } }
+        didSet {
+            guard !self.isInitializing else { return }
+            self.ifNotPreview { Task { AppStateStore.updateLaunchAtLogin(enabled: self.launchAtLogin) } }
+        }
     }
 
     var onboardingSeen: Bool {
@@ -98,6 +101,10 @@ final class AppState {
                 }
             }
         }
+    }
+
+    var voiceWakeMicName: String {
+        didSet { self.ifNotPreview { UserDefaults.standard.set(self.voiceWakeMicName, forKey: voiceWakeMicNameKey) } }
     }
 
     var voiceWakeLocaleID: String {
@@ -229,6 +236,7 @@ final class AppState {
         }
         self.showDockIcon = UserDefaults.standard.bool(forKey: showDockIconKey)
         self.voiceWakeMicID = UserDefaults.standard.string(forKey: voiceWakeMicKey) ?? ""
+        self.voiceWakeMicName = UserDefaults.standard.string(forKey: voiceWakeMicNameKey) ?? ""
         self.voiceWakeLocaleID = UserDefaults.standard.string(forKey: voiceWakeLocaleKey) ?? Locale.current.identifier
         self.voiceWakeAdditionalLocaleIDs = UserDefaults.standard
             .stringArray(forKey: voiceWakeAdditionalLocalesKey) ?? []
@@ -416,7 +424,8 @@ final class AppState {
             : nil
 
         Task { @MainActor in
-            var root = await ConfigStore.load()
+            // Keep app-only connection settings local to avoid overwriting remote gateway config.
+            var root = ClawdbotConfigFile.loadDict()
             var gateway = root["gateway"] as? [String: Any] ?? [:]
             var changed = false
 
@@ -446,8 +455,12 @@ final class AppState {
             }
 
             guard changed else { return }
-            root["gateway"] = gateway
-            try? await ConfigStore.save(root)
+            if gateway.isEmpty {
+                root.removeValue(forKey: "gateway")
+            } else {
+                root["gateway"] = gateway
+            }
+            ClawdbotConfigFile.saveDict(root)
         }
     }
 
@@ -578,6 +591,7 @@ extension AppState {
         state.iconAnimationsEnabled = true
         state.showDockIcon = true
         state.voiceWakeMicID = "BuiltInMic"
+        state.voiceWakeMicName = "Built-in Microphone"
         state.voiceWakeLocaleID = Locale.current.identifier
         state.voiceWakeAdditionalLocaleIDs = ["en-US", "de-DE"]
         state.voicePushToTalkEnabled = false

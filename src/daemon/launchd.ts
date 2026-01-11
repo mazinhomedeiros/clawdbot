@@ -3,12 +3,20 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { promisify } from "node:util";
 
+import { colorize, isRich, theme } from "../terminal/theme.js";
 import {
   GATEWAY_LAUNCH_AGENT_LABEL,
   LEGACY_GATEWAY_LAUNCH_AGENT_LABELS,
 } from "./constants.js";
+import { parseKeyValueOutput } from "./runtime-parse.js";
+import type { GatewayServiceRuntime } from "./service-runtime.js";
 
 const execFileAsync = promisify(execFile);
+
+const formatLine = (label: string, value: string) => {
+  const rich = isRich();
+  return `${colorize(rich, theme.muted, `${label}:`)} ${colorize(rich, theme.command, value)}`;
+};
 function resolveHomeDir(env: Record<string, string | undefined>): string {
   const home = env.HOME?.trim() || env.USERPROFILE?.trim();
   if (!home) throw new Error("Missing HOME");
@@ -37,12 +45,31 @@ export function resolveGatewayLogPaths(
   stderrPath: string;
 } {
   const home = resolveHomeDir(env);
-  const logDir = path.join(home, ".clawdbot", "logs");
+  const stateOverride =
+    env.CLAWDBOT_STATE_DIR?.trim() || env.CLAWDIS_STATE_DIR?.trim();
+  const profile = env.CLAWDBOT_PROFILE?.trim();
+  const suffix =
+    profile && profile.toLowerCase() !== "default" ? `-${profile}` : "";
+  const defaultStateDir = path.join(home, `.clawdbot${suffix}`);
+  const stateDir = stateOverride
+    ? resolveUserPathWithHome(stateOverride, home)
+    : defaultStateDir;
+  const logDir = path.join(stateDir, "logs");
   return {
     logDir,
     stdoutPath: path.join(logDir, "gateway.log"),
     stderrPath: path.join(logDir, "gateway.err.log"),
   };
+}
+
+function resolveUserPathWithHome(input: string, home: string): string {
+  const trimmed = input.trim();
+  if (!trimmed) return trimmed;
+  if (trimmed.startsWith("~")) {
+    const expanded = trimmed.replace(/^~(?=$|[\\/])/, home);
+    return path.resolve(expanded);
+  }
+  return path.resolve(trimmed);
 }
 
 function plistEscape(value: string): string {
@@ -86,7 +113,12 @@ function renderEnvDict(
 
 export async function readLaunchAgentProgramArguments(
   env: Record<string, string | undefined>,
-): Promise<{ programArguments: string[]; workingDirectory?: string } | null> {
+): Promise<{
+  programArguments: string[];
+  workingDirectory?: string;
+  environment?: Record<string, string>;
+  sourcePath?: string;
+} | null> {
   const plistPath = resolveLaunchAgentPlistPath(env);
   try {
     const plist = await fs.readFile(plistPath, "utf8");
@@ -103,9 +135,25 @@ export async function readLaunchAgentProgramArguments(
     const workingDirectory = workingDirMatch
       ? plistUnescape(workingDirMatch[1] ?? "").trim()
       : "";
+    const envMatch = plist.match(
+      /<key>EnvironmentVariables<\/key>\s*<dict>([\s\S]*?)<\/dict>/i,
+    );
+    const environment: Record<string, string> = {};
+    if (envMatch) {
+      for (const pair of envMatch[1].matchAll(
+        /<key>([\s\S]*?)<\/key>\s*<string>([\s\S]*?)<\/string>/gi,
+      )) {
+        const key = plistUnescape(pair[1] ?? "").trim();
+        if (!key) continue;
+        const value = plistUnescape(pair[2] ?? "").trim();
+        environment[key] = value;
+      }
+    }
     return {
       programArguments: args.filter(Boolean),
       ...(workingDirectory ? { workingDirectory } : {}),
+      ...(Object.keys(environment).length > 0 ? { environment } : {}),
+      sourcePath: plistPath,
     };
   } catch {
     return null;
@@ -196,11 +244,82 @@ function resolveGuiDomain(): string {
   return `gui/${process.getuid()}`;
 }
 
+export type LaunchctlPrintInfo = {
+  state?: string;
+  pid?: number;
+  lastExitStatus?: number;
+  lastExitReason?: string;
+};
+
+export function parseLaunchctlPrint(output: string): LaunchctlPrintInfo {
+  const entries = parseKeyValueOutput(output, "=");
+  const info: LaunchctlPrintInfo = {};
+  const state = entries.state;
+  if (state) info.state = state;
+  const pidValue = entries.pid;
+  if (pidValue) {
+    const pid = Number.parseInt(pidValue, 10);
+    if (Number.isFinite(pid)) info.pid = pid;
+  }
+  const exitStatusValue = entries["last exit status"];
+  if (exitStatusValue) {
+    const status = Number.parseInt(exitStatusValue, 10);
+    if (Number.isFinite(status)) info.lastExitStatus = status;
+  }
+  const exitReason = entries["last exit reason"];
+  if (exitReason) info.lastExitReason = exitReason;
+  return info;
+}
+
 export async function isLaunchAgentLoaded(): Promise<boolean> {
   const domain = resolveGuiDomain();
   const label = GATEWAY_LAUNCH_AGENT_LABEL;
   const res = await execLaunchctl(["print", `${domain}/${label}`]);
   return res.code === 0;
+}
+
+async function hasLaunchAgentPlist(
+  env: Record<string, string | undefined>,
+): Promise<boolean> {
+  const plistPath = resolveLaunchAgentPlistPath(env);
+  try {
+    await fs.access(plistPath);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export async function readLaunchAgentRuntime(
+  env: Record<string, string | undefined>,
+): Promise<GatewayServiceRuntime> {
+  const domain = resolveGuiDomain();
+  const label = GATEWAY_LAUNCH_AGENT_LABEL;
+  const res = await execLaunchctl(["print", `${domain}/${label}`]);
+  if (res.code !== 0) {
+    return {
+      status: "unknown",
+      detail: (res.stderr || res.stdout).trim() || undefined,
+      missingUnit: true,
+    };
+  }
+  const parsed = parseLaunchctlPrint(res.stdout || res.stderr || "");
+  const plistExists = await hasLaunchAgentPlist(env);
+  const state = parsed.state?.toLowerCase();
+  const status =
+    state === "running" || parsed.pid
+      ? "running"
+      : state
+        ? "stopped"
+        : "unknown";
+  return {
+    status,
+    state: parsed.state,
+    pid: parsed.pid,
+    lastExitStatus: parsed.lastExitStatus,
+    lastExitReason: parsed.lastExitReason,
+    cachedLabel: !plistExists,
+  };
 }
 
 export type LegacyLaunchAgent = {
@@ -265,7 +384,9 @@ export async function uninstallLegacyLaunchAgents({
     const dest = path.join(trashDir, `${agent.label}.plist`);
     try {
       await fs.rename(agent.plistPath, dest);
-      stdout.write(`Moved legacy LaunchAgent to Trash: ${dest}\n`);
+      stdout.write(
+        `${formatLine("Moved legacy LaunchAgent to Trash", dest)}\n`,
+      );
     } catch {
       stdout.write(
         `Legacy LaunchAgent remains at ${agent.plistPath} (could not move)\n`,
@@ -301,7 +422,7 @@ export async function uninstallLaunchAgent({
   try {
     await fs.mkdir(trashDir, { recursive: true });
     await fs.rename(plistPath, dest);
-    stdout.write(`Moved LaunchAgent to Trash: ${dest}\n`);
+    stdout.write(`${formatLine("Moved LaunchAgent to Trash", dest)}\n`);
   } catch {
     stdout.write(`LaunchAgent remains at ${plistPath} (could not move)\n`);
   }
@@ -333,7 +454,7 @@ export async function stopLaunchAgent({
       `launchctl bootout failed: ${res.stderr || res.stdout}`.trim(),
     );
   }
-  stdout.write(`Stopped LaunchAgent: ${domain}/${label}\n`);
+  stdout.write(`${formatLine("Stopped LaunchAgent", `${domain}/${label}`)}\n`);
 }
 
 export async function installLaunchAgent({
@@ -394,8 +515,8 @@ export async function installLaunchAgent({
     `${domain}/${GATEWAY_LAUNCH_AGENT_LABEL}`,
   ]);
 
-  stdout.write(`Installed LaunchAgent: ${plistPath}\n`);
-  stdout.write(`Logs: ${stdoutPath}\n`);
+  stdout.write(`${formatLine("Installed LaunchAgent", plistPath)}\n`);
+  stdout.write(`${formatLine("Logs", stdoutPath)}\n`);
   return { plistPath };
 }
 
@@ -412,5 +533,7 @@ export async function restartLaunchAgent({
       `launchctl kickstart failed: ${res.stderr || res.stdout}`.trim(),
     );
   }
-  stdout.write(`Restarted LaunchAgent: ${domain}/${label}\n`);
+  stdout.write(
+    `${formatLine("Restarted LaunchAgent", `${domain}/${label}`)}\n`,
+  );
 }

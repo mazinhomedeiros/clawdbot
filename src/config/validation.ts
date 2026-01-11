@@ -1,8 +1,8 @@
 import {
-  applyIdentityDefaults,
-  applyModelDefaults,
-  applySessionDefaults,
-} from "./defaults.js";
+  findDuplicateAgentDirs,
+  formatDuplicateAgentDirError,
+} from "./agent-dirs.js";
+import { applyModelDefaults, applySessionDefaults } from "./defaults.js";
 import { findLegacyConfigIssues } from "./legacy.js";
 import type { ClawdbotConfig, ConfigValidationIssue } from "./types.js";
 import { ClawdbotSchema } from "./zod-schema.js";
@@ -32,12 +32,22 @@ export function validateConfigObject(
       })),
     };
   }
+  const duplicates = findDuplicateAgentDirs(validated.data as ClawdbotConfig);
+  if (duplicates.length > 0) {
+    return {
+      ok: false,
+      issues: [
+        {
+          path: "agents.list",
+          message: formatDuplicateAgentDirError(duplicates),
+        },
+      ],
+    };
+  }
   return {
     ok: true,
     config: applyModelDefaults(
-      applySessionDefaults(
-        applyIdentityDefaults(validated.data as ClawdbotConfig),
-      ),
+      applySessionDefaults(validated.data as ClawdbotConfig),
     ),
   };
 }

@@ -1,6 +1,11 @@
 import { type Static, type TSchema, Type } from "@sinclair/typebox";
+import { SESSION_LABEL_MAX_LENGTH } from "../../sessions/session-label.js";
 
 const NonEmptyString = Type.String({ minLength: 1 });
+const SessionLabelString = Type.String({
+  minLength: 1,
+  maxLength: SESSION_LABEL_MAX_LENGTH,
+});
 
 export const PresenceEntrySchema = Type.Object(
   {
@@ -220,11 +225,14 @@ export const AgentParamsSchema = Type.Object(
     sessionKey: Type.Optional(Type.String()),
     thinking: Type.Optional(Type.String()),
     deliver: Type.Optional(Type.Boolean()),
+    attachments: Type.Optional(Type.Array(Type.Unknown())),
     provider: Type.Optional(Type.String()),
     timeout: Type.Optional(Type.Integer({ minimum: 0 })),
     lane: Type.Optional(Type.String()),
     extraSystemPrompt: Type.Optional(Type.String()),
     idempotencyKey: NonEmptyString,
+    label: Type.Optional(SessionLabelString),
+    spawnedBy: Type.Optional(Type.String()),
   },
   { additionalProperties: false },
 );
@@ -313,7 +321,21 @@ export const SessionsListParamsSchema = Type.Object(
     activeMinutes: Type.Optional(Type.Integer({ minimum: 1 })),
     includeGlobal: Type.Optional(Type.Boolean()),
     includeUnknown: Type.Optional(Type.Boolean()),
+    label: Type.Optional(SessionLabelString),
     spawnedBy: Type.Optional(NonEmptyString),
+    agentId: Type.Optional(NonEmptyString),
+  },
+  { additionalProperties: false },
+);
+
+export const SessionsResolveParamsSchema = Type.Object(
+  {
+    key: Type.Optional(NonEmptyString),
+    label: Type.Optional(SessionLabelString),
+    agentId: Type.Optional(NonEmptyString),
+    spawnedBy: Type.Optional(NonEmptyString),
+    includeGlobal: Type.Optional(Type.Boolean()),
+    includeUnknown: Type.Optional(Type.Boolean()),
   },
   { additionalProperties: false },
 );
@@ -321,8 +343,13 @@ export const SessionsListParamsSchema = Type.Object(
 export const SessionsPatchParamsSchema = Type.Object(
   {
     key: NonEmptyString,
+    label: Type.Optional(Type.Union([SessionLabelString, Type.Null()])),
     thinkingLevel: Type.Optional(Type.Union([NonEmptyString, Type.Null()])),
     verboseLevel: Type.Optional(Type.Union([NonEmptyString, Type.Null()])),
+    reasoningLevel: Type.Optional(Type.Union([NonEmptyString, Type.Null()])),
+    responseUsage: Type.Optional(
+      Type.Union([Type.Literal("on"), Type.Literal("off"), Type.Null()]),
+    ),
     elevatedLevel: Type.Optional(Type.Union([NonEmptyString, Type.Null()])),
     model: Type.Optional(Type.Union([NonEmptyString, Type.Null()])),
     spawnedBy: Type.Optional(Type.Union([NonEmptyString, Type.Null()])),
@@ -373,8 +400,28 @@ export const ConfigSetParamsSchema = Type.Object(
   { additionalProperties: false },
 );
 
+export const ConfigApplyParamsSchema = Type.Object(
+  {
+    raw: NonEmptyString,
+    sessionKey: Type.Optional(Type.String()),
+    note: Type.Optional(Type.String()),
+    restartDelayMs: Type.Optional(Type.Integer({ minimum: 0 })),
+  },
+  { additionalProperties: false },
+);
+
 export const ConfigSchemaParamsSchema = Type.Object(
   {},
+  { additionalProperties: false },
+);
+
+export const UpdateRunParamsSchema = Type.Object(
+  {
+    sessionKey: Type.Optional(Type.String()),
+    note: Type.Optional(Type.String()),
+    restartDelayMs: Type.Optional(Type.Integer({ minimum: 0 })),
+    timeoutMs: Type.Optional(Type.Integer({ minimum: 1 })),
+  },
   { additionalProperties: false },
 );
 
@@ -569,6 +616,29 @@ export const ModelChoiceSchema = Type.Object(
   { additionalProperties: false },
 );
 
+export const AgentSummarySchema = Type.Object(
+  {
+    id: NonEmptyString,
+    name: Type.Optional(NonEmptyString),
+  },
+  { additionalProperties: false },
+);
+
+export const AgentsListParamsSchema = Type.Object(
+  {},
+  { additionalProperties: false },
+);
+
+export const AgentsListResultSchema = Type.Object(
+  {
+    defaultId: NonEmptyString,
+    mainKey: NonEmptyString,
+    scope: Type.Union([Type.Literal("per-sender"), Type.Literal("global")]),
+    agents: Type.Array(AgentSummarySchema),
+  },
+  { additionalProperties: false },
+);
+
 export const ModelsListParamsSchema = Type.Object(
   {},
   { additionalProperties: false },
@@ -643,6 +713,7 @@ export const CronPayloadSchema = Type.Union([
     {
       kind: Type.Literal("agentTurn"),
       message: NonEmptyString,
+      model: Type.Optional(Type.String()),
       thinking: Type.Optional(Type.String()),
       timeoutSeconds: Type.Optional(Type.Integer({ minimum: 1 })),
       deliver: Type.Optional(Type.Boolean()),
@@ -787,6 +858,27 @@ export const CronRunLogEntrySchema = Type.Object(
   { additionalProperties: false },
 );
 
+export const LogsTailParamsSchema = Type.Object(
+  {
+    cursor: Type.Optional(Type.Integer({ minimum: 0 })),
+    limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 5000 })),
+    maxBytes: Type.Optional(Type.Integer({ minimum: 1, maximum: 1_000_000 })),
+  },
+  { additionalProperties: false },
+);
+
+export const LogsTailResultSchema = Type.Object(
+  {
+    file: NonEmptyString,
+    cursor: Type.Integer({ minimum: 0 }),
+    size: Type.Integer({ minimum: 0 }),
+    lines: Type.Array(Type.String()),
+    truncated: Type.Optional(Type.Boolean()),
+    reset: Type.Optional(Type.Boolean()),
+  },
+  { additionalProperties: false },
+);
+
 // WebChat/WebSocket-native chat methods
 export const ChatHistoryParamsSchema = Type.Object(
   {
@@ -812,7 +904,7 @@ export const ChatSendParamsSchema = Type.Object(
 export const ChatAbortParamsSchema = Type.Object(
   {
     sessionKey: NonEmptyString,
-    runId: NonEmptyString,
+    runId: Type.Optional(NonEmptyString),
   },
   { additionalProperties: false },
 );
@@ -863,12 +955,14 @@ export const ProtocolSchemas: Record<string, TSchema> = {
   NodeDescribeParams: NodeDescribeParamsSchema,
   NodeInvokeParams: NodeInvokeParamsSchema,
   SessionsListParams: SessionsListParamsSchema,
+  SessionsResolveParams: SessionsResolveParamsSchema,
   SessionsPatchParams: SessionsPatchParamsSchema,
   SessionsResetParams: SessionsResetParamsSchema,
   SessionsDeleteParams: SessionsDeleteParamsSchema,
   SessionsCompactParams: SessionsCompactParamsSchema,
   ConfigGetParams: ConfigGetParamsSchema,
   ConfigSetParams: ConfigSetParamsSchema,
+  ConfigApplyParams: ConfigApplyParamsSchema,
   ConfigSchemaParams: ConfigSchemaParamsSchema,
   ConfigSchemaResponse: ConfigSchemaResponseSchema,
   WizardStartParams: WizardStartParamsSchema,
@@ -883,6 +977,9 @@ export const ProtocolSchemas: Record<string, TSchema> = {
   ProvidersStatusParams: ProvidersStatusParamsSchema,
   WebLoginStartParams: WebLoginStartParamsSchema,
   WebLoginWaitParams: WebLoginWaitParamsSchema,
+  AgentSummary: AgentSummarySchema,
+  AgentsListParams: AgentsListParamsSchema,
+  AgentsListResult: AgentsListResultSchema,
   ModelChoice: ModelChoiceSchema,
   ModelsListParams: ModelsListParamsSchema,
   ModelsListResult: ModelsListResultSchema,
@@ -898,10 +995,13 @@ export const ProtocolSchemas: Record<string, TSchema> = {
   CronRunParams: CronRunParamsSchema,
   CronRunsParams: CronRunsParamsSchema,
   CronRunLogEntry: CronRunLogEntrySchema,
+  LogsTailParams: LogsTailParamsSchema,
+  LogsTailResult: LogsTailResultSchema,
   ChatHistoryParams: ChatHistoryParamsSchema,
   ChatSendParams: ChatSendParamsSchema,
   ChatAbortParams: ChatAbortParamsSchema,
   ChatEvent: ChatEventSchema,
+  UpdateRunParams: UpdateRunParamsSchema,
   TickEvent: TickEventSchema,
   ShutdownEvent: ShutdownEventSchema,
 };
@@ -932,12 +1032,14 @@ export type NodeListParams = Static<typeof NodeListParamsSchema>;
 export type NodeDescribeParams = Static<typeof NodeDescribeParamsSchema>;
 export type NodeInvokeParams = Static<typeof NodeInvokeParamsSchema>;
 export type SessionsListParams = Static<typeof SessionsListParamsSchema>;
+export type SessionsResolveParams = Static<typeof SessionsResolveParamsSchema>;
 export type SessionsPatchParams = Static<typeof SessionsPatchParamsSchema>;
 export type SessionsResetParams = Static<typeof SessionsResetParamsSchema>;
 export type SessionsDeleteParams = Static<typeof SessionsDeleteParamsSchema>;
 export type SessionsCompactParams = Static<typeof SessionsCompactParamsSchema>;
 export type ConfigGetParams = Static<typeof ConfigGetParamsSchema>;
 export type ConfigSetParams = Static<typeof ConfigSetParamsSchema>;
+export type ConfigApplyParams = Static<typeof ConfigApplyParamsSchema>;
 export type ConfigSchemaParams = Static<typeof ConfigSchemaParamsSchema>;
 export type ConfigSchemaResponse = Static<typeof ConfigSchemaResponseSchema>;
 export type WizardStartParams = Static<typeof WizardStartParamsSchema>;
@@ -952,6 +1054,9 @@ export type TalkModeParams = Static<typeof TalkModeParamsSchema>;
 export type ProvidersStatusParams = Static<typeof ProvidersStatusParamsSchema>;
 export type WebLoginStartParams = Static<typeof WebLoginStartParamsSchema>;
 export type WebLoginWaitParams = Static<typeof WebLoginWaitParamsSchema>;
+export type AgentSummary = Static<typeof AgentSummarySchema>;
+export type AgentsListParams = Static<typeof AgentsListParamsSchema>;
+export type AgentsListResult = Static<typeof AgentsListResultSchema>;
 export type ModelChoice = Static<typeof ModelChoiceSchema>;
 export type ModelsListParams = Static<typeof ModelsListParamsSchema>;
 export type ModelsListResult = Static<typeof ModelsListResultSchema>;
@@ -967,8 +1072,11 @@ export type CronRemoveParams = Static<typeof CronRemoveParamsSchema>;
 export type CronRunParams = Static<typeof CronRunParamsSchema>;
 export type CronRunsParams = Static<typeof CronRunsParamsSchema>;
 export type CronRunLogEntry = Static<typeof CronRunLogEntrySchema>;
+export type LogsTailParams = Static<typeof LogsTailParamsSchema>;
+export type LogsTailResult = Static<typeof LogsTailResultSchema>;
 export type ChatAbortParams = Static<typeof ChatAbortParamsSchema>;
 export type ChatEvent = Static<typeof ChatEventSchema>;
+export type UpdateRunParams = Static<typeof UpdateRunParamsSchema>;
 export type TickEvent = Static<typeof TickEventSchema>;
 export type ShutdownEvent = Static<typeof ShutdownEventSchema>;
 

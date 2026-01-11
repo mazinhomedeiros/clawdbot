@@ -10,7 +10,12 @@ import { Type } from "@sinclair/typebox";
 import type { ClawdbotConfig } from "../config/config.js";
 import { detectMime } from "../media/mime.js";
 import { isSubagentSessionKey } from "../routing/session-key.js";
+import { resolveGatewayMessageProvider } from "../utils/message-provider.js";
 import { startWebLoginWithQr, waitForWebLogin } from "../web/login-qr.js";
+import {
+  resolveAgentConfig,
+  resolveAgentIdFromSessionKey,
+} from "./agent-scope.js";
 import {
   type BashToolDefaults,
   createBashTool,
@@ -18,8 +23,10 @@ import {
   type ProcessToolDefaults,
 } from "./bash-tools.js";
 import { createClawdbotTools } from "./clawdbot-tools.js";
+import type { ModelAuthMode } from "./model-auth.js";
 import type { SandboxContext, SandboxToolPolicy } from "./sandbox.js";
 import { assertSandboxPath } from "./sandbox-paths.js";
+import { cleanSchemaForGemini } from "./schema/clean-for-gemini.js";
 import { sanitizeToolResultImages } from "./tool-images.js";
 
 // NOTE(steipete): Upstream read now does file-magic MIME detection; we keep the wrapper
@@ -150,67 +157,6 @@ function mergePropertySchemas(existing: unknown, incoming: unknown): unknown {
   return existing;
 }
 
-function cleanSchemaForGemini(schema: unknown): unknown {
-  if (!schema || typeof schema !== "object") return schema;
-  if (Array.isArray(schema)) return schema.map(cleanSchemaForGemini);
-
-  const obj = schema as Record<string, unknown>;
-  const hasAnyOf = "anyOf" in obj && Array.isArray(obj.anyOf);
-  const cleaned: Record<string, unknown> = {};
-
-  for (const [key, value] of Object.entries(obj)) {
-    // Skip unsupported schema features for Gemini:
-    // - patternProperties: not in OpenAPI 3.0 subset
-    // - const: convert to enum with single value instead
-    if (key === "patternProperties") {
-      // Gemini doesn't support patternProperties - skip it
-      continue;
-    }
-
-    // Convert const to enum (Gemini doesn't support const)
-    if (key === "const") {
-      cleaned.enum = [value];
-      continue;
-    }
-
-    // Skip 'type' if we have 'anyOf' — Gemini doesn't allow both
-    if (key === "type" && hasAnyOf) {
-      continue;
-    }
-
-    if (key === "properties" && value && typeof value === "object") {
-      // Recursively clean nested properties
-      const props = value as Record<string, unknown>;
-      cleaned[key] = Object.fromEntries(
-        Object.entries(props).map(([k, v]) => [k, cleanSchemaForGemini(v)]),
-      );
-    } else if (key === "items" && value && typeof value === "object") {
-      // Recursively clean array items schema
-      cleaned[key] = cleanSchemaForGemini(value);
-    } else if (key === "anyOf" && Array.isArray(value)) {
-      // Clean each anyOf variant
-      cleaned[key] = value.map((variant) => cleanSchemaForGemini(variant));
-    } else if (key === "oneOf" && Array.isArray(value)) {
-      // Clean each oneOf variant
-      cleaned[key] = value.map((variant) => cleanSchemaForGemini(variant));
-    } else if (key === "allOf" && Array.isArray(value)) {
-      // Clean each allOf variant
-      cleaned[key] = value.map((variant) => cleanSchemaForGemini(variant));
-    } else if (
-      key === "additionalProperties" &&
-      value &&
-      typeof value === "object"
-    ) {
-      // Recursively clean additionalProperties schema
-      cleaned[key] = cleanSchemaForGemini(value);
-    } else {
-      cleaned[key] = value;
-    }
-  }
-
-  return cleaned;
-}
-
 function normalizeToolParameters(tool: AnyAgentTool): AnyAgentTool {
   const schema =
     tool.parameters && typeof tool.parameters === "object"
@@ -329,6 +275,10 @@ function normalizeToolParameters(tool: AnyAgentTool): AnyAgentTool {
   };
 }
 
+function cleanToolSchemaForGemini(schema: Record<string, unknown>): unknown {
+  return cleanSchemaForGemini(schema);
+}
+
 function normalizeToolNames(list?: string[]) {
   if (!list) return [];
   return list.map((entry) => entry.trim().toLowerCase()).filter(Boolean);
@@ -342,7 +292,7 @@ const DEFAULT_SUBAGENT_TOOL_DENY = [
 ];
 
 function resolveSubagentToolPolicy(cfg?: ClawdbotConfig): SandboxToolPolicy {
-  const configured = cfg?.agent?.subagents?.tools;
+  const configured = cfg?.tools?.subagents?.tools;
   const deny = [
     ...DEFAULT_SUBAGENT_TOOL_DENY,
     ...(Array.isArray(configured?.deny) ? configured.deny : []),
@@ -365,6 +315,45 @@ function filterToolsByPolicy(
     if (allow) return allow.has(name);
     return true;
   });
+}
+
+function resolveEffectiveToolPolicy(params: {
+  config?: ClawdbotConfig;
+  sessionKey?: string;
+}) {
+  const agentId = params.sessionKey
+    ? resolveAgentIdFromSessionKey(params.sessionKey)
+    : undefined;
+  const agentConfig =
+    params.config && agentId
+      ? resolveAgentConfig(params.config, agentId)
+      : undefined;
+  const agentTools = agentConfig?.tools;
+  const hasAgentToolPolicy =
+    Array.isArray(agentTools?.allow) || Array.isArray(agentTools?.deny);
+  const globalTools = params.config?.tools;
+  return {
+    agentId,
+    policy: hasAgentToolPolicy ? agentTools : globalTools,
+  };
+}
+
+function isToolAllowedByPolicy(name: string, policy?: SandboxToolPolicy) {
+  if (!policy) return true;
+  const deny = new Set(normalizeToolNames(policy.deny));
+  const allowRaw = normalizeToolNames(policy.allow);
+  const allow = allowRaw.length > 0 ? new Set(allowRaw) : null;
+  const normalized = name.trim().toLowerCase();
+  if (deny.has(normalized)) return false;
+  if (allow) return allow.has(normalized);
+  return true;
+}
+
+function isToolAllowedByPolicies(
+  name: string,
+  policies: Array<SandboxToolPolicy | undefined>,
+) {
+  return policies.every((policy) => isToolAllowedByPolicy(name, policy));
 }
 
 function wrapSandboxPathGuard(tool: AnyAgentTool, root: string): AnyAgentTool {
@@ -405,8 +394,13 @@ function createWhatsAppLoginTool(): AnyAgentTool {
     name: "whatsapp_login",
     description:
       "Generate a WhatsApp QR code for linking, or wait for the scan to complete.",
+    // NOTE: Using Type.Unsafe for action enum instead of Type.Union([Type.Literal(...)])
+    // because Claude API on Vertex AI rejects nested anyOf schemas as invalid JSON Schema.
     parameters: Type.Object({
-      action: Type.Union([Type.Literal("start"), Type.Literal("wait")]),
+      action: Type.Unsafe<"start" | "wait">({
+        type: "string",
+        enum: ["start", "wait"],
+      }),
       timeoutMs: Type.Optional(Type.Number()),
       force: Type.Optional(Type.Boolean()),
     }),
@@ -484,50 +478,126 @@ function createClawdbotReadTool(base: AnyAgentTool): AnyAgentTool {
   };
 }
 
-function normalizeMessageProvider(
-  messageProvider?: string,
-): string | undefined {
-  const trimmed = messageProvider?.trim().toLowerCase();
-  return trimmed ? trimmed : undefined;
+export const __testing = {
+  cleanToolSchemaForGemini,
+} as const;
+
+function throwAbortError(): never {
+  const err = new Error("Aborted");
+  err.name = "AbortError";
+  throw err;
 }
 
-function shouldIncludeDiscordTool(messageProvider?: string): boolean {
-  const normalized = normalizeMessageProvider(messageProvider);
-  if (!normalized) return false;
-  return normalized === "discord" || normalized.startsWith("discord:");
+function combineAbortSignals(
+  a?: AbortSignal,
+  b?: AbortSignal,
+): AbortSignal | undefined {
+  if (!a && !b) return undefined;
+  if (a && !b) return a;
+  if (b && !a) return b;
+  if (a?.aborted) return a;
+  if (b?.aborted) return b;
+  if (typeof AbortSignal.any === "function") {
+    return AbortSignal.any([a as AbortSignal, b as AbortSignal]);
+  }
+  const controller = new AbortController();
+  const onAbort = () => controller.abort();
+  a?.addEventListener("abort", onAbort, { once: true });
+  b?.addEventListener("abort", onAbort, { once: true });
+  return controller.signal;
 }
 
-function shouldIncludeSlackTool(messageProvider?: string): boolean {
-  const normalized = normalizeMessageProvider(messageProvider);
-  if (!normalized) return false;
-  return normalized === "slack" || normalized.startsWith("slack:");
+function wrapToolWithAbortSignal(
+  tool: AnyAgentTool,
+  abortSignal?: AbortSignal,
+): AnyAgentTool {
+  if (!abortSignal) return tool;
+  const execute = tool.execute;
+  if (!execute) return tool;
+  return {
+    ...tool,
+    execute: async (toolCallId, params, signal, onUpdate) => {
+      const combined = combineAbortSignals(signal, abortSignal);
+      if (combined?.aborted) throwAbortError();
+      return await execute(toolCallId, params, combined, onUpdate);
+    },
+  };
 }
 
 export function createClawdbotCodingTools(options?: {
   bash?: BashToolDefaults & ProcessToolDefaults;
   messageProvider?: string;
+  agentAccountId?: string;
   sandbox?: SandboxContext | null;
   sessionKey?: string;
   agentDir?: string;
+  workspaceDir?: string;
   config?: ClawdbotConfig;
+  abortSignal?: AbortSignal;
+  /**
+   * Provider of the currently selected model (used for provider-specific tool quirks).
+   * Example: "anthropic", "openai", "google", "openai-codex".
+   */
+  modelProvider?: string;
+  /**
+   * Auth mode for the current provider. We only need this for Anthropic OAuth
+   * tool-name blocking quirks.
+   */
+  modelAuthMode?: ModelAuthMode;
+  /** Current channel ID for auto-threading (Slack). */
+  currentChannelId?: string;
+  /** Current thread timestamp for auto-threading (Slack). */
+  currentThreadTs?: string;
+  /** Reply-to mode for Slack auto-threading. */
+  replyToMode?: "off" | "first" | "all";
+  /** Mutable ref to track if a reply was sent (for "first" mode). */
+  hasRepliedRef?: { value: boolean };
 }): AnyAgentTool[] {
   const bashToolName = "bash";
   const sandbox = options?.sandbox?.enabled ? options.sandbox : undefined;
+  const { agentId, policy: effectiveToolsPolicy } = resolveEffectiveToolPolicy({
+    config: options?.config,
+    sessionKey: options?.sessionKey,
+  });
+  const scopeKey =
+    options?.bash?.scopeKey ?? (agentId ? `agent:${agentId}` : undefined);
+  const subagentPolicy =
+    isSubagentSessionKey(options?.sessionKey) && options?.sessionKey
+      ? resolveSubagentToolPolicy(options.config)
+      : undefined;
+  const allowBackground = isToolAllowedByPolicies("process", [
+    effectiveToolsPolicy,
+    sandbox?.tools,
+    subagentPolicy,
+  ]);
   const sandboxRoot = sandbox?.workspaceDir;
+  const allowWorkspaceWrites = sandbox?.workspaceAccess !== "ro";
+  const workspaceRoot = options?.workspaceDir ?? process.cwd();
+
   const base = (codingTools as unknown as AnyAgentTool[]).flatMap((tool) => {
     if (tool.name === readTool.name) {
-      return sandboxRoot
-        ? [createSandboxedReadTool(sandboxRoot)]
-        : [createClawdbotReadTool(tool)];
+      if (sandboxRoot) {
+        return [createSandboxedReadTool(sandboxRoot)];
+      }
+      const freshReadTool = createReadTool(workspaceRoot);
+      return [createClawdbotReadTool(freshReadTool)];
     }
     if (tool.name === bashToolName) return [];
-    if (sandboxRoot && (tool.name === "write" || tool.name === "edit")) {
-      return [];
+    if (tool.name === "write") {
+      if (sandboxRoot) return [];
+      return [createWriteTool(workspaceRoot)];
+    }
+    if (tool.name === "edit") {
+      if (sandboxRoot) return [];
+      return [createEditTool(workspaceRoot)];
     }
     return [tool as AnyAgentTool];
   });
   const bashTool = createBashTool({
     ...options?.bash,
+    cwd: options?.workspaceDir,
+    allowBackground,
+    scopeKey,
     sandbox: sandbox
       ? {
           containerName: sandbox.containerName,
@@ -539,51 +609,56 @@ export function createClawdbotCodingTools(options?: {
   });
   const processTool = createProcessTool({
     cleanupMs: options?.bash?.cleanupMs,
+    scopeKey,
   });
   const tools: AnyAgentTool[] = [
     ...base,
     ...(sandboxRoot
-      ? [
-          createSandboxedEditTool(sandboxRoot),
-          createSandboxedWriteTool(sandboxRoot),
-        ]
+      ? allowWorkspaceWrites
+        ? [
+            createSandboxedEditTool(sandboxRoot),
+            createSandboxedWriteTool(sandboxRoot),
+          ]
+        : []
       : []),
     bashTool as unknown as AnyAgentTool,
     processTool as unknown as AnyAgentTool,
     createWhatsAppLoginTool(),
     ...createClawdbotTools({
       browserControlUrl: sandbox?.browser?.controlUrl,
+      allowHostBrowserControl: sandbox ? sandbox.browserAllowHostControl : true,
       agentSessionKey: options?.sessionKey,
-      agentProvider: options?.messageProvider,
+      agentProvider: resolveGatewayMessageProvider(options?.messageProvider),
+      agentAccountId: options?.agentAccountId,
       agentDir: options?.agentDir,
       sandboxed: !!sandbox,
       config: options?.config,
+      currentChannelId: options?.currentChannelId,
+      currentThreadTs: options?.currentThreadTs,
+      replyToMode: options?.replyToMode,
+      hasRepliedRef: options?.hasRepliedRef,
     }),
   ];
-  const allowDiscord = shouldIncludeDiscordTool(options?.messageProvider);
-  const allowSlack = shouldIncludeSlackTool(options?.messageProvider);
-  const filtered = tools.filter((tool) => {
-    if (tool.name === "discord") return allowDiscord;
-    if (tool.name === "slack") return allowSlack;
-    return true;
-  });
-  const globallyFiltered =
-    options?.config?.agent?.tools &&
-    (options.config.agent.tools.allow?.length ||
-      options.config.agent.tools.deny?.length)
-      ? filterToolsByPolicy(filtered, options.config.agent.tools)
-      : filtered;
+  const toolsFiltered = effectiveToolsPolicy
+    ? filterToolsByPolicy(tools, effectiveToolsPolicy)
+    : tools;
   const sandboxed = sandbox
-    ? filterToolsByPolicy(globallyFiltered, sandbox.tools)
-    : globallyFiltered;
-  const subagentFiltered =
-    isSubagentSessionKey(options?.sessionKey) && options?.sessionKey
-      ? filterToolsByPolicy(
-          sandboxed,
-          resolveSubagentToolPolicy(options.config),
-        )
-      : sandboxed;
+    ? filterToolsByPolicy(toolsFiltered, sandbox.tools)
+    : toolsFiltered;
+  const subagentFiltered = subagentPolicy
+    ? filterToolsByPolicy(sandboxed, subagentPolicy)
+    : sandboxed;
   // Always normalize tool JSON Schemas before handing them to pi-agent/pi-ai.
   // Without this, some providers (notably OpenAI) will reject root-level union schemas.
-  return subagentFiltered.map(normalizeToolParameters);
+  const normalized = subagentFiltered.map(normalizeToolParameters);
+  const withAbort = options?.abortSignal
+    ? normalized.map((tool) =>
+        wrapToolWithAbortSignal(tool, options.abortSignal),
+      )
+    : normalized;
+
+  // NOTE: Keep canonical (lowercase) tool names here.
+  // pi-ai's Anthropic OAuth transport remaps tool names to Claude Code-style names
+  // on the wire and maps them back for tool dispatch.
+  return withAbort;
 }

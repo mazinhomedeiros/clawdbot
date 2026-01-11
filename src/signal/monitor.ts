@@ -1,13 +1,27 @@
+import {
+  resolveEffectiveMessagesConfig,
+  resolveHumanDelayConfig,
+} from "../agents/identity.js";
 import { chunkText, resolveTextChunkLimit } from "../auto-reply/chunk.js";
 import { formatAgentEnvelope } from "../auto-reply/envelope.js";
 import { dispatchReplyFromConfig } from "../auto-reply/reply/dispatch-from-config.js";
+import {
+  buildHistoryContextFromMap,
+  clearHistoryEntries,
+  DEFAULT_GROUP_HISTORY_LIMIT,
+  type HistoryEntry,
+} from "../auto-reply/reply/history.js";
 import { createReplyDispatcher } from "../auto-reply/reply/reply-dispatcher.js";
 import type { ReplyPayload } from "../auto-reply/types.js";
+import type { ClawdbotConfig } from "../config/config.js";
 import { loadConfig } from "../config/config.js";
 import { resolveStorePath, updateLastRoute } from "../config/sessions.js";
+import type { SignalReactionNotificationMode } from "../config/types.js";
 import { danger, logVerbose, shouldLogVerbose } from "../globals.js";
+import { enqueueSystemEvent } from "../infra/system-events.js";
 import { mediaKindFromMime } from "../media/constants.js";
 import { saveMediaBuffer } from "../media/store.js";
+import { buildPairingReply } from "../pairing/pairing-messages.js";
 import {
   readProviderAllowFromStore,
   upsertProviderPairingRequest,
@@ -15,17 +29,42 @@ import {
 import { resolveAgentRoute } from "../routing/resolve-route.js";
 import type { RuntimeEnv } from "../runtime.js";
 import { normalizeE164 } from "../utils.js";
-import { signalCheck, signalRpcRequest, streamSignalEvents } from "./client.js";
+import { resolveSignalAccount } from "./accounts.js";
+import { signalCheck, signalRpcRequest } from "./client.js";
 import { spawnSignalDaemon } from "./daemon.js";
+import {
+  formatSignalPairingIdLine,
+  formatSignalSenderDisplay,
+  formatSignalSenderId,
+  isSignalSenderAllowed,
+  resolveSignalPeerId,
+  resolveSignalRecipient,
+  resolveSignalSender,
+} from "./identity.js";
 import { sendMessageSignal } from "./send.js";
+import { runSignalSseLoop } from "./sse-reconnect.js";
 
 type SignalEnvelope = {
   sourceNumber?: string | null;
+  sourceUuid?: string | null;
   sourceName?: string | null;
   timestamp?: number | null;
   dataMessage?: SignalDataMessage | null;
   editMessage?: { dataMessage?: SignalDataMessage | null } | null;
   syncMessage?: unknown;
+  reactionMessage?: SignalReactionMessage | null;
+};
+
+type SignalReactionMessage = {
+  emoji?: string | null;
+  targetAuthor?: string | null;
+  targetAuthorUuid?: string | null;
+  targetSentTimestamp?: number | null;
+  isRemove?: boolean | null;
+  groupInfo?: {
+    groupId?: string | null;
+    groupName?: string | null;
+  } | null;
 };
 
 type SignalDataMessage = {
@@ -37,6 +76,7 @@ type SignalDataMessage = {
     groupName?: string | null;
   } | null;
   quote?: { text?: string | null } | null;
+  reaction?: SignalReactionMessage | null;
 };
 
 type SignalAttachment = {
@@ -50,6 +90,8 @@ export type MonitorSignalOpts = {
   runtime?: RuntimeEnv;
   abortSignal?: AbortSignal;
   account?: string;
+  accountId?: string;
+  config?: ClawdbotConfig;
   baseUrl?: string;
   autoStart?: boolean;
   cliPath?: string;
@@ -82,58 +124,88 @@ function resolveRuntime(opts: MonitorSignalOpts): RuntimeEnv {
   );
 }
 
-function resolveBaseUrl(opts: MonitorSignalOpts): string {
-  const cfg = loadConfig();
-  const signalCfg = cfg.signal;
-  if (opts.baseUrl?.trim()) return opts.baseUrl.trim();
-  if (signalCfg?.httpUrl?.trim()) return signalCfg.httpUrl.trim();
-  const host = opts.httpHost ?? signalCfg?.httpHost ?? "127.0.0.1";
-  const port = opts.httpPort ?? signalCfg?.httpPort ?? 8080;
-  return `http://${host}:${port}`;
+function normalizeAllowList(raw?: Array<string | number>): string[] {
+  return (raw ?? []).map((entry) => String(entry).trim()).filter(Boolean);
 }
 
-function resolveAccount(opts: MonitorSignalOpts): string | undefined {
-  const cfg = loadConfig();
-  return opts.account?.trim() || cfg.signal?.account?.trim() || undefined;
+type SignalReactionTarget = {
+  kind: "phone" | "uuid";
+  id: string;
+  display: string;
+};
+
+function resolveSignalReactionTargets(
+  reaction: SignalReactionMessage,
+): SignalReactionTarget[] {
+  const targets: SignalReactionTarget[] = [];
+  const uuid = reaction.targetAuthorUuid?.trim();
+  if (uuid) {
+    targets.push({ kind: "uuid", id: uuid, display: `uuid:${uuid}` });
+  }
+  const author = reaction.targetAuthor?.trim();
+  if (author) {
+    const normalized = normalizeE164(author);
+    targets.push({ kind: "phone", id: normalized, display: normalized });
+  }
+  return targets;
 }
 
-function resolveAllowFrom(opts: MonitorSignalOpts): string[] {
-  const cfg = loadConfig();
-  const raw = opts.allowFrom ?? cfg.signal?.allowFrom ?? [];
-  return raw.map((entry) => String(entry).trim()).filter(Boolean);
+function isSignalReactionMessage(
+  reaction: SignalReactionMessage | null | undefined,
+): reaction is SignalReactionMessage {
+  if (!reaction) return false;
+  const emoji = reaction.emoji?.trim();
+  const timestamp = reaction.targetSentTimestamp;
+  const hasTarget = Boolean(
+    reaction.targetAuthor?.trim() || reaction.targetAuthorUuid?.trim(),
+  );
+  return Boolean(
+    emoji && typeof timestamp === "number" && timestamp > 0 && hasTarget,
+  );
 }
 
-function resolveGroupAllowFrom(opts: MonitorSignalOpts): string[] {
-  const cfg = loadConfig();
-  const raw =
-    opts.groupAllowFrom ??
-    cfg.signal?.groupAllowFrom ??
-    (cfg.signal?.allowFrom && cfg.signal.allowFrom.length > 0
-      ? cfg.signal.allowFrom
-      : []);
-  return raw.map((entry) => String(entry).trim()).filter(Boolean);
+function shouldEmitSignalReactionNotification(params: {
+  mode?: SignalReactionNotificationMode;
+  account?: string | null;
+  targets?: SignalReactionTarget[];
+  sender?: ReturnType<typeof resolveSignalSender> | null;
+  allowlist?: string[];
+}) {
+  const { mode, account, targets, sender, allowlist } = params;
+  const effectiveMode = mode ?? "own";
+  if (effectiveMode === "off") return false;
+  if (effectiveMode === "own") {
+    const accountId = account?.trim();
+    if (!accountId || !targets || targets.length === 0) return false;
+    const normalizedAccount = normalizeE164(accountId);
+    return targets.some((target) => {
+      if (target.kind === "uuid") {
+        return accountId === target.id || accountId === `uuid:${target.id}`;
+      }
+      return normalizedAccount === target.id;
+    });
+  }
+  if (effectiveMode === "allowlist") {
+    if (!sender || !allowlist || allowlist.length === 0) return false;
+    return isSignalSenderAllowed(sender, allowlist);
+  }
+  return true;
 }
 
-function isAllowedSender(sender: string, allowFrom: string[]): boolean {
-  if (allowFrom.length === 0) return false;
-  if (allowFrom.includes("*")) return true;
-  const normalizedAllow = allowFrom
-    .map((entry) => entry.replace(/^signal:/i, ""))
-    .map((entry) => normalizeE164(entry));
-  const normalizedSender = normalizeE164(sender);
-  return normalizedAllow.includes(normalizedSender);
-}
-
-export function isSignalGroupAllowed(params: {
-  groupPolicy: "open" | "disabled" | "allowlist";
-  allowFrom: string[];
-  sender: string;
-}): boolean {
-  const { groupPolicy, allowFrom, sender } = params;
-  if (groupPolicy === "disabled") return false;
-  if (groupPolicy === "open") return true;
-  if (allowFrom.length === 0) return false;
-  return isAllowedSender(sender, allowFrom);
+function buildSignalReactionSystemEventText(params: {
+  emojiLabel: string;
+  actorLabel: string;
+  messageId: string;
+  targetLabel?: string;
+  groupLabel?: string;
+}) {
+  const base = `Signal reaction added: ${params.emojiLabel} by ${params.actorLabel} msg ${params.messageId}`;
+  const withTarget = params.targetLabel
+    ? `${base} from ${params.targetLabel}`
+    : base;
+  return params.groupLabel
+    ? `${withTarget} in ${params.groupLabel}`
+    : withTarget;
 }
 
 async function waitForSignalDaemonReady(params: {
@@ -206,12 +278,21 @@ async function deliverReplies(params: {
   target: string;
   baseUrl: string;
   account?: string;
+  accountId?: string;
   runtime: RuntimeEnv;
   maxBytes: number;
   textLimit: number;
 }) {
-  const { replies, target, baseUrl, account, runtime, maxBytes, textLimit } =
-    params;
+  const {
+    replies,
+    target,
+    baseUrl,
+    account,
+    accountId,
+    runtime,
+    maxBytes,
+    textLimit,
+  } = params;
   for (const payload of replies) {
     const mediaList =
       payload.mediaUrls ?? (payload.mediaUrl ? [payload.mediaUrl] : []);
@@ -223,6 +304,7 @@ async function deliverReplies(params: {
           baseUrl,
           account,
           maxBytes,
+          accountId,
         });
       }
     } else {
@@ -235,6 +317,7 @@ async function deliverReplies(params: {
           account,
           mediaUrl: url,
           maxBytes,
+          accountId,
         });
       }
     }
@@ -246,37 +329,64 @@ export async function monitorSignalProvider(
   opts: MonitorSignalOpts = {},
 ): Promise<void> {
   const runtime = resolveRuntime(opts);
-  const cfg = loadConfig();
-  const textLimit = resolveTextChunkLimit(cfg, "signal");
-  const baseUrl = resolveBaseUrl(opts);
-  const account = resolveAccount(opts);
-  const dmPolicy = cfg.signal?.dmPolicy ?? "pairing";
-  const allowFrom = resolveAllowFrom(opts);
-  const groupAllowFrom = resolveGroupAllowFrom(opts);
-  const groupPolicy = cfg.signal?.groupPolicy ?? "open";
+  const cfg = opts.config ?? loadConfig();
+  const accountInfo = resolveSignalAccount({
+    cfg,
+    accountId: opts.accountId,
+  });
+  const historyLimit = Math.max(
+    0,
+    accountInfo.config.historyLimit ??
+      cfg.messages?.groupChat?.historyLimit ??
+      DEFAULT_GROUP_HISTORY_LIMIT,
+  );
+  const groupHistories = new Map<string, HistoryEntry[]>();
+  const textLimit = resolveTextChunkLimit(cfg, "signal", accountInfo.accountId);
+  const baseUrl = opts.baseUrl?.trim() || accountInfo.baseUrl;
+  const account = opts.account?.trim() || accountInfo.config.account?.trim();
+  const dmPolicy = accountInfo.config.dmPolicy ?? "pairing";
+  const allowFrom = normalizeAllowList(
+    opts.allowFrom ?? accountInfo.config.allowFrom,
+  );
+  const groupAllowFrom = normalizeAllowList(
+    opts.groupAllowFrom ??
+      accountInfo.config.groupAllowFrom ??
+      (accountInfo.config.allowFrom && accountInfo.config.allowFrom.length > 0
+        ? accountInfo.config.allowFrom
+        : []),
+  );
+  const groupPolicy = accountInfo.config.groupPolicy ?? "open";
+  const reactionMode = accountInfo.config.reactionNotifications ?? "own";
+  const reactionAllowlist = normalizeAllowList(
+    accountInfo.config.reactionAllowlist,
+  );
   const mediaMaxBytes =
-    (opts.mediaMaxMb ?? cfg.signal?.mediaMaxMb ?? 8) * 1024 * 1024;
+    (opts.mediaMaxMb ?? accountInfo.config.mediaMaxMb ?? 8) * 1024 * 1024;
   const ignoreAttachments =
-    opts.ignoreAttachments ?? cfg.signal?.ignoreAttachments ?? false;
+    opts.ignoreAttachments ?? accountInfo.config.ignoreAttachments ?? false;
 
   const autoStart =
-    opts.autoStart ?? cfg.signal?.autoStart ?? !cfg.signal?.httpUrl;
+    opts.autoStart ??
+    accountInfo.config.autoStart ??
+    !accountInfo.config.httpUrl;
   let daemonHandle: ReturnType<typeof spawnSignalDaemon> | null = null;
 
   if (autoStart) {
-    const cliPath = opts.cliPath ?? cfg.signal?.cliPath ?? "signal-cli";
-    const httpHost = opts.httpHost ?? cfg.signal?.httpHost ?? "127.0.0.1";
-    const httpPort = opts.httpPort ?? cfg.signal?.httpPort ?? 8080;
+    const cliPath = opts.cliPath ?? accountInfo.config.cliPath ?? "signal-cli";
+    const httpHost =
+      opts.httpHost ?? accountInfo.config.httpHost ?? "127.0.0.1";
+    const httpPort = opts.httpPort ?? accountInfo.config.httpPort ?? 8080;
     daemonHandle = spawnSignalDaemon({
       cliPath,
       account,
       httpHost,
       httpPort,
-      receiveMode: opts.receiveMode ?? cfg.signal?.receiveMode,
+      receiveMode: opts.receiveMode ?? accountInfo.config.receiveMode,
       ignoreAttachments:
-        opts.ignoreAttachments ?? cfg.signal?.ignoreAttachments,
-      ignoreStories: opts.ignoreStories ?? cfg.signal?.ignoreStories,
-      sendReadReceipts: opts.sendReadReceipts ?? cfg.signal?.sendReadReceipts,
+        opts.ignoreAttachments ?? accountInfo.config.ignoreAttachments,
+      ignoreStories: opts.ignoreStories ?? accountInfo.config.ignoreStories,
+      sendReadReceipts:
+        opts.sendReadReceipts ?? accountInfo.config.sendReadReceipts,
       runtime,
     });
   }
@@ -311,15 +421,92 @@ export async function monitorSignalProvider(
       const envelope = payload?.envelope;
       if (!envelope) return;
       if (envelope.syncMessage) return;
+
+      const sender = resolveSignalSender(envelope);
+      if (!sender) return;
+      if (account && sender.kind === "phone") {
+        if (sender.e164 === normalizeE164(account)) {
+          return;
+        }
+      }
       const dataMessage =
         envelope.dataMessage ?? envelope.editMessage?.dataMessage;
-      if (!dataMessage) return;
-
-      const sender = envelope.sourceNumber?.trim();
-      if (!sender) return;
-      if (account && normalizeE164(sender) === normalizeE164(account)) {
+      const reaction = isSignalReactionMessage(envelope.reactionMessage)
+        ? envelope.reactionMessage
+        : isSignalReactionMessage(dataMessage?.reaction)
+          ? dataMessage?.reaction
+          : null;
+      const messageText = (dataMessage?.message ?? "").trim();
+      const quoteText = dataMessage?.quote?.text?.trim() ?? "";
+      const hasBodyContent =
+        Boolean(messageText || quoteText) ||
+        Boolean(!reaction && dataMessage?.attachments?.length);
+      if (reaction && !hasBodyContent) {
+        if (reaction.isRemove) return; // Ignore reaction removals
+        const emojiLabel = reaction.emoji?.trim() || "emoji";
+        const senderDisplay = formatSignalSenderDisplay(sender);
+        const senderName = envelope.sourceName ?? senderDisplay;
+        logVerbose(`signal reaction: ${emojiLabel} from ${senderName}`);
+        const targets = resolveSignalReactionTargets(reaction);
+        const shouldNotify = shouldEmitSignalReactionNotification({
+          mode: reactionMode,
+          account,
+          targets,
+          sender,
+          allowlist: reactionAllowlist,
+        });
+        if (!shouldNotify) return;
+        const groupId = reaction.groupInfo?.groupId ?? undefined;
+        const groupName = reaction.groupInfo?.groupName ?? undefined;
+        const isGroup = Boolean(groupId);
+        const senderPeerId = resolveSignalPeerId(sender);
+        const route = resolveAgentRoute({
+          cfg,
+          provider: "signal",
+          accountId: accountInfo.accountId,
+          peer: {
+            kind: isGroup ? "group" : "dm",
+            id: isGroup ? (groupId ?? "unknown") : senderPeerId,
+          },
+        });
+        const groupLabel = isGroup
+          ? `${groupName ?? "Signal Group"} id:${groupId}`
+          : undefined;
+        const messageId = reaction.targetSentTimestamp
+          ? String(reaction.targetSentTimestamp)
+          : "unknown";
+        const text = buildSignalReactionSystemEventText({
+          emojiLabel,
+          actorLabel: senderName,
+          messageId,
+          targetLabel: targets[0]?.display,
+          groupLabel,
+        });
+        const senderId = formatSignalSenderId(sender);
+        const contextKey = [
+          "signal",
+          "reaction",
+          "added",
+          messageId,
+          senderId,
+          emojiLabel,
+          groupId ?? "",
+        ]
+          .filter(Boolean)
+          .join(":");
+        enqueueSystemEvent(text, {
+          sessionKey: route.sessionKey,
+          contextKey,
+        });
         return;
       }
+      if (!dataMessage) return;
+      const senderDisplay = formatSignalSenderDisplay(sender);
+      const senderRecipient = resolveSignalRecipient(sender);
+      const senderPeerId = resolveSignalPeerId(sender);
+      const senderAllowId = formatSignalSenderId(sender);
+      if (!senderRecipient) return;
+      const senderIdLine = formatSignalPairingIdLine(sender);
       const groupId = dataMessage.groupInfo?.groupId ?? undefined;
       const groupName = dataMessage.groupInfo?.groupName ?? undefined;
       const isGroup = Boolean(groupId);
@@ -329,44 +516,48 @@ export async function monitorSignalProvider(
       const effectiveDmAllow = [...allowFrom, ...storeAllowFrom];
       const effectiveGroupAllow = [...groupAllowFrom, ...storeAllowFrom];
       const dmAllowed =
-        dmPolicy === "open" ? true : isAllowedSender(sender, effectiveDmAllow);
+        dmPolicy === "open"
+          ? true
+          : isSignalSenderAllowed(sender, effectiveDmAllow);
 
       if (!isGroup) {
         if (dmPolicy === "disabled") return;
         if (!dmAllowed) {
           if (dmPolicy === "pairing") {
-            const senderId = normalizeE164(sender);
-            const { code } = await upsertProviderPairingRequest({
+            const senderId = senderAllowId;
+            const { code, created } = await upsertProviderPairingRequest({
               provider: "signal",
               id: senderId,
               meta: {
                 name: envelope.sourceName ?? undefined,
               },
             });
-            logVerbose(
-              `signal pairing request sender=${senderId} code=${code}`,
-            );
-            try {
-              await sendMessageSignal(
-                senderId,
-                [
-                  "Clawdbot: access not configured.",
-                  "",
-                  `Pairing code: ${code}`,
-                  "",
-                  "Ask the bot owner to approve with:",
-                  "clawdbot pairing approve --provider signal <code>",
-                ].join("\n"),
-                { baseUrl, account, maxBytes: mediaMaxBytes },
-              );
-            } catch (err) {
-              logVerbose(
-                `signal pairing reply failed for ${senderId}: ${String(err)}`,
-              );
+            if (created) {
+              logVerbose(`signal pairing request sender=${senderId}`);
+              try {
+                await sendMessageSignal(
+                  `signal:${senderRecipient}`,
+                  buildPairingReply({
+                    provider: "signal",
+                    idLine: senderIdLine,
+                    code,
+                  }),
+                  {
+                    baseUrl,
+                    account,
+                    maxBytes: mediaMaxBytes,
+                    accountId: accountInfo.accountId,
+                  },
+                );
+              } catch (err) {
+                logVerbose(
+                  `signal pairing reply failed for ${senderId}: ${String(err)}`,
+                );
+              }
             }
           } else {
             logVerbose(
-              `Blocked signal sender ${sender} (dmPolicy=${dmPolicy})`,
+              `Blocked signal sender ${senderDisplay} (dmPolicy=${dmPolicy})`,
             );
           }
           return;
@@ -383,9 +574,9 @@ export async function monitorSignalProvider(
           );
           return;
         }
-        if (!isAllowedSender(sender, effectiveGroupAllow)) {
+        if (!isSignalSenderAllowed(sender, effectiveGroupAllow)) {
           logVerbose(
-            `Blocked signal group sender ${sender} (not in groupAllowFrom)`,
+            `Blocked signal group sender ${senderDisplay} (not in groupAllowFrom)`,
           );
           return;
         }
@@ -393,10 +584,9 @@ export async function monitorSignalProvider(
 
       const commandAuthorized = isGroup
         ? effectiveGroupAllow.length > 0
-          ? isAllowedSender(sender, effectiveGroupAllow)
+          ? isSignalSenderAllowed(sender, effectiveGroupAllow)
           : true
         : dmAllowed;
-      const messageText = (dataMessage.message ?? "").trim();
 
       let mediaPath: string | undefined;
       let mediaType: string | undefined;
@@ -408,7 +598,7 @@ export async function monitorSignalProvider(
             baseUrl,
             account,
             attachment: firstAttachment,
-            sender,
+            sender: senderRecipient,
             groupId,
             maxBytes: mediaMaxBytes,
           });
@@ -435,39 +625,79 @@ export async function monitorSignalProvider(
 
       const fromLabel = isGroup
         ? `${groupName ?? "Signal Group"} id:${groupId}`
-        : `${envelope.sourceName ?? sender} id:${sender}`;
+        : `${envelope.sourceName ?? senderDisplay} id:${senderDisplay}`;
       const body = formatAgentEnvelope({
         provider: "Signal",
         from: fromLabel,
         timestamp: envelope.timestamp ?? undefined,
         body: bodyText,
       });
+      let combinedBody = body;
+      const historyKey = isGroup ? String(groupId ?? "unknown") : undefined;
+      if (isGroup && historyKey && historyLimit > 0) {
+        combinedBody = buildHistoryContextFromMap({
+          historyMap: groupHistories,
+          historyKey,
+          limit: historyLimit,
+          entry: {
+            sender: envelope.sourceName ?? senderDisplay,
+            body: bodyText,
+            timestamp: envelope.timestamp ?? undefined,
+            messageId:
+              typeof envelope.timestamp === "number"
+                ? String(envelope.timestamp)
+                : undefined,
+          },
+          currentMessage: combinedBody,
+          formatEntry: (entry) =>
+            formatAgentEnvelope({
+              provider: "Signal",
+              from: fromLabel,
+              timestamp: entry.timestamp,
+              body: `${entry.sender}: ${entry.body}${
+                entry.messageId ? ` [id:${entry.messageId}]` : ""
+              }`,
+            }),
+        });
+      }
 
       const route = resolveAgentRoute({
         cfg,
         provider: "signal",
+        accountId: accountInfo.accountId,
         peer: {
           kind: isGroup ? "group" : "dm",
-          id: isGroup ? (groupId ?? "unknown") : normalizeE164(sender),
+          id: isGroup ? (groupId ?? "unknown") : senderPeerId,
         },
       });
+      const signalTo = isGroup
+        ? `group:${groupId}`
+        : `signal:${senderRecipient}`;
       const ctxPayload = {
-        Body: body,
-        From: isGroup ? `group:${groupId ?? "unknown"}` : `signal:${sender}`,
-        To: isGroup ? `group:${groupId ?? "unknown"}` : `signal:${sender}`,
+        Body: combinedBody,
+        RawBody: bodyText,
+        CommandBody: bodyText,
+        From: isGroup
+          ? `group:${groupId ?? "unknown"}`
+          : `signal:${senderRecipient}`,
+        To: signalTo,
         SessionKey: route.sessionKey,
         AccountId: route.accountId,
         ChatType: isGroup ? "group" : "direct",
         GroupSubject: isGroup ? (groupName ?? undefined) : undefined,
-        SenderName: envelope.sourceName ?? sender,
-        SenderId: sender,
+        SenderName: envelope.sourceName ?? senderDisplay,
+        SenderId: senderDisplay,
         Provider: "signal" as const,
+        Surface: "signal" as const,
         MessageSid: envelope.timestamp ? String(envelope.timestamp) : undefined,
         Timestamp: envelope.timestamp ?? undefined,
         MediaPath: mediaPath,
         MediaType: mediaType,
         MediaUrl: mediaPath,
         CommandAuthorized: commandAuthorized,
+        // Originating channel for reply routing.
+        OriginatingChannel: "signal" as const,
+        OriginatingTo: signalTo,
       };
 
       if (!isGroup) {
@@ -479,7 +709,7 @@ export async function monitorSignalProvider(
           storePath,
           sessionKey: route.mainSessionKey,
           provider: "signal",
-          to: normalizeE164(sender),
+          to: senderRecipient,
           accountId: route.accountId,
         });
       }
@@ -491,18 +721,23 @@ export async function monitorSignalProvider(
         );
       }
 
+      let didSendReply = false;
       const dispatcher = createReplyDispatcher({
-        responsePrefix: cfg.messages?.responsePrefix,
+        responsePrefix: resolveEffectiveMessagesConfig(cfg, route.agentId)
+          .responsePrefix,
+        humanDelay: resolveHumanDelayConfig(cfg, route.agentId),
         deliver: async (payload) => {
           await deliverReplies({
             replies: [payload],
             target: ctxPayload.To,
             baseUrl,
             account,
+            accountId: accountInfo.accountId,
             runtime,
             maxBytes: mediaMaxBytes,
             textLimit,
           });
+          didSendReply = true;
         },
         onError: (err, info) => {
           runtime.error?.(
@@ -515,14 +750,29 @@ export async function monitorSignalProvider(
         ctx: ctxPayload,
         cfg,
         dispatcher,
+        replyOptions: {
+          disableBlockStreaming:
+            typeof accountInfo.config.blockStreaming === "boolean"
+              ? !accountInfo.config.blockStreaming
+              : undefined,
+        },
       });
-      if (!queuedFinal) return;
+      if (!queuedFinal) {
+        if (isGroup && historyKey && historyLimit > 0 && didSendReply) {
+          clearHistoryEntries({ historyMap: groupHistories, historyKey });
+        }
+        return;
+      }
+      if (isGroup && historyKey && historyLimit > 0 && didSendReply) {
+        clearHistoryEntries({ historyMap: groupHistories, historyKey });
+      }
     };
 
-    await streamSignalEvents({
+    await runSignalSseLoop({
       baseUrl,
       account,
       abortSignal: opts.abortSignal,
+      runtime,
       onEvent: (event) => {
         void handleEvent(event).catch((err) => {
           runtime.error?.(`event handler failed: ${String(err)}`);

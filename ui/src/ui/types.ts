@@ -215,6 +215,7 @@ export type GatewaySessionsDefaults = {
 export type GatewaySessionRow = {
   key: string;
   kind: "direct" | "group" | "global" | "unknown";
+  label?: string;
   displayName?: string;
   surface?: string;
   subject?: string;
@@ -226,6 +227,7 @@ export type GatewaySessionRow = {
   abortedLastRun?: boolean;
   thinkingLevel?: string;
   verboseLevel?: string;
+  reasoningLevel?: string;
   elevatedLevel?: string;
   inputTokens?: number;
   outputTokens?: number;
@@ -251,6 +253,7 @@ export type SessionsPatchResult = {
     updatedAt?: number;
     thinkingLevel?: string;
     verboseLevel?: string;
+    reasoningLevel?: string;
     elevatedLevel?: string;
   };
 };
@@ -378,3 +381,20 @@ export type SkillStatusReport = {
 export type StatusSummary = Record<string, unknown>;
 
 export type HealthSnapshot = Record<string, unknown>;
+
+export type LogLevel =
+  | "trace"
+  | "debug"
+  | "info"
+  | "warn"
+  | "error"
+  | "fatal";
+
+export type LogEntry = {
+  raw: string;
+  time?: string | null;
+  level?: LogLevel | null;
+  subsystem?: string | null;
+  message?: string | null;
+  meta?: Record<string, unknown> | null;
+};

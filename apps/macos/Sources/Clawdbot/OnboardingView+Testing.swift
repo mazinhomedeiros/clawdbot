@@ -1,3 +1,4 @@
+import ClawdbotDiscovery
 import SwiftUI
 
 #if DEBUG
@@ -5,13 +6,14 @@ import SwiftUI
 extension OnboardingView {
     static func exerciseForTesting() {
         let state = AppState(preview: true)
-        let discovery = GatewayDiscoveryModel()
+        let discovery = GatewayDiscoveryModel(localDisplayName: InstanceIdentity.displayName)
         discovery.statusText = "Searching..."
         let gateway = GatewayDiscoveryModel.DiscoveredGateway(
             displayName: "Test Bridge",
             lanHost: "bridge.local",
             tailnetDns: "bridge.ts.net",
             sshPort: 2222,
+            gatewayPort: 18789,
             cliPath: "/usr/local/bin/clawdbot",
             stableID: "bridge-1",
             debugID: "bridge-1",

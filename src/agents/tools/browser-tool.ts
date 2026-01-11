@@ -28,74 +28,61 @@ import {
   readStringParam,
 } from "./common.js";
 
-const BrowserActSchema = Type.Union([
-  Type.Object({
-    kind: Type.Literal("click"),
-    ref: Type.String(),
-    targetId: Type.Optional(Type.String()),
-    doubleClick: Type.Optional(Type.Boolean()),
-    button: Type.Optional(Type.String()),
-    modifiers: Type.Optional(Type.Array(Type.String())),
+const BROWSER_ACT_KINDS = [
+  "click",
+  "type",
+  "press",
+  "hover",
+  "drag",
+  "select",
+  "fill",
+  "resize",
+  "wait",
+  "evaluate",
+  "close",
+] as const;
+
+type BrowserActKind = (typeof BROWSER_ACT_KINDS)[number];
+
+// NOTE: Using a flattened object schema instead of Type.Union([Type.Object(...), ...])
+// because Claude API on Vertex AI rejects nested anyOf schemas as invalid JSON Schema.
+// The discriminator (kind) determines which properties are relevant; runtime validates.
+const BrowserActSchema = Type.Object({
+  kind: Type.Unsafe<BrowserActKind>({
+    type: "string",
+    enum: [...BROWSER_ACT_KINDS],
   }),
-  Type.Object({
-    kind: Type.Literal("type"),
-    ref: Type.String(),
-    text: Type.String(),
-    targetId: Type.Optional(Type.String()),
-    submit: Type.Optional(Type.Boolean()),
-    slowly: Type.Optional(Type.Boolean()),
-  }),
-  Type.Object({
-    kind: Type.Literal("press"),
-    key: Type.String(),
-    targetId: Type.Optional(Type.String()),
-  }),
-  Type.Object({
-    kind: Type.Literal("hover"),
-    ref: Type.String(),
-    targetId: Type.Optional(Type.String()),
-  }),
-  Type.Object({
-    kind: Type.Literal("drag"),
-    startRef: Type.String(),
-    endRef: Type.String(),
-    targetId: Type.Optional(Type.String()),
-  }),
-  Type.Object({
-    kind: Type.Literal("select"),
-    ref: Type.String(),
-    values: Type.Array(Type.String()),
-    targetId: Type.Optional(Type.String()),
-  }),
-  Type.Object({
-    kind: Type.Literal("fill"),
-    fields: Type.Array(Type.Record(Type.String(), Type.Unknown())),
-    targetId: Type.Optional(Type.String()),
-  }),
-  Type.Object({
-    kind: Type.Literal("resize"),
-    width: Type.Number(),
-    height: Type.Number(),
-    targetId: Type.Optional(Type.String()),
-  }),
-  Type.Object({
-    kind: Type.Literal("wait"),
-    timeMs: Type.Optional(Type.Number()),
-    text: Type.Optional(Type.String()),
-    textGone: Type.Optional(Type.String()),
-    targetId: Type.Optional(Type.String()),
-  }),
-  Type.Object({
-    kind: Type.Literal("evaluate"),
-    fn: Type.String(),
-    ref: Type.Optional(Type.String()),
-    targetId: Type.Optional(Type.String()),
-  }),
-  Type.Object({
-    kind: Type.Literal("close"),
-    targetId: Type.Optional(Type.String()),
-  }),
-]);
+  // Common fields
+  targetId: Type.Optional(Type.String()),
+  ref: Type.Optional(Type.String()),
+  // click
+  doubleClick: Type.Optional(Type.Boolean()),
+  button: Type.Optional(Type.String()),
+  modifiers: Type.Optional(Type.Array(Type.String())),
+  // type
+  text: Type.Optional(Type.String()),
+  submit: Type.Optional(Type.Boolean()),
+  slowly: Type.Optional(Type.Boolean()),
+  // press
+  key: Type.Optional(Type.String()),
+  // drag
+  startRef: Type.Optional(Type.String()),
+  endRef: Type.Optional(Type.String()),
+  // select
+  values: Type.Optional(Type.Array(Type.String())),
+  // fill - use permissive array of objects
+  fields: Type.Optional(
+    Type.Array(Type.Object({}, { additionalProperties: true })),
+  ),
+  // resize
+  width: Type.Optional(Type.Number()),
+  height: Type.Optional(Type.Number()),
+  // wait
+  timeMs: Type.Optional(Type.Number()),
+  textGone: Type.Optional(Type.String()),
+  // evaluate
+  fn: Type.Optional(Type.String()),
+});
 
 // IMPORTANT: OpenAI function tool schemas must have a top-level `type: "object"`.
 // A root-level `Type.Union([...])` compiles to `{ anyOf: [...] }` (no `type`),
@@ -118,6 +105,14 @@ const BrowserToolSchema = Type.Object({
     Type.Literal("dialog"),
     Type.Literal("act"),
   ]),
+  target: Type.Optional(
+    Type.Union([
+      Type.Literal("sandbox"),
+      Type.Literal("host"),
+      Type.Literal("custom"),
+    ]),
+  ),
+  profile: Type.Optional(Type.String()),
   controlUrl: Type.Optional(Type.String()),
   targetUrl: Type.Optional(Type.String()),
   targetId: Type.Optional(Type.String()),
@@ -136,20 +131,54 @@ const BrowserToolSchema = Type.Object({
   request: Type.Optional(BrowserActSchema),
 });
 
-function resolveBrowserBaseUrl(controlUrl?: string) {
+function resolveBrowserBaseUrl(params: {
+  target?: "sandbox" | "host" | "custom";
+  controlUrl?: string;
+  defaultControlUrl?: string;
+  allowHostControl?: boolean;
+}) {
   const cfg = loadConfig();
   const resolved = resolveBrowserConfig(cfg.browser);
-  if (!resolved.enabled && !controlUrl?.trim()) {
+  const normalizedControlUrl = params.controlUrl?.trim() ?? "";
+  const normalizedDefault = params.defaultControlUrl?.trim() ?? "";
+  const target =
+    params.target ??
+    (normalizedControlUrl ? "custom" : normalizedDefault ? "sandbox" : "host");
+
+  if (target !== "custom" && params.target && normalizedControlUrl) {
+    throw new Error('controlUrl is only supported with target="custom".');
+  }
+
+  if (target === "custom") {
+    if (!normalizedControlUrl) {
+      throw new Error("Custom browser target requires controlUrl.");
+    }
+    return normalizedControlUrl.replace(/\/$/, "");
+  }
+
+  if (target === "sandbox") {
+    if (!normalizedDefault) {
+      throw new Error(
+        'Sandbox browser is unavailable. Enable agents.defaults.sandbox.browser.enabled or use target="host" if allowed.',
+      );
+    }
+    return normalizedDefault.replace(/\/$/, "");
+  }
+
+  if (params.allowHostControl === false) {
+    throw new Error("Host browser control is disabled by sandbox policy.");
+  }
+  if (!resolved.enabled) {
     throw new Error(
       "Browser control is disabled. Set browser.enabled=true in ~/.clawdbot/clawdbot.json.",
     );
   }
-  const url = controlUrl?.trim() ? controlUrl.trim() : resolved.controlUrl;
-  return url.replace(/\/$/, "");
+  return resolved.controlUrl.replace(/\/$/, "");
 }
 
 export function createBrowserTool(opts?: {
   defaultControlUrl?: string;
+  allowHostControl?: boolean;
 }): AnyAgentTool {
   return {
     label: "Browser",
@@ -161,38 +190,49 @@ export function createBrowserTool(opts?: {
       const params = args as Record<string, unknown>;
       const action = readStringParam(params, "action", { required: true });
       const controlUrl = readStringParam(params, "controlUrl");
-      const baseUrl = resolveBrowserBaseUrl(
-        controlUrl ?? opts?.defaultControlUrl,
-      );
+      const target = readStringParam(params, "target") as
+        | "sandbox"
+        | "host"
+        | "custom"
+        | undefined;
+      const profile = readStringParam(params, "profile");
+      const baseUrl = resolveBrowserBaseUrl({
+        target,
+        controlUrl,
+        defaultControlUrl: opts?.defaultControlUrl,
+        allowHostControl: opts?.allowHostControl,
+      });
 
       switch (action) {
         case "status":
-          return jsonResult(await browserStatus(baseUrl));
+          return jsonResult(await browserStatus(baseUrl, { profile }));
         case "start":
-          await browserStart(baseUrl);
-          return jsonResult(await browserStatus(baseUrl));
+          await browserStart(baseUrl, { profile });
+          return jsonResult(await browserStatus(baseUrl, { profile }));
         case "stop":
-          await browserStop(baseUrl);
-          return jsonResult(await browserStatus(baseUrl));
+          await browserStop(baseUrl, { profile });
+          return jsonResult(await browserStatus(baseUrl, { profile }));
         case "tabs":
-          return jsonResult({ tabs: await browserTabs(baseUrl) });
+          return jsonResult({ tabs: await browserTabs(baseUrl, { profile }) });
         case "open": {
           const targetUrl = readStringParam(params, "targetUrl", {
             required: true,
           });
-          return jsonResult(await browserOpenTab(baseUrl, targetUrl));
+          return jsonResult(
+            await browserOpenTab(baseUrl, targetUrl, { profile }),
+          );
         }
         case "focus": {
           const targetId = readStringParam(params, "targetId", {
             required: true,
           });
-          await browserFocusTab(baseUrl, targetId);
+          await browserFocusTab(baseUrl, targetId, { profile });
           return jsonResult({ ok: true });
         }
         case "close": {
           const targetId = readStringParam(params, "targetId");
-          if (targetId) await browserCloseTab(baseUrl, targetId);
-          else await browserAct(baseUrl, { kind: "close" });
+          if (targetId) await browserCloseTab(baseUrl, targetId, { profile });
+          else await browserAct(baseUrl, { kind: "close" }, { profile });
           return jsonResult({ ok: true });
         }
         case "snapshot": {
@@ -212,6 +252,7 @@ export function createBrowserTool(opts?: {
             format,
             targetId,
             limit,
+            profile,
           });
           if (snapshot.format === "ai") {
             return {
@@ -233,6 +274,7 @@ export function createBrowserTool(opts?: {
             ref,
             element,
             type,
+            profile,
           });
           return await imageResultFromFile({
             label: "browser:screenshot",
@@ -246,7 +288,11 @@ export function createBrowserTool(opts?: {
           });
           const targetId = readStringParam(params, "targetId");
           return jsonResult(
-            await browserNavigate(baseUrl, { url: targetUrl, targetId }),
+            await browserNavigate(baseUrl, {
+              url: targetUrl,
+              targetId,
+              profile,
+            }),
           );
         }
         case "console": {
@@ -257,7 +303,7 @@ export function createBrowserTool(opts?: {
               ? params.targetId.trim()
               : undefined;
           return jsonResult(
-            await browserConsoleMessages(baseUrl, { level, targetId }),
+            await browserConsoleMessages(baseUrl, { level, targetId, profile }),
           );
         }
         case "pdf": {
@@ -265,7 +311,7 @@ export function createBrowserTool(opts?: {
             typeof params.targetId === "string"
               ? params.targetId.trim()
               : undefined;
-          const result = await browserPdfSave(baseUrl, { targetId });
+          const result = await browserPdfSave(baseUrl, { targetId, profile });
           return {
             content: [{ type: "text", text: `FILE:${result.path}` }],
             details: result,
@@ -296,6 +342,7 @@ export function createBrowserTool(opts?: {
               element,
               targetId,
               timeoutMs,
+              profile,
             }),
           );
         }
@@ -320,6 +367,7 @@ export function createBrowserTool(opts?: {
               promptText,
               targetId,
               timeoutMs,
+              profile,
             }),
           );
         }
@@ -331,6 +379,7 @@ export function createBrowserTool(opts?: {
           const result = await browserAct(
             baseUrl,
             request as Parameters<typeof browserAct>[1],
+            { profile },
           );
           return jsonResult(result);
         }

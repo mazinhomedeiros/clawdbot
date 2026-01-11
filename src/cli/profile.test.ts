@@ -3,7 +3,7 @@ import { describe, expect, it } from "vitest";
 import { applyCliProfileEnv, parseCliProfileArgs } from "./profile.js";
 
 describe("parseCliProfileArgs", () => {
-  it("strips --dev anywhere in argv", () => {
+  it("leaves gateway --dev for subcommands", () => {
     const res = parseCliProfileArgs([
       "node",
       "clawdbot",
@@ -12,13 +12,21 @@ describe("parseCliProfileArgs", () => {
       "--allow-unconfigured",
     ]);
     if (!res.ok) throw new Error(res.error);
-    expect(res.profile).toBe("dev");
+    expect(res.profile).toBeNull();
     expect(res.argv).toEqual([
       "node",
       "clawdbot",
       "gateway",
+      "--dev",
       "--allow-unconfigured",
     ]);
+  });
+
+  it("still accepts global --dev before subcommand", () => {
+    const res = parseCliProfileArgs(["node", "clawdbot", "--dev", "gateway"]);
+    if (!res.ok) throw new Error(res.error);
+    expect(res.profile).toBe("dev");
+    expect(res.argv).toEqual(["node", "clawdbot", "gateway"]);
   });
 
   it("parses --profile value and strips it", () => {
@@ -72,10 +80,11 @@ describe("applyCliProfileEnv", () => {
       env,
       homedir: () => "/home/peter",
     });
+    const expectedStateDir = path.join("/home/peter", ".clawdbot-dev");
     expect(env.CLAWDBOT_PROFILE).toBe("dev");
-    expect(env.CLAWDBOT_STATE_DIR).toBe("/home/peter/.clawdbot-dev");
+    expect(env.CLAWDBOT_STATE_DIR).toBe(expectedStateDir);
     expect(env.CLAWDBOT_CONFIG_PATH).toBe(
-      path.join("/home/peter/.clawdbot-dev", "clawdbot.json"),
+      path.join(expectedStateDir, "clawdbot.json"),
     );
     expect(env.CLAWDBOT_GATEWAY_PORT).toBe("19001");
   });

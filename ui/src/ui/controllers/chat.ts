@@ -1,4 +1,5 @@
 import type { GatewayBrowserClient } from "../gateway";
+import { stripThinkingTags } from "../format";
 import { generateUUID } from "../uuid";
 
 export type ChatState = {
@@ -42,9 +43,9 @@ export async function loadChatHistory(state: ChatState) {
   }
 }
 
-export async function sendChat(state: ChatState): Promise<boolean> {
+export async function sendChatMessage(state: ChatState, message: string): Promise<boolean> {
   if (!state.client || !state.connected) return false;
-  const msg = state.chatMessage.trim();
+  const msg = message.trim();
   if (!msg) return false;
 
   const now = Date.now();
@@ -58,7 +59,6 @@ export async function sendChat(state: ChatState): Promise<boolean> {
   ];
 
   state.chatSending = true;
-  state.chatMessage = "";
   state.lastError = null;
   const runId = generateUUID();
   state.chatRunId = runId;
@@ -77,7 +77,6 @@ export async function sendChat(state: ChatState): Promise<boolean> {
     state.chatRunId = null;
     state.chatStream = null;
     state.chatStreamStartedAt = null;
-    state.chatMessage = msg;
     state.lastError = error;
     state.chatMessages = [
       ...state.chatMessages,
@@ -90,6 +89,23 @@ export async function sendChat(state: ChatState): Promise<boolean> {
     return false;
   } finally {
     state.chatSending = false;
+  }
+}
+
+export async function abortChatRun(state: ChatState): Promise<boolean> {
+  if (!state.client || !state.connected) return false;
+  const runId = state.chatRunId;
+  try {
+    await state.client.request(
+      "chat.abort",
+      runId
+        ? { sessionKey: state.sessionKey, runId }
+        : { sessionKey: state.sessionKey },
+    );
+    return true;
+  } catch (err) {
+    state.lastError = String(err);
+    return false;
   }
 }
 
@@ -129,8 +145,11 @@ export function handleChatEvent(
 
 function extractText(message: unknown): string | null {
   const m = message as Record<string, unknown>;
+  const role = typeof m.role === "string" ? m.role : "";
   const content = m.content;
-  if (typeof content === "string") return content;
+  if (typeof content === "string") {
+    return role === "assistant" ? stripThinkingTags(content) : content;
+  }
   if (Array.isArray(content)) {
     const parts = content
       .map((p) => {
@@ -139,8 +158,13 @@ function extractText(message: unknown): string | null {
         return null;
       })
       .filter((v): v is string => typeof v === "string");
-    if (parts.length > 0) return parts.join("\n");
+    if (parts.length > 0) {
+      const joined = parts.join("\n");
+      return role === "assistant" ? stripThinkingTags(joined) : joined;
+    }
   }
-  if (typeof m.text === "string") return m.text;
+  if (typeof m.text === "string") {
+    return role === "assistant" ? stripThinkingTags(m.text) : m.text;
+  }
   return null;
 }

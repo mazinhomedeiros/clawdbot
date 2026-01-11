@@ -5,24 +5,28 @@ import {
   deleteMessageDiscord,
   editMessageDiscord,
   fetchChannelPermissionsDiscord,
+  fetchMessageDiscord,
   fetchReactionsDiscord,
   listPinsDiscord,
   listThreadsDiscord,
   pinMessageDiscord,
   reactMessageDiscord,
   readMessagesDiscord,
+  removeOwnReactionsDiscord,
+  removeReactionDiscord,
   searchMessagesDiscord,
   sendMessageDiscord,
   sendPollDiscord,
   sendStickerDiscord,
   unpinMessageDiscord,
 } from "../../discord/send.js";
-import { jsonResult, readStringArrayParam, readStringParam } from "./common.js";
-
-type ActionGate = (
-  key: keyof DiscordActionConfig,
-  defaultValue?: boolean,
-) => boolean;
+import {
+  type ActionGate,
+  jsonResult,
+  readReactionParams,
+  readStringArrayParam,
+  readStringParam,
+} from "./common.js";
 
 function formatDiscordTimestamp(ts?: string | null): string | undefined {
   if (!ts) return undefined;
@@ -50,10 +54,27 @@ function formatDiscordTimestamp(ts?: string | null): string | undefined {
   return `${yyyy}-${mm}-${dd}T${hh}:${min}${sign}${offsetH}:${offsetM}${tzSuffix}`;
 }
 
+function parseDiscordMessageLink(link: string) {
+  const normalized = link.trim();
+  const match = normalized.match(
+    /^(?:https?:\/\/)?(?:ptb\.|canary\.)?discord(?:app)?\.com\/channels\/(\d+)\/(\d+)\/(\d+)(?:\/?|\?.*)$/i,
+  );
+  if (!match) {
+    throw new Error(
+      "Invalid Discord message link. Expected https://discord.com/channels/<guildId>/<channelId>/<messageId>.",
+    );
+  }
+  return {
+    guildId: match[1],
+    channelId: match[2],
+    messageId: match[3],
+  };
+}
+
 export async function handleDiscordMessagingAction(
   action: string,
   params: Record<string, unknown>,
-  isActionEnabled: ActionGate,
+  isActionEnabled: ActionGate<DiscordActionConfig>,
 ): Promise<AgentToolResult<unknown>> {
   switch (action) {
     case "react": {
@@ -66,9 +87,19 @@ export async function handleDiscordMessagingAction(
       const messageId = readStringParam(params, "messageId", {
         required: true,
       });
-      const emoji = readStringParam(params, "emoji", { required: true });
+      const { emoji, remove, isEmpty } = readReactionParams(params, {
+        removeErrorMessage: "Emoji is required to remove a Discord reaction.",
+      });
+      if (remove) {
+        await removeReactionDiscord(channelId, messageId, emoji);
+        return jsonResult({ ok: true, removed: emoji });
+      }
+      if (isEmpty) {
+        const removed = await removeOwnReactionsDiscord(channelId, messageId);
+        return jsonResult({ ok: true, removed: removed.removed });
+      }
       await reactMessageDiscord(channelId, messageId, emoji);
-      return jsonResult({ ok: true });
+      return jsonResult({ ok: true, added: emoji });
     }
     case "reactions": {
       if (!isActionEnabled("reactions")) {
@@ -143,6 +174,28 @@ export async function handleDiscordMessagingAction(
       });
       const permissions = await fetchChannelPermissionsDiscord(channelId);
       return jsonResult({ ok: true, permissions });
+    }
+    case "fetchMessage": {
+      if (!isActionEnabled("messages")) {
+        throw new Error("Discord message reads are disabled.");
+      }
+      const messageLink = readStringParam(params, "messageLink");
+      let guildId = readStringParam(params, "guildId");
+      let channelId = readStringParam(params, "channelId");
+      let messageId = readStringParam(params, "messageId");
+      if (messageLink) {
+        const parsed = parseDiscordMessageLink(messageLink);
+        guildId = parsed.guildId;
+        channelId = parsed.channelId;
+        messageId = parsed.messageId;
+      }
+      if (!guildId || !channelId || !messageId) {
+        throw new Error(
+          "Discord message fetch requires guildId, channelId, and messageId (or a valid messageLink).",
+        );
+      }
+      const message = await fetchMessageDiscord(channelId, messageId);
+      return jsonResult({ ok: true, message, guildId, channelId, messageId });
     }
     case "readMessages": {
       if (!isActionEnabled("messages")) {

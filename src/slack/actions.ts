@@ -1,10 +1,13 @@
 import { WebClient } from "@slack/web-api";
 
 import { loadConfig } from "../config/config.js";
+import { logVerbose } from "../globals.js";
+import { resolveSlackAccount } from "./accounts.js";
 import { sendMessageSlack } from "./send.js";
 import { resolveSlackBotToken } from "./token.js";
 
 export type SlackActionClientOpts = {
+  accountId?: string;
   token?: string;
   client?: WebClient;
 };
@@ -28,12 +31,16 @@ export type SlackPin = {
   file?: { id?: string; name?: string };
 };
 
-function resolveToken(explicit?: string) {
-  const cfgToken = loadConfig().slack?.botToken;
-  const token = resolveSlackBotToken(
-    explicit ?? process.env.SLACK_BOT_TOKEN ?? cfgToken ?? undefined,
-  );
+function resolveToken(explicit?: string, accountId?: string) {
+  const cfg = loadConfig();
+  const account = resolveSlackAccount({ cfg, accountId });
+  const token = resolveSlackBotToken(explicit ?? account.botToken ?? undefined);
   if (!token) {
+    logVerbose(
+      `slack actions: missing bot token for account=${account.accountId} explicit=${Boolean(
+        explicit,
+      )} source=${account.botTokenSource ?? "unknown"}`,
+    );
     throw new Error(
       "SLACK_BOT_TOKEN or slack.botToken is required for Slack actions",
     );
@@ -50,8 +57,16 @@ function normalizeEmoji(raw: string) {
 }
 
 async function getClient(opts: SlackActionClientOpts = {}) {
-  const token = resolveToken(opts.token);
+  const token = resolveToken(opts.token, opts.accountId);
   return opts.client ?? new WebClient(token);
+}
+
+async function resolveBotUserId(client: WebClient) {
+  const auth = await client.auth.test();
+  if (!auth?.user_id) {
+    throw new Error("Failed to resolve Slack bot user id");
+  }
+  return auth.user_id;
 }
 
 export async function reactSlackMessage(
@@ -66,6 +81,50 @@ export async function reactSlackMessage(
     timestamp: messageId,
     name: normalizeEmoji(emoji),
   });
+}
+
+export async function removeSlackReaction(
+  channelId: string,
+  messageId: string,
+  emoji: string,
+  opts: SlackActionClientOpts = {},
+) {
+  const client = await getClient(opts);
+  await client.reactions.remove({
+    channel: channelId,
+    timestamp: messageId,
+    name: normalizeEmoji(emoji),
+  });
+}
+
+export async function removeOwnSlackReactions(
+  channelId: string,
+  messageId: string,
+  opts: SlackActionClientOpts = {},
+): Promise<string[]> {
+  const client = await getClient(opts);
+  const userId = await resolveBotUserId(client);
+  const reactions = await listSlackReactions(channelId, messageId, { client });
+  const toRemove = new Set<string>();
+  for (const reaction of reactions ?? []) {
+    const name = reaction?.name;
+    if (!name) continue;
+    const users = reaction?.users ?? [];
+    if (users.includes(userId)) {
+      toRemove.add(name);
+    }
+  }
+  if (toRemove.size === 0) return [];
+  await Promise.all(
+    Array.from(toRemove, (name) =>
+      client.reactions.remove({
+        channel: channelId,
+        timestamp: messageId,
+        name,
+      }),
+    ),
+  );
+  return Array.from(toRemove);
 }
 
 export async function listSlackReactions(
@@ -86,12 +145,14 @@ export async function listSlackReactions(
 export async function sendSlackMessage(
   to: string,
   content: string,
-  opts: SlackActionClientOpts & { mediaUrl?: string } = {},
+  opts: SlackActionClientOpts & { mediaUrl?: string; threadTs?: string } = {},
 ) {
   return await sendMessageSlack(to, content, {
+    accountId: opts.accountId,
     token: opts.token,
     mediaUrl: opts.mediaUrl,
     client: opts.client,
+    threadTs: opts.threadTs,
   });
 }
 

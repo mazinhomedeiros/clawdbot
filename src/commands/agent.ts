@@ -1,5 +1,10 @@
 import crypto from "node:crypto";
+import {
+  resolveAgentDir,
+  resolveAgentWorkspaceDir,
+} from "../agents/agent-scope.js";
 import { ensureAuthProfileStore } from "../agents/auth-profiles.js";
+import { runClaudeCliAgent } from "../agents/claude-cli-runner.js";
 import { lookupContextTokens } from "../agents/context.js";
 import {
   DEFAULT_CONTEXT_TOKENS,
@@ -18,11 +23,7 @@ import { runEmbeddedPiAgent } from "../agents/pi-embedded.js";
 import { buildWorkspaceSkillSnapshot } from "../agents/skills.js";
 import { resolveAgentTimeoutMs } from "../agents/timeout.js";
 import { hasNonzeroUsage } from "../agents/usage.js";
-import {
-  DEFAULT_AGENT_WORKSPACE_DIR,
-  ensureAgentWorkspace,
-} from "../agents/workspace.js";
-import { chunkText, resolveTextChunkLimit } from "../auto-reply/chunk.js";
+import { ensureAgentWorkspace } from "../agents/workspace.js";
 import type { MsgContext } from "../auto-reply/templating.js";
 import {
   normalizeThinkLevel,
@@ -35,8 +36,9 @@ import { type ClawdbotConfig, loadConfig } from "../config/config.js";
 import {
   DEFAULT_IDLE_MINUTES,
   loadSessionStore,
+  resolveAgentIdFromSessionKey,
+  resolveSessionFilePath,
   resolveSessionKey,
-  resolveSessionTranscriptPath,
   resolveStorePath,
   type SessionEntry,
   saveSessionStore,
@@ -45,15 +47,39 @@ import {
   emitAgentEvent,
   registerAgentRunContext,
 } from "../infra/agent-events.js";
+import { deliverOutboundPayloads } from "../infra/outbound/deliver.js";
+import { buildOutboundResultEnvelope } from "../infra/outbound/envelope.js";
+import {
+  formatOutboundPayloadLog,
+  type NormalizedOutboundPayload,
+  normalizeOutboundPayloads,
+  normalizeOutboundPayloadsForJson,
+} from "../infra/outbound/payloads.js";
+import { resolveOutboundTarget } from "../infra/outbound/targets.js";
+import { normalizeMainKey } from "../routing/session-key.js";
 import { defaultRuntime, type RuntimeEnv } from "../runtime.js";
+import { applyVerboseOverride } from "../sessions/level-overrides.js";
 import { resolveSendPolicy } from "../sessions/send-policy.js";
-import { resolveTelegramToken } from "../telegram/token.js";
+import {
+  normalizeMessageProvider,
+  resolveMessageProvider,
+} from "../utils/message-provider.js";
 import { normalizeE164 } from "../utils.js";
+
+/** Image content block for Claude API multimodal messages. */
+type ImageContent = {
+  type: "image";
+  data: string;
+  mimeType: string;
+};
 
 type AgentCommandOpts = {
   message: string;
+  /** Optional image attachments for multimodal messages. */
+  images?: ImageContent[];
   to?: string;
   sessionId?: string;
+  sessionKey?: string;
   thinking?: string;
   thinkingOnce?: string;
   verbose?: string;
@@ -85,29 +111,35 @@ function resolveSession(opts: {
   cfg: ClawdbotConfig;
   to?: string;
   sessionId?: string;
+  sessionKey?: string;
 }): SessionResolution {
   const sessionCfg = opts.cfg.session;
   const scope = sessionCfg?.scope ?? "per-sender";
-  const mainKey = sessionCfg?.mainKey ?? "main";
+  const mainKey = normalizeMainKey(sessionCfg?.mainKey);
   const idleMinutes = Math.max(
     sessionCfg?.idleMinutes ?? DEFAULT_IDLE_MINUTES,
     1,
   );
   const idleMs = idleMinutes * 60_000;
-  const storePath = resolveStorePath(sessionCfg?.store);
+  const explicitSessionKey = opts.sessionKey?.trim();
+  const storeAgentId = resolveAgentIdFromSessionKey(explicitSessionKey);
+  const storePath = resolveStorePath(sessionCfg?.store, {
+    agentId: storeAgentId,
+  });
   const sessionStore = loadSessionStore(storePath);
   const now = Date.now();
 
   const ctx: MsgContext | undefined = opts.to?.trim()
     ? { From: opts.to }
     : undefined;
-  let sessionKey: string | undefined = ctx
-    ? resolveSessionKey(scope, ctx, mainKey)
-    : undefined;
+  let sessionKey: string | undefined =
+    explicitSessionKey ??
+    (ctx ? resolveSessionKey(scope, ctx, mainKey) : undefined);
   let sessionEntry = sessionKey ? sessionStore[sessionKey] : undefined;
 
   // If a session id was provided, prefer to re-use its entry (by id) even when no key was derived.
   if (
+    !explicitSessionKey &&
     opts.sessionId &&
     (!sessionEntry || sessionEntry.sessionId !== opts.sessionId)
   ) {
@@ -155,16 +187,18 @@ export async function agentCommand(
 ) {
   const body = (opts.message ?? "").trim();
   if (!body) throw new Error("Message (--message) is required");
-  if (!opts.to && !opts.sessionId) {
+  if (!opts.to && !opts.sessionId && !opts.sessionKey) {
     throw new Error("Pass --to <E.164> or --session-id to choose a session");
   }
 
   const cfg = loadConfig();
-  const agentCfg = cfg.agent;
-  const workspaceDirRaw = cfg.agent?.workspace ?? DEFAULT_AGENT_WORKSPACE_DIR;
+  const agentCfg = cfg.agents?.defaults;
+  const sessionAgentId = resolveAgentIdFromSessionKey(opts.sessionKey?.trim());
+  const workspaceDirRaw = resolveAgentWorkspaceDir(cfg, sessionAgentId);
+  const agentDir = resolveAgentDir(cfg, sessionAgentId);
   const workspace = await ensureAgentWorkspace({
     dir: workspaceDirRaw,
-    ensureBootstrapFiles: !cfg.agent?.skipBootstrap,
+    ensureBootstrapFiles: !agentCfg?.skipBootstrap,
   });
   const workspaceDir = workspace.dir;
 
@@ -209,6 +243,7 @@ export async function agentCommand(
     cfg,
     to: opts.to,
     sessionId: opts.sessionId,
+    sessionKey: opts.sessionKey,
   });
 
   const {
@@ -223,10 +258,6 @@ export async function agentCommand(
   } = sessionResolution;
   let sessionEntry = resolvedSessionEntry;
   const runId = opts.runId?.trim() || sessionId;
-
-  if (sessionKey) {
-    registerAgentRunContext(runId, { sessionKey });
-  }
 
   if (opts.deliver === true) {
     const sendPolicy = resolveSendPolicy({
@@ -251,12 +282,17 @@ export async function agentCommand(
     persistedVerbose ??
     (agentCfg?.verboseDefault as VerboseLevel | undefined);
 
+  if (sessionKey) {
+    registerAgentRunContext(runId, {
+      sessionKey,
+      verboseLevel: resolvedVerboseLevel,
+    });
+  }
+
   const needsSkillsSnapshot = isNewSession || !sessionEntry?.skillsSnapshot;
   const skillsSnapshot = needsSkillsSnapshot
     ? buildWorkspaceSkillSnapshot(workspaceDir, { config: cfg })
     : sessionEntry?.skillsSnapshot;
-
-  const { token: telegramToken } = resolveTelegramToken(cfg);
 
   if (skillsSnapshot && sessionStore && sessionKey && needsSkillsSnapshot) {
     const current = sessionEntry ?? {
@@ -283,10 +319,7 @@ export async function agentCommand(
       if (thinkOverride === "off") delete next.thinkingLevel;
       else next.thinkingLevel = thinkOverride;
     }
-    if (verboseOverride) {
-      if (verboseOverride === "off") delete next.verboseLevel;
-      else next.verboseLevel = verboseOverride;
-    }
+    applyVerboseOverride(next, verboseOverride);
     sessionStore[sessionKey] = next;
     await saveSessionStore(storePath, sessionStore);
   }
@@ -315,6 +348,7 @@ export async function agentCommand(
       cfg,
       catalog: modelCatalog,
       defaultProvider,
+      defaultModel,
     });
     allowedModelKeys = allowed.allowedKeys;
     allowedModelCatalog = allowed.allowedCatalog;
@@ -326,7 +360,11 @@ export async function agentCommand(
     const overrideModel = sessionEntry.modelOverride?.trim();
     if (overrideModel) {
       const key = modelKey(overrideProvider, overrideModel);
-      if (allowedModelKeys.size > 0 && !allowedModelKeys.has(key)) {
+      if (
+        overrideProvider !== "claude-cli" &&
+        allowedModelKeys.size > 0 &&
+        !allowedModelKeys.has(key)
+      ) {
         delete sessionEntry.providerOverride;
         delete sessionEntry.modelOverride;
         sessionEntry.updatedAt = Date.now();
@@ -341,7 +379,11 @@ export async function agentCommand(
   if (storedModelOverride) {
     const candidateProvider = storedProviderOverride || defaultProvider;
     const key = modelKey(candidateProvider, storedModelOverride);
-    if (allowedModelKeys.size === 0 || allowedModelKeys.has(key)) {
+    if (
+      candidateProvider === "claude-cli" ||
+      allowedModelKeys.size === 0 ||
+      allowedModelKeys.has(key)
+    ) {
       provider = candidateProvider;
       model = storedModelOverride;
     }
@@ -372,7 +414,7 @@ export async function agentCommand(
       catalog: catalogForThinking,
     });
   }
-  const sessionFile = resolveSessionTranscriptPath(sessionId);
+  const sessionFile = resolveSessionFilePath(sessionId, sessionEntry);
 
   const startedAt = Date.now();
   let lifecycleEnded = false;
@@ -380,20 +422,35 @@ export async function agentCommand(
   let result: Awaited<ReturnType<typeof runEmbeddedPiAgent>>;
   let fallbackProvider = provider;
   let fallbackModel = model;
+  const claudeSessionId = sessionEntry?.claudeCliSessionId?.trim();
   try {
-    const messageProvider =
-      opts.messageProvider?.trim().toLowerCase() ||
-      (() => {
-        const raw = opts.provider?.trim().toLowerCase();
-        if (!raw) return undefined;
-        return raw === "imsg" ? "imessage" : raw;
-      })();
+    const messageProvider = resolveMessageProvider(
+      opts.messageProvider,
+      opts.provider,
+    );
     const fallbackResult = await runWithModelFallback({
       cfg,
       provider,
       model,
-      run: (providerOverride, modelOverride) =>
-        runEmbeddedPiAgent({
+      run: (providerOverride, modelOverride) => {
+        if (providerOverride === "claude-cli") {
+          return runClaudeCliAgent({
+            sessionId,
+            sessionKey,
+            sessionFile,
+            workspaceDir,
+            config: cfg,
+            prompt: body,
+            provider: providerOverride,
+            model: modelOverride,
+            thinkLevel: resolvedThinkLevel,
+            timeoutMs,
+            runId,
+            extraSystemPrompt: opts.extraSystemPrompt,
+            claudeSessionId,
+          });
+        }
+        return runEmbeddedPiAgent({
           sessionId,
           sessionKey,
           messageProvider,
@@ -402,6 +459,7 @@ export async function agentCommand(
           config: cfg,
           skillsSnapshot,
           prompt: body,
+          images: opts.images,
           provider: providerOverride,
           model: modelOverride,
           authProfileId: sessionEntry?.authProfileOverride,
@@ -412,6 +470,7 @@ export async function agentCommand(
           lane: opts.lane,
           abortSignal: opts.abortSignal,
           extraSystemPrompt: opts.extraSystemPrompt,
+          agentDir,
           onAgentEvent: (evt) => {
             if (
               evt.stream === "lifecycle" &&
@@ -426,7 +485,8 @@ export async function agentCommand(
               data: evt.data,
             });
           },
-        }),
+        });
+      },
     });
     result = fallbackResult.result;
     fallbackProvider = fallbackResult.provider;
@@ -482,6 +542,10 @@ export async function agentCommand(
       model: modelUsed,
       contextTokens,
     };
+    if (providerUsed === "claude-cli") {
+      const cliSessionId = result.meta.agentMeta?.sessionId?.trim();
+      if (cliSessionId) next.claudeCliSessionId = cliSessionId;
+    }
     next.abortedLastRun = result.meta.aborted ?? false;
     if (hasNonzeroUsage(usage)) {
       const input = usage.input ?? 0;
@@ -500,109 +564,53 @@ export async function agentCommand(
   const payloads = result.payloads ?? [];
   const deliver = opts.deliver === true;
   const bestEffortDeliver = opts.bestEffortDeliver === true;
-  const deliveryProviderRaw = (opts.provider ?? "whatsapp").toLowerCase();
   const deliveryProvider =
-    deliveryProviderRaw === "imsg" ? "imessage" : deliveryProviderRaw;
-
-  const whatsappTarget = opts.to ? normalizeE164(opts.to) : allowFrom[0];
-  const telegramTarget = opts.to?.trim() || undefined;
-  const discordTarget = opts.to?.trim() || undefined;
-  const slackTarget = opts.to?.trim() || undefined;
-  const signalTarget = opts.to?.trim() || undefined;
-  const imessageTarget = opts.to?.trim() || undefined;
+    normalizeMessageProvider(opts.provider) ?? "whatsapp";
 
   const logDeliveryError = (err: unknown) => {
-    const deliveryTarget =
-      deliveryProvider === "telegram"
-        ? telegramTarget
-        : deliveryProvider === "whatsapp"
-          ? whatsappTarget
-          : deliveryProvider === "discord"
-            ? discordTarget
-            : deliveryProvider === "slack"
-              ? slackTarget
-              : deliveryProvider === "signal"
-                ? signalTarget
-                : deliveryProvider === "imessage"
-                  ? imessageTarget
-                  : undefined;
     const message = `Delivery failed (${deliveryProvider}${deliveryTarget ? ` to ${deliveryTarget}` : ""}): ${String(err)}`;
     runtime.error?.(message);
     if (!runtime.error) runtime.log(message);
   };
 
+  const isDeliveryProviderKnown =
+    deliveryProvider === "whatsapp" ||
+    deliveryProvider === "telegram" ||
+    deliveryProvider === "discord" ||
+    deliveryProvider === "slack" ||
+    deliveryProvider === "signal" ||
+    deliveryProvider === "imessage" ||
+    deliveryProvider === "webchat";
+
+  const resolvedTarget =
+    deliver && isDeliveryProviderKnown
+      ? resolveOutboundTarget({
+          provider: deliveryProvider,
+          to: opts.to,
+          allowFrom,
+        })
+      : null;
+  const deliveryTarget = resolvedTarget?.ok ? resolvedTarget.to : undefined;
+
   if (deliver) {
-    if (deliveryProvider === "whatsapp" && !whatsappTarget) {
-      const err = new Error(
-        "Delivering to WhatsApp requires --to <E.164> or whatsapp.allowFrom[0]",
-      );
-      if (!bestEffortDeliver) throw err;
-      logDeliveryError(err);
-    }
-    if (deliveryProvider === "telegram" && !telegramTarget) {
-      const err = new Error("Delivering to Telegram requires --to <chatId>");
-      if (!bestEffortDeliver) throw err;
-      logDeliveryError(err);
-    }
-    if (deliveryProvider === "discord" && !discordTarget) {
-      const err = new Error(
-        "Delivering to Discord requires --to <channelId|user:ID|channel:ID>",
-      );
-      if (!bestEffortDeliver) throw err;
-      logDeliveryError(err);
-    }
-    if (deliveryProvider === "slack" && !slackTarget) {
-      const err = new Error(
-        "Delivering to Slack requires --to <channelId|user:ID|channel:ID>",
-      );
-      if (!bestEffortDeliver) throw err;
-      logDeliveryError(err);
-    }
-    if (deliveryProvider === "signal" && !signalTarget) {
-      const err = new Error(
-        "Delivering to Signal requires --to <E.164|group:ID|signal:group:ID|signal:+E.164>",
-      );
-      if (!bestEffortDeliver) throw err;
-      logDeliveryError(err);
-    }
-    if (deliveryProvider === "imessage" && !imessageTarget) {
-      const err = new Error(
-        "Delivering to iMessage requires --to <handle|chat_id:ID>",
-      );
-      if (!bestEffortDeliver) throw err;
-      logDeliveryError(err);
-    }
-    if (deliveryProvider === "webchat") {
-      const err = new Error(
-        "Delivering to WebChat is not supported via `clawdbot agent`; use WhatsApp/Telegram or run with --deliver=false.",
-      );
-      if (!bestEffortDeliver) throw err;
-      logDeliveryError(err);
-    }
-    if (
-      deliveryProvider !== "whatsapp" &&
-      deliveryProvider !== "telegram" &&
-      deliveryProvider !== "discord" &&
-      deliveryProvider !== "slack" &&
-      deliveryProvider !== "signal" &&
-      deliveryProvider !== "imessage" &&
-      deliveryProvider !== "webchat"
-    ) {
+    if (!isDeliveryProviderKnown) {
       const err = new Error(`Unknown provider: ${deliveryProvider}`);
       if (!bestEffortDeliver) throw err;
       logDeliveryError(err);
+    } else if (resolvedTarget && !resolvedTarget.ok) {
+      if (!bestEffortDeliver) throw resolvedTarget.error;
+      logDeliveryError(resolvedTarget.error);
     }
   }
 
+  const normalizedPayloads = normalizeOutboundPayloadsForJson(payloads);
   if (opts.json) {
-    const normalizedPayloads = payloads.map((p) => ({
-      text: p.text ?? "",
-      mediaUrl: p.mediaUrl ?? null,
-      mediaUrls: p.mediaUrls ?? (p.mediaUrl ? [p.mediaUrl] : undefined),
-    }));
     runtime.log(
       JSON.stringify(
-        { payloads: normalizedPayloads, meta: result.meta },
+        buildOutboundResultEnvelope({
+          payloads: normalizedPayloads,
+          meta: result.meta,
+        }),
         null,
         2,
       ),
@@ -617,192 +625,46 @@ export async function agentCommand(
     return { payloads: [], meta: result.meta };
   }
 
-  const deliveryTextLimit =
-    deliveryProvider === "whatsapp" ||
-    deliveryProvider === "telegram" ||
-    deliveryProvider === "discord" ||
-    deliveryProvider === "slack" ||
-    deliveryProvider === "signal" ||
-    deliveryProvider === "imessage"
-      ? resolveTextChunkLimit(cfg, deliveryProvider)
-      : resolveTextChunkLimit(cfg, "whatsapp");
-
-  for (const payload of payloads) {
-    const mediaList =
-      payload.mediaUrls ?? (payload.mediaUrl ? [payload.mediaUrl] : []);
-
-    if (!opts.json) {
-      const lines: string[] = [];
-      if (payload.text) lines.push(payload.text.trimEnd());
-      for (const url of mediaList) lines.push(`MEDIA:${url}`);
-      runtime.log(lines.join("\n"));
+  const deliveryPayloads = normalizeOutboundPayloads(payloads);
+  const logPayload = (payload: NormalizedOutboundPayload) => {
+    if (opts.json) return;
+    const output = formatOutboundPayloadLog(payload);
+    if (output) runtime.log(output);
+  };
+  if (!deliver) {
+    for (const payload of deliveryPayloads) {
+      logPayload(payload);
     }
-
-    if (!deliver) continue;
-
-    const text = payload.text ?? "";
-    const media = mediaList;
-    if (!text && media.length === 0) continue;
-
-    if (deliveryProvider === "whatsapp" && whatsappTarget) {
-      try {
-        const primaryMedia = media[0];
-        await deps.sendMessageWhatsApp(whatsappTarget, text, {
-          verbose: false,
-          mediaUrl: primaryMedia,
-        });
-        for (const extra of media.slice(1)) {
-          await deps.sendMessageWhatsApp(whatsappTarget, "", {
-            verbose: false,
-            mediaUrl: extra,
-          });
-        }
-      } catch (err) {
-        if (!bestEffortDeliver) throw err;
-        logDeliveryError(err);
-      }
-      continue;
-    }
-
-    if (deliveryProvider === "telegram" && telegramTarget) {
-      try {
-        if (media.length === 0) {
-          for (const chunk of chunkText(text, deliveryTextLimit)) {
-            await deps.sendMessageTelegram(telegramTarget, chunk, {
-              verbose: false,
-              token: telegramToken || undefined,
-            });
-          }
-        } else {
-          let first = true;
-          for (const url of media) {
-            const caption = first ? text : "";
-            first = false;
-            await deps.sendMessageTelegram(telegramTarget, caption, {
-              verbose: false,
-              mediaUrl: url,
-              token: telegramToken || undefined,
-            });
-          }
-        }
-      } catch (err) {
-        if (!bestEffortDeliver) throw err;
-        logDeliveryError(err);
-      }
-    }
-
-    if (deliveryProvider === "discord" && discordTarget) {
-      try {
-        if (media.length === 0) {
-          await deps.sendMessageDiscord(discordTarget, text, {
-            token: process.env.DISCORD_BOT_TOKEN,
-          });
-        } else {
-          let first = true;
-          for (const url of media) {
-            const caption = first ? text : "";
-            first = false;
-            await deps.sendMessageDiscord(discordTarget, caption, {
-              token: process.env.DISCORD_BOT_TOKEN,
-              mediaUrl: url,
-            });
-          }
-        }
-      } catch (err) {
-        if (!bestEffortDeliver) throw err;
-        logDeliveryError(err);
-      }
-    }
-
-    if (deliveryProvider === "slack" && slackTarget) {
-      try {
-        if (media.length === 0) {
-          await deps.sendMessageSlack(slackTarget, text);
-        } else {
-          let first = true;
-          for (const url of media) {
-            const caption = first ? text : "";
-            first = false;
-            await deps.sendMessageSlack(slackTarget, caption, {
-              mediaUrl: url,
-            });
-          }
-        }
-      } catch (err) {
-        if (!bestEffortDeliver) throw err;
-        logDeliveryError(err);
-      }
-    }
-
-    if (deliveryProvider === "signal" && signalTarget) {
-      try {
-        if (media.length === 0) {
-          await deps.sendMessageSignal(signalTarget, text, {
-            maxBytes: cfg.signal?.mediaMaxMb
-              ? cfg.signal.mediaMaxMb * 1024 * 1024
-              : cfg.agent?.mediaMaxMb
-                ? cfg.agent.mediaMaxMb * 1024 * 1024
-                : undefined,
-          });
-        } else {
-          let first = true;
-          for (const url of media) {
-            const caption = first ? text : "";
-            first = false;
-            await deps.sendMessageSignal(signalTarget, caption, {
-              mediaUrl: url,
-              maxBytes: cfg.signal?.mediaMaxMb
-                ? cfg.signal.mediaMaxMb * 1024 * 1024
-                : cfg.agent?.mediaMaxMb
-                  ? cfg.agent.mediaMaxMb * 1024 * 1024
-                  : undefined,
-            });
-          }
-        }
-      } catch (err) {
-        if (!bestEffortDeliver) throw err;
-        logDeliveryError(err);
-      }
-    }
-
-    if (deliveryProvider === "imessage" && imessageTarget) {
-      try {
-        if (media.length === 0) {
-          for (const chunk of chunkText(text, deliveryTextLimit)) {
-            await deps.sendMessageIMessage(imessageTarget, chunk, {
-              maxBytes: cfg.imessage?.mediaMaxMb
-                ? cfg.imessage.mediaMaxMb * 1024 * 1024
-                : cfg.agent?.mediaMaxMb
-                  ? cfg.agent.mediaMaxMb * 1024 * 1024
-                  : undefined,
-            });
-          }
-        } else {
-          let first = true;
-          for (const url of media) {
-            const caption = first ? text : "";
-            first = false;
-            await deps.sendMessageIMessage(imessageTarget, caption, {
-              mediaUrl: url,
-              maxBytes: cfg.imessage?.mediaMaxMb
-                ? cfg.imessage.mediaMaxMb * 1024 * 1024
-                : cfg.agent?.mediaMaxMb
-                  ? cfg.agent.mediaMaxMb * 1024 * 1024
-                  : undefined,
-            });
-          }
-        }
-      } catch (err) {
-        if (!bestEffortDeliver) throw err;
-        logDeliveryError(err);
-      }
+  }
+  if (
+    deliver &&
+    (deliveryProvider === "whatsapp" ||
+      deliveryProvider === "telegram" ||
+      deliveryProvider === "discord" ||
+      deliveryProvider === "slack" ||
+      deliveryProvider === "signal" ||
+      deliveryProvider === "imessage")
+  ) {
+    if (deliveryTarget) {
+      await deliverOutboundPayloads({
+        cfg,
+        provider: deliveryProvider,
+        to: deliveryTarget,
+        payloads: deliveryPayloads,
+        bestEffort: bestEffortDeliver,
+        onError: (err) => logDeliveryError(err),
+        onPayload: logPayload,
+        deps: {
+          sendWhatsApp: deps.sendMessageWhatsApp,
+          sendTelegram: deps.sendMessageTelegram,
+          sendDiscord: deps.sendMessageDiscord,
+          sendSlack: deps.sendMessageSlack,
+          sendSignal: deps.sendMessageSignal,
+          sendIMessage: deps.sendMessageIMessage,
+        },
+      });
     }
   }
 
-  const normalizedPayloads = payloads.map((p) => ({
-    text: p.text ?? "",
-    mediaUrl: p.mediaUrl ?? null,
-    mediaUrls: p.mediaUrls ?? (p.mediaUrl ? [p.mediaUrl] : undefined),
-  }));
   return { payloads: normalizedPayloads, meta: result.meta };
 }

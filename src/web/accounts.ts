@@ -3,19 +3,29 @@ import path from "node:path";
 
 import type { ClawdbotConfig } from "../config/config.js";
 import { resolveOAuthDir } from "../config/paths.js";
-import type { GroupPolicy, WhatsAppAccountConfig } from "../config/types.js";
+import type {
+  DmPolicy,
+  GroupPolicy,
+  WhatsAppAccountConfig,
+} from "../config/types.js";
 import { DEFAULT_ACCOUNT_ID } from "../routing/session-key.js";
 import { resolveUserPath } from "../utils.js";
 
 export type ResolvedWhatsAppAccount = {
   accountId: string;
+  name?: string;
   enabled: boolean;
+  messagePrefix?: string;
   authDir: string;
   isLegacyAuthDir: boolean;
+  selfChatMode?: boolean;
   allowFrom?: string[];
   groupAllowFrom?: string[];
   groupPolicy?: GroupPolicy;
+  dmPolicy?: DmPolicy;
   textChunkLimit?: number;
+  mediaMaxMb?: number;
+  blockStreaming?: boolean;
   groups?: WhatsAppAccountConfig["groups"];
 };
 
@@ -100,15 +110,25 @@ export function resolveWhatsAppAccount(params: {
   });
   return {
     accountId,
+    name: accountCfg?.name?.trim() || undefined,
     enabled,
+    messagePrefix:
+      accountCfg?.messagePrefix ??
+      params.cfg.whatsapp?.messagePrefix ??
+      params.cfg.messages?.messagePrefix,
     authDir,
     isLegacyAuthDir: isLegacy,
+    selfChatMode: accountCfg?.selfChatMode ?? params.cfg.whatsapp?.selfChatMode,
+    dmPolicy: accountCfg?.dmPolicy ?? params.cfg.whatsapp?.dmPolicy,
     allowFrom: accountCfg?.allowFrom ?? params.cfg.whatsapp?.allowFrom,
     groupAllowFrom:
       accountCfg?.groupAllowFrom ?? params.cfg.whatsapp?.groupAllowFrom,
     groupPolicy: accountCfg?.groupPolicy ?? params.cfg.whatsapp?.groupPolicy,
     textChunkLimit:
       accountCfg?.textChunkLimit ?? params.cfg.whatsapp?.textChunkLimit,
+    mediaMaxMb: accountCfg?.mediaMaxMb ?? params.cfg.whatsapp?.mediaMaxMb,
+    blockStreaming:
+      accountCfg?.blockStreaming ?? params.cfg.whatsapp?.blockStreaming,
     groups: accountCfg?.groups ?? params.cfg.whatsapp?.groups,
   };
 }

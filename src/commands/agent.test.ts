@@ -1,5 +1,4 @@
 import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
 
 import {
@@ -10,6 +9,8 @@ import {
   type MockInstance,
   vi,
 } from "vitest";
+
+import { withTempHome as withTempHomeBase } from "../../test/helpers/temp-home.js";
 
 vi.mock("../agents/pi-embedded.js", () => ({
   abortEmbeddedPiRun: vi.fn().mockReturnValue(false),
@@ -39,33 +40,27 @@ const runtime: RuntimeEnv = {
 const configSpy = vi.spyOn(configModule, "loadConfig");
 
 async function withTempHome<T>(fn: (home: string) => Promise<T>): Promise<T> {
-  const base = fs.mkdtempSync(path.join(os.tmpdir(), "clawdbot-agent-"));
-  const previousHome = process.env.HOME;
-  process.env.HOME = base;
-  try {
-    return await fn(base);
-  } finally {
-    process.env.HOME = previousHome;
-    fs.rmSync(base, { recursive: true, force: true });
-  }
+  return withTempHomeBase(fn, { prefix: "clawdbot-agent-" });
 }
 
 function mockConfig(
   home: string,
   storePath: string,
-  routingOverrides?: Partial<NonNullable<ClawdbotConfig["routing"]>>,
-  agentOverrides?: Partial<NonNullable<ClawdbotConfig["agent"]>>,
+  agentOverrides?: Partial<
+    NonNullable<NonNullable<ClawdbotConfig["agents"]>["defaults"]>
+  >,
   telegramOverrides?: Partial<NonNullable<ClawdbotConfig["telegram"]>>,
 ) {
   configSpy.mockReturnValue({
-    agent: {
-      model: { primary: "anthropic/claude-opus-4-5" },
-      models: { "anthropic/claude-opus-4-5": {} },
-      workspace: path.join(home, "clawd"),
-      ...agentOverrides,
+    agents: {
+      defaults: {
+        model: { primary: "anthropic/claude-opus-4-5" },
+        models: { "anthropic/claude-opus-4-5": {} },
+        workspace: path.join(home, "clawd"),
+        ...agentOverrides,
+      },
     },
     session: { store: storePath, mainKey: "main" },
-    routing: routingOverrides ? { ...routingOverrides } : undefined,
     telegram: telegramOverrides ? { ...telegramOverrides } : undefined,
   });
 }
@@ -153,11 +148,15 @@ describe("agentCommand", () => {
     });
   });
 
-  it("uses provider/model from agent.model", async () => {
+  it("uses provider/model from agents.defaults.model.primary", async () => {
     await withTempHome(async (home) => {
       const store = path.join(home, "sessions.json");
-      mockConfig(home, store, undefined, {
-        model: "openai/gpt-4.1-mini",
+      mockConfig(home, store, {
+        model: { primary: "openai/gpt-4.1-mini" },
+        models: {
+          "anthropic/claude-opus-4-5": {},
+          "openai/gpt-4.1-mini": {},
+        },
       });
 
       await agentCommand({ message: "hi", to: "+1555" }, runtime);
@@ -165,6 +164,45 @@ describe("agentCommand", () => {
       const callArgs = vi.mocked(runEmbeddedPiAgent).mock.calls.at(-1)?.[0];
       expect(callArgs?.provider).toBe("openai");
       expect(callArgs?.model).toBe("gpt-4.1-mini");
+    });
+  });
+
+  it("keeps explicit sessionKey even when sessionId exists elsewhere", async () => {
+    await withTempHome(async (home) => {
+      const store = path.join(home, "sessions.json");
+      fs.mkdirSync(path.dirname(store), { recursive: true });
+      fs.writeFileSync(
+        store,
+        JSON.stringify(
+          {
+            "agent:main:main": {
+              sessionId: "sess-main",
+              updatedAt: Date.now(),
+            },
+          },
+          null,
+          2,
+        ),
+      );
+      mockConfig(home, store);
+
+      await agentCommand(
+        {
+          message: "hi",
+          sessionId: "sess-main",
+          sessionKey: "agent:main:subagent:abc",
+        },
+        runtime,
+      );
+
+      const callArgs = vi.mocked(runEmbeddedPiAgent).mock.calls.at(-1)?.[0];
+      expect(callArgs?.sessionKey).toBe("agent:main:subagent:abc");
+
+      const saved = JSON.parse(fs.readFileSync(store, "utf-8")) as Record<
+        string,
+        { sessionId?: string }
+      >;
+      expect(saved["agent:main:subagent:abc"]?.sessionId).toBe("sess-main");
     });
   });
 
@@ -227,10 +265,10 @@ describe("agentCommand", () => {
     });
   });
 
-  it("passes telegram token when delivering", async () => {
+  it("passes through telegram accountId when delivering", async () => {
     await withTempHome(async (home) => {
       const store = path.join(home, "sessions.json");
-      mockConfig(home, store, undefined, undefined, { botToken: "t-1" });
+      mockConfig(home, store, undefined, { botToken: "t-1" });
       const deps = {
         sendMessageWhatsApp: vi.fn(),
         sendMessageTelegram: vi
@@ -258,7 +296,7 @@ describe("agentCommand", () => {
         expect(deps.sendMessageTelegram).toHaveBeenCalledWith(
           "123",
           "ok",
-          expect.objectContaining({ token: "t-1" }),
+          expect.objectContaining({ accountId: undefined, verbose: false }),
         );
       } finally {
         if (prevTelegramToken === undefined) {

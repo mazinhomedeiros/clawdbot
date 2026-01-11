@@ -1,4 +1,5 @@
 import AppKit
+import ClawdbotDiscovery
 import ClawdbotIPC
 import SwiftUI
 
@@ -29,6 +30,7 @@ extension OnboardingView {
                 user: user,
                 host: host,
                 port: gateway.sshPort)
+            ClawdbotConfigFile.setRemoteGatewayUrl(host: host, port: gateway.gatewayPort)
         }
         self.state.remoteCliPath = gateway.cliPath ?? ""
 

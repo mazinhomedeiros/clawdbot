@@ -2,11 +2,13 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import type { ClawdbotConfig } from "../config/config.js";
 import {
+  autoMigrateLegacyState,
   detectLegacyStateMigrations,
+  resetAutoMigrateLegacyStateForTest,
   runLegacyStateMigrations,
 } from "./doctor-state-migrations.js";
 
@@ -21,6 +23,7 @@ async function makeTempRoot() {
 }
 
 afterEach(async () => {
+  resetAutoMigrateLegacyStateForTest();
   if (!tempRoot) return;
   await fs.promises.rm(tempRoot, { recursive: true, force: true });
   tempRoot = null;
@@ -98,6 +101,57 @@ describe("doctor legacy state migrations", () => {
     expect(fs.existsSync(path.join(backupDir, "foo.txt"))).toBe(true);
   });
 
+  it("auto-migrates legacy agent dir on startup", async () => {
+    const root = await makeTempRoot();
+    const cfg: ClawdbotConfig = {};
+
+    const legacyAgentDir = path.join(root, "agent");
+    fs.mkdirSync(legacyAgentDir, { recursive: true });
+    fs.writeFileSync(path.join(legacyAgentDir, "auth.json"), "{}", "utf-8");
+
+    const log = { info: vi.fn(), warn: vi.fn() };
+
+    const result = await autoMigrateLegacyState({
+      cfg,
+      env: { CLAWDBOT_STATE_DIR: root } as NodeJS.ProcessEnv,
+      log,
+    });
+
+    const targetAgentDir = path.join(root, "agents", "main", "agent");
+    expect(fs.existsSync(path.join(targetAgentDir, "auth.json"))).toBe(true);
+    expect(result.migrated).toBe(true);
+    expect(log.info).toHaveBeenCalled();
+  });
+
+  it("auto-migrates legacy sessions on startup", async () => {
+    const root = await makeTempRoot();
+    const cfg: ClawdbotConfig = {};
+
+    const legacySessionsDir = path.join(root, "sessions");
+    fs.mkdirSync(legacySessionsDir, { recursive: true });
+    writeJson5(path.join(legacySessionsDir, "sessions.json"), {
+      "+1555": { sessionId: "a", updatedAt: 10 },
+    });
+    fs.writeFileSync(path.join(legacySessionsDir, "a.jsonl"), "a", "utf-8");
+
+    const log = { info: vi.fn(), warn: vi.fn() };
+
+    const result = await autoMigrateLegacyState({
+      cfg,
+      env: { CLAWDBOT_STATE_DIR: root } as NodeJS.ProcessEnv,
+      log,
+      now: () => 123,
+    });
+
+    expect(result.migrated).toBe(true);
+    expect(log.info).toHaveBeenCalled();
+
+    const targetDir = path.join(root, "agents", "main", "sessions");
+    expect(fs.existsSync(path.join(targetDir, "a.jsonl"))).toBe(true);
+    expect(fs.existsSync(path.join(legacySessionsDir, "a.jsonl"))).toBe(false);
+    expect(fs.existsSync(path.join(targetDir, "sessions.json"))).toBe(true);
+  });
+
   it("migrates legacy WhatsApp auth files without touching oauth.json", async () => {
     const root = await makeTempRoot();
     const cfg: ClawdbotConfig = {};
@@ -132,9 +186,11 @@ describe("doctor legacy state migrations", () => {
     expect(result.changes).toEqual([]);
   });
 
-  it("routes legacy state to routing.defaultAgentId", async () => {
+  it("routes legacy state to the default agent entry", async () => {
     const root = await makeTempRoot();
-    const cfg: ClawdbotConfig = { routing: { defaultAgentId: "alpha" } };
+    const cfg: ClawdbotConfig = {
+      agents: { list: [{ id: "alpha", default: true }] },
+    };
     const legacySessionsDir = path.join(root, "sessions");
     fs.mkdirSync(legacySessionsDir, { recursive: true });
     writeJson5(path.join(legacySessionsDir, "sessions.json"), {

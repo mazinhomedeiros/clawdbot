@@ -4,12 +4,20 @@ import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
 import { runCommandWithTimeout, runExec } from "../process/exec.js";
+import { colorize, isRich, theme } from "../terminal/theme.js";
 import {
   GATEWAY_SYSTEMD_SERVICE_NAME,
   LEGACY_GATEWAY_SYSTEMD_SERVICE_NAMES,
 } from "./constants.js";
+import { parseKeyValueOutput } from "./runtime-parse.js";
+import type { GatewayServiceRuntime } from "./service-runtime.js";
 
 const execFileAsync = promisify(execFile);
+
+const formatLine = (label: string, value: string) => {
+  const rich = isRich();
+  return `${colorize(rich, theme.muted, `${label}:`)} ${colorize(rich, theme.command, value)}`;
+};
 
 function resolveHomeDir(env: Record<string, string | undefined>): string {
   const home = env.HOME?.trim() || env.USERPROFILE?.trim();
@@ -29,6 +37,12 @@ function resolveSystemdUnitPath(
   env: Record<string, string | undefined>,
 ): string {
   return resolveSystemdUnitPathForName(env, GATEWAY_SYSTEMD_SERVICE_NAME);
+}
+
+export function resolveSystemdUserUnitPath(
+  env: Record<string, string | undefined>,
+): string {
+  return resolveSystemdUnitPath(env);
 }
 
 function resolveLoginctlUser(
@@ -139,10 +153,17 @@ function buildSystemdUnit({
   return [
     "[Unit]",
     "Description=Clawdbot Gateway",
+    "After=network-online.target",
+    "Wants=network-online.target",
     "",
     "[Service]",
     `ExecStart=${execStart}`,
     "Restart=always",
+    "RestartSec=5",
+    // KillMode=process ensures systemd only waits for the main process to exit.
+    // Without this, podman's conmon (container monitor) processes block shutdown
+    // since they run as children of the gateway and stay in the same cgroup.
+    "KillMode=process",
     workingDirLine,
     ...envLines,
     "",
@@ -189,12 +210,18 @@ function parseSystemdExecStart(value: string): string[] {
 
 export async function readSystemdServiceExecStart(
   env: Record<string, string | undefined>,
-): Promise<{ programArguments: string[]; workingDirectory?: string } | null> {
+): Promise<{
+  programArguments: string[];
+  workingDirectory?: string;
+  environment?: Record<string, string>;
+  sourcePath?: string;
+} | null> {
   const unitPath = resolveSystemdUnitPath(env);
   try {
     const content = await fs.readFile(unitPath, "utf8");
     let execStart = "";
     let workingDirectory = "";
+    const environment: Record<string, string> = {};
     for (const rawLine of content.split("\n")) {
       const line = rawLine.trim();
       if (!line || line.startsWith("#")) continue;
@@ -202,6 +229,10 @@ export async function readSystemdServiceExecStart(
         execStart = line.slice("ExecStart=".length).trim();
       } else if (line.startsWith("WorkingDirectory=")) {
         workingDirectory = line.slice("WorkingDirectory=".length).trim();
+      } else if (line.startsWith("Environment=")) {
+        const raw = line.slice("Environment=".length).trim();
+        const parsed = parseSystemdEnvAssignment(raw);
+        if (parsed) environment[parsed.key] = parsed.value;
       }
     }
     if (!execStart) return null;
@@ -209,10 +240,75 @@ export async function readSystemdServiceExecStart(
     return {
       programArguments,
       ...(workingDirectory ? { workingDirectory } : {}),
+      ...(Object.keys(environment).length > 0 ? { environment } : {}),
+      sourcePath: unitPath,
     };
   } catch {
     return null;
   }
+}
+
+function parseSystemdEnvAssignment(
+  raw: string,
+): { key: string; value: string } | null {
+  const trimmed = raw.trim();
+  if (!trimmed) return null;
+
+  const unquoted = (() => {
+    if (!(trimmed.startsWith('"') && trimmed.endsWith('"'))) return trimmed;
+    let out = "";
+    let escapeNext = false;
+    for (const ch of trimmed.slice(1, -1)) {
+      if (escapeNext) {
+        out += ch;
+        escapeNext = false;
+        continue;
+      }
+      if (ch === "\\") {
+        escapeNext = true;
+        continue;
+      }
+      out += ch;
+    }
+    return out;
+  })();
+
+  const eq = unquoted.indexOf("=");
+  if (eq <= 0) return null;
+  const key = unquoted.slice(0, eq).trim();
+  if (!key) return null;
+  const value = unquoted.slice(eq + 1);
+  return { key, value };
+}
+
+export type SystemdServiceInfo = {
+  activeState?: string;
+  subState?: string;
+  mainPid?: number;
+  execMainStatus?: number;
+  execMainCode?: string;
+};
+
+export function parseSystemdShow(output: string): SystemdServiceInfo {
+  const entries = parseKeyValueOutput(output, "=");
+  const info: SystemdServiceInfo = {};
+  const activeState = entries.activestate;
+  if (activeState) info.activeState = activeState;
+  const subState = entries.substate;
+  if (subState) info.subState = subState;
+  const mainPidValue = entries.mainpid;
+  if (mainPidValue) {
+    const pid = Number.parseInt(mainPidValue, 10);
+    if (Number.isFinite(pid) && pid > 0) info.mainPid = pid;
+  }
+  const execMainStatusValue = entries.execmainstatus;
+  if (execMainStatusValue) {
+    const status = Number.parseInt(execMainStatusValue, 10);
+    if (Number.isFinite(status)) info.execMainStatus = status;
+  }
+  const execMainCode = entries.execmaincode;
+  if (execMainCode) info.execMainCode = execMainCode;
+  return info;
 }
 
 async function execSystemctl(
@@ -245,6 +341,19 @@ async function execSystemctl(
       code: typeof e.code === "number" ? e.code : 1,
     };
   }
+}
+
+export async function isSystemdUserServiceAvailable(): Promise<boolean> {
+  const res = await execSystemctl(["--user", "status"]);
+  if (res.code === 0) return true;
+  const detail = `${res.stderr} ${res.stdout}`.toLowerCase();
+  if (!detail) return false;
+  if (detail.includes("not found")) return false;
+  if (detail.includes("failed to connect")) return false;
+  if (detail.includes("not been booted")) return false;
+  if (detail.includes("no such file or directory")) return false;
+  if (detail.includes("not supported")) return false;
+  return false;
 }
 
 async function assertSystemdAvailable() {
@@ -307,7 +416,7 @@ export async function installSystemdService({
     );
   }
 
-  stdout.write(`Installed systemd service: ${unitPath}\n`);
+  stdout.write(`${formatLine("Installed systemd service", unitPath)}\n`);
   return { unitPath };
 }
 
@@ -325,7 +434,7 @@ export async function uninstallSystemdService({
   const unitPath = resolveSystemdUnitPath(env);
   try {
     await fs.unlink(unitPath);
-    stdout.write(`Removed systemd service: ${unitPath}\n`);
+    stdout.write(`${formatLine("Removed systemd service", unitPath)}\n`);
   } catch {
     stdout.write(`Systemd service not found at ${unitPath}\n`);
   }
@@ -344,7 +453,7 @@ export async function stopSystemdService({
       `systemctl stop failed: ${res.stderr || res.stdout}`.trim(),
     );
   }
-  stdout.write(`Stopped systemd service: ${unitName}\n`);
+  stdout.write(`${formatLine("Stopped systemd service", unitName)}\n`);
 }
 
 export async function restartSystemdService({
@@ -360,7 +469,7 @@ export async function restartSystemdService({
       `systemctl restart failed: ${res.stderr || res.stdout}`.trim(),
     );
   }
-  stdout.write(`Restarted systemd service: ${unitName}\n`);
+  stdout.write(`${formatLine("Restarted systemd service", unitName)}\n`);
 }
 
 export async function isSystemdServiceEnabled(): Promise<boolean> {
@@ -368,6 +477,47 @@ export async function isSystemdServiceEnabled(): Promise<boolean> {
   const unitName = `${GATEWAY_SYSTEMD_SERVICE_NAME}.service`;
   const res = await execSystemctl(["--user", "is-enabled", unitName]);
   return res.code === 0;
+}
+
+export async function readSystemdServiceRuntime(): Promise<GatewayServiceRuntime> {
+  try {
+    await assertSystemdAvailable();
+  } catch (err) {
+    return {
+      status: "unknown",
+      detail: String(err),
+    };
+  }
+  const unitName = `${GATEWAY_SYSTEMD_SERVICE_NAME}.service`;
+  const res = await execSystemctl([
+    "--user",
+    "show",
+    unitName,
+    "--no-page",
+    "--property",
+    "ActiveState,SubState,MainPID,ExecMainStatus,ExecMainCode",
+  ]);
+  if (res.code !== 0) {
+    const detail = (res.stderr || res.stdout).trim();
+    const missing = detail.toLowerCase().includes("not found");
+    return {
+      status: missing ? "stopped" : "unknown",
+      detail: detail || undefined,
+      missingUnit: missing,
+    };
+  }
+  const parsed = parseSystemdShow(res.stdout || "");
+  const activeState = parsed.activeState?.toLowerCase();
+  const status =
+    activeState === "active" ? "running" : activeState ? "stopped" : "unknown";
+  return {
+    status,
+    state: parsed.activeState,
+    subState: parsed.subState,
+    pid: parsed.mainPid,
+    lastExitStatus: parsed.execMainStatus,
+    lastExitReason: parsed.execMainCode,
+  };
 }
 export type LegacySystemdUnit = {
   name: string;
@@ -440,7 +590,9 @@ export async function uninstallLegacySystemdUnits({
 
     try {
       await fs.unlink(unit.unitPath);
-      stdout.write(`Removed legacy systemd service: ${unit.unitPath}\n`);
+      stdout.write(
+        `${formatLine("Removed legacy systemd service", unit.unitPath)}\n`,
+      );
     } catch {
       stdout.write(`Legacy systemd unit not found at ${unit.unitPath}\n`);
     }

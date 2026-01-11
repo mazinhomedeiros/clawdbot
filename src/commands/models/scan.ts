@@ -1,15 +1,36 @@
-import { cancel, isCancel, multiselect } from "@clack/prompts";
+import {
+  cancel,
+  multiselect as clackMultiselect,
+  isCancel,
+} from "@clack/prompts";
 import { resolveApiKeyForProvider } from "../../agents/model-auth.js";
 import {
   type ModelScanResult,
   scanOpenRouterModels,
 } from "../../agents/model-scan.js";
+import { withProgressTotals } from "../../cli/progress.js";
 import { CONFIG_PATH_CLAWDBOT, loadConfig } from "../../config/config.js";
 import type { RuntimeEnv } from "../../runtime.js";
+import {
+  stylePromptHint,
+  stylePromptMessage,
+  stylePromptTitle,
+} from "../../terminal/prompt-style.js";
 import { formatMs, formatTokenK, updateConfig } from "./shared.js";
 
 const MODEL_PAD = 42;
 const CTX_PAD = 8;
+
+const multiselect = <T>(params: Parameters<typeof clackMultiselect<T>>[0]) =>
+  clackMultiselect({
+    ...params,
+    message: stylePromptMessage(params.message),
+    options: params.options.map((opt) =>
+      opt.hint === undefined
+        ? opt
+        : { ...opt, hint: stylePromptHint(opt.hint) },
+    ),
+  });
 
 const pad = (value: string, size: number) => value.padEnd(size);
 
@@ -140,6 +161,7 @@ export async function modelsScanCommand(
     setDefault?: boolean;
     setImage?: boolean;
     json?: boolean;
+    probe?: boolean;
   },
   runtime: RuntimeEnv,
 ) {
@@ -174,24 +196,57 @@ export async function modelsScanCommand(
   }
 
   const cfg = loadConfig();
+  const probe = opts.probe ?? true;
   let storedKey: string | undefined;
-  try {
-    const resolved = await resolveApiKeyForProvider({
-      provider: "openrouter",
-      cfg,
-    });
-    storedKey = resolved.apiKey;
-  } catch {
-    storedKey = undefined;
+  if (probe) {
+    try {
+      const resolved = await resolveApiKeyForProvider({
+        provider: "openrouter",
+        cfg,
+      });
+      storedKey = resolved.apiKey;
+    } catch {
+      storedKey = undefined;
+    }
   }
-  const results = await scanOpenRouterModels({
-    apiKey: storedKey ?? undefined,
-    minParamB: minParams,
-    maxAgeDays,
-    providerFilter: opts.provider,
-    timeoutMs: timeout,
-    concurrency,
-  });
+  const results = await withProgressTotals(
+    {
+      label: "Scanning OpenRouter models...",
+      indeterminate: false,
+      enabled: opts.json !== true,
+    },
+    async (update) =>
+      await scanOpenRouterModels({
+        apiKey: storedKey ?? undefined,
+        minParamB: minParams,
+        maxAgeDays,
+        providerFilter: opts.provider,
+        timeoutMs: timeout,
+        concurrency,
+        probe,
+        onProgress: ({ phase, completed, total }) => {
+          if (phase !== "probe") return;
+          const labelBase = probe ? "Probing models" : "Scanning models";
+          update({
+            completed,
+            total,
+            label: `${labelBase} (${completed}/${total})`,
+          });
+        },
+      }),
+  );
+
+  if (!probe) {
+    if (!opts.json) {
+      runtime.log(
+        `Found ${results.length} OpenRouter free models (metadata only; pass --probe to test tools/images).`,
+      );
+      printScanTable(sortScanResults(results), runtime);
+    } else {
+      runtime.log(JSON.stringify(results, null, 2));
+    }
+    return;
+  }
 
   const toolOk = results.filter((entry) => entry.tool.ok);
   if (toolOk.length === 0) {
@@ -233,7 +288,9 @@ export async function modelsScanCommand(
     });
 
     if (isCancel(selection)) {
-      cancel("Model scan cancelled.");
+      cancel(
+        stylePromptTitle("Model scan cancelled.") ?? "Model scan cancelled.",
+      );
       runtime.exit(0);
     }
 
@@ -250,7 +307,9 @@ export async function modelsScanCommand(
       });
 
       if (isCancel(imageSelection)) {
-        cancel("Model scan cancelled.");
+        cancel(
+          stylePromptTitle("Model scan cancelled.") ?? "Model scan cancelled.",
+        );
         runtime.exit(0);
       }
 
@@ -268,14 +327,14 @@ export async function modelsScanCommand(
   }
 
   const _updated = await updateConfig((cfg) => {
-    const nextModels = { ...cfg.agent?.models };
+    const nextModels = { ...cfg.agents?.defaults?.models };
     for (const entry of selected) {
       if (!nextModels[entry]) nextModels[entry] = {};
     }
     for (const entry of selectedImages) {
       if (!nextModels[entry]) nextModels[entry] = {};
     }
-    const existingImageModel = cfg.agent?.imageModel as
+    const existingImageModel = cfg.agents?.defaults?.imageModel as
       | { primary?: string; fallbacks?: string[] }
       | undefined;
     const nextImageModel =
@@ -287,12 +346,12 @@ export async function modelsScanCommand(
             fallbacks: selectedImages,
             ...(opts.setImage ? { primary: selectedImages[0] } : {}),
           }
-        : cfg.agent?.imageModel;
-    const existingModel = cfg.agent?.model as
+        : cfg.agents?.defaults?.imageModel;
+    const existingModel = cfg.agents?.defaults?.model as
       | { primary?: string; fallbacks?: string[] }
       | undefined;
-    const agent = {
-      ...cfg.agent,
+    const defaults = {
+      ...cfg.agents?.defaults,
       model: {
         ...(existingModel?.primary
           ? { primary: existingModel.primary }
@@ -302,10 +361,13 @@ export async function modelsScanCommand(
       },
       ...(nextImageModel ? { imageModel: nextImageModel } : {}),
       models: nextModels,
-    } satisfies NonNullable<typeof cfg.agent>;
+    } satisfies NonNullable<NonNullable<typeof cfg.agents>["defaults"]>;
     return {
       ...cfg,
-      agent,
+      agents: {
+        ...cfg.agents,
+        defaults,
+      },
     };
   });
 

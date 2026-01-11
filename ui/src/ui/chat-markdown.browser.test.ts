@@ -16,20 +16,28 @@ beforeEach(() => {
     // no-op: avoid real gateway WS connections in browser tests
   };
   window.__CLAWDBOT_CONTROL_UI_BASE_PATH__ = undefined;
+  localStorage.clear();
   document.body.innerHTML = "";
 });
 
 afterEach(() => {
   ClawdbotApp.prototype.connect = originalConnect;
   window.__CLAWDBOT_CONTROL_UI_BASE_PATH__ = undefined;
+  localStorage.clear();
   document.body.innerHTML = "";
 });
 
 describe("chat markdown rendering", () => {
   it("renders markdown inside tool result cards", async () => {
+    localStorage.setItem(
+      "clawdbot.control.settings.v1",
+      JSON.stringify({ useNewChatLayout: false }),
+    );
+
     const app = mountApp("/chat");
     await app.updateComplete;
 
+    const timestamp = Date.now();
     app.chatMessages = [
       {
         role: "assistant",
@@ -37,9 +45,11 @@ describe("chat markdown rendering", () => {
           { type: "toolcall", name: "noop", arguments: {} },
           { type: "toolresult", name: "noop", text: "Hello **world**" },
         ],
-        timestamp: Date.now(),
+        timestamp,
       },
     ];
+    // Expand the tool output card so its markdown is rendered into the DOM.
+    app.toolOutputExpanded = new Set([`${timestamp}:1`]);
 
     await app.updateComplete;
 
@@ -47,4 +57,3 @@ describe("chat markdown rendering", () => {
     expect(strong?.textContent).toBe("world");
   });
 });
-

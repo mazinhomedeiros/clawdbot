@@ -1,11 +1,18 @@
 import type { ClawdbotConfig } from "../config/config.js";
 import { DEFAULT_MODEL, DEFAULT_PROVIDER } from "./defaults.js";
 import {
+  coerceToFailoverError,
+  describeFailoverError,
+  isFailoverError,
+} from "./failover-error.js";
+import {
   buildModelAliasIndex,
   modelKey,
   parseModelRef,
+  resolveConfiguredModelRef,
   resolveModelRefFromString,
 } from "./model-selection.js";
+import type { FailoverReason } from "./pi-embedded-helpers.js";
 
 type ModelCandidate = {
   provider: string;
@@ -16,6 +23,9 @@ type FallbackAttempt = {
   provider: string;
   model: string;
   error: string;
+  reason?: FailoverReason;
+  status?: number;
+  code?: string;
 };
 
 function isAbortError(err: unknown): boolean {
@@ -34,7 +44,7 @@ function buildAllowedModelKeys(
   defaultProvider: string,
 ): Set<string> | null {
   const rawAllowlist = (() => {
-    const modelMap = cfg?.agent?.models ?? {};
+    const modelMap = cfg?.agents?.defaults?.models ?? {};
     return Object.keys(modelMap);
   })();
   if (rawAllowlist.length === 0) return null;
@@ -85,7 +95,7 @@ function resolveImageFallbackCandidates(params: {
   if (params.modelOverride?.trim()) {
     addRaw(params.modelOverride, false);
   } else {
-    const imageModel = params.cfg?.agent?.imageModel as
+    const imageModel = params.cfg?.agents?.defaults?.imageModel as
       | { primary?: string }
       | string
       | undefined;
@@ -95,7 +105,7 @@ function resolveImageFallbackCandidates(params: {
   }
 
   const imageFallbacks = (() => {
-    const imageModel = params.cfg?.agent?.imageModel as
+    const imageModel = params.cfg?.agents?.defaults?.imageModel as
       | { fallbacks?: string[] }
       | string
       | undefined;
@@ -119,6 +129,13 @@ function resolveFallbackCandidates(params: {
 }): ModelCandidate[] {
   const provider = params.provider.trim() || DEFAULT_PROVIDER;
   const model = params.model.trim() || DEFAULT_MODEL;
+  const primary = params.cfg
+    ? resolveConfiguredModelRef({
+        cfg: params.cfg,
+        defaultProvider: DEFAULT_PROVIDER,
+        defaultModel: DEFAULT_MODEL,
+      })
+    : null;
   const aliasIndex = buildModelAliasIndex({
     cfg: params.cfg ?? {},
     defaultProvider: DEFAULT_PROVIDER,
@@ -142,7 +159,7 @@ function resolveFallbackCandidates(params: {
   addCandidate({ provider, model }, false);
 
   const modelFallbacks = (() => {
-    const model = params.cfg?.agent?.model as
+    const model = params.cfg?.agents?.defaults?.model as
       | { fallbacks?: string[] }
       | string
       | undefined;
@@ -158,6 +175,10 @@ function resolveFallbackCandidates(params: {
     });
     if (!resolved) continue;
     addCandidate(resolved.ref, true);
+  }
+
+  if (primary?.provider && primary.model) {
+    addCandidate({ provider: primary.provider, model: primary.model }, false);
   }
 
   return candidates;
@@ -197,16 +218,27 @@ export async function runWithModelFallback<T>(params: {
       };
     } catch (err) {
       if (isAbortError(err)) throw err;
-      lastError = err;
+      const normalized =
+        coerceToFailoverError(err, {
+          provider: candidate.provider,
+          model: candidate.model,
+        }) ?? err;
+      if (!isFailoverError(normalized)) throw err;
+
+      lastError = normalized;
+      const described = describeFailoverError(normalized);
       attempts.push({
         provider: candidate.provider,
         model: candidate.model,
-        error: err instanceof Error ? err.message : String(err),
+        error: described.message,
+        reason: described.reason,
+        status: described.status,
+        code: described.code,
       });
       await params.onError?.({
         provider: candidate.provider,
         model: candidate.model,
-        error: err,
+        error: normalized,
         attempt: i + 1,
         total: candidates.length,
       });
@@ -219,7 +251,9 @@ export async function runWithModelFallback<T>(params: {
       ? attempts
           .map(
             (attempt) =>
-              `${attempt.provider}/${attempt.model}: ${attempt.error}`,
+              `${attempt.provider}/${attempt.model}: ${attempt.error}${
+                attempt.reason ? ` (${attempt.reason})` : ""
+              }`,
           )
           .join(" | ")
       : "unknown";
@@ -253,7 +287,7 @@ export async function runWithImageModelFallback<T>(params: {
   });
   if (candidates.length === 0) {
     throw new Error(
-      "No image model configured. Set agent.imageModel.primary or agent.imageModel.fallbacks.",
+      "No image model configured. Set agents.defaults.imageModel.primary or agents.defaults.imageModel.fallbacks.",
     );
   }
 

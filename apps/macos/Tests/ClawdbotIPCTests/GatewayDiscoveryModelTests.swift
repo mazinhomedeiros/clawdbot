@@ -1,5 +1,5 @@
+import ClawdbotDiscovery
 import Testing
-@testable import Clawdbot
 
 @Suite
 @MainActor
@@ -64,16 +64,36 @@ struct GatewayDiscoveryModelTests {
             local: local))
     }
 
+    @Test func serviceNameDoesNotFalsePositiveOnSubstringHostToken() {
+        let local = GatewayDiscoveryModel.LocalIdentity(
+            hostTokens: ["steipete"],
+            displayTokens: [])
+        #expect(!GatewayDiscoveryModel.isLocalGateway(
+            lanHost: nil,
+            tailnetDns: nil,
+            displayName: nil,
+            serviceName: "steipetacstudio (Clawdbot)",
+            local: local))
+        #expect(GatewayDiscoveryModel.isLocalGateway(
+            lanHost: nil,
+            tailnetDns: nil,
+            displayName: nil,
+            serviceName: "steipete (Clawdbot)",
+            local: local))
+    }
+
     @Test func parsesGatewayTXTFields() {
         let parsed = GatewayDiscoveryModel.parseGatewayTXT([
             "lanHost": "  studio.local  ",
             "tailnetDns": "  peters-mac-studio-1.ts.net  ",
             "sshPort": " 2222 ",
-            "cliPath": " /opt/clawdbot "
+            "gatewayPort": " 18799 ",
+            "cliPath": " /opt/clawdbot ",
         ])
         #expect(parsed.lanHost == "studio.local")
         #expect(parsed.tailnetDns == "peters-mac-studio-1.ts.net")
         #expect(parsed.sshPort == 2222)
+        #expect(parsed.gatewayPort == 18799)
         #expect(parsed.cliPath == "/opt/clawdbot")
     }
 
@@ -81,11 +101,13 @@ struct GatewayDiscoveryModelTests {
         let parsed = GatewayDiscoveryModel.parseGatewayTXT([
             "lanHost": "  ",
             "tailnetDns": "\n",
-            "sshPort": "nope"
+            "gatewayPort": "nope",
+            "sshPort": "nope",
         ])
         #expect(parsed.lanHost == nil)
         #expect(parsed.tailnetDns == nil)
         #expect(parsed.sshPort == 22)
+        #expect(parsed.gatewayPort == nil)
         #expect(parsed.cliPath == nil)
     }
 

@@ -3,9 +3,10 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import {
+  resolveAgentConfig,
   resolveAgentDir,
-  resolveAgentIdFromSessionKey,
   resolveAgentWorkspaceDir,
+  resolveSessionAgentId,
 } from "../agents/agent-scope.js";
 import { resolveModelRefFromString } from "../agents/model-selection.js";
 import {
@@ -14,7 +15,10 @@ import {
   isEmbeddedPiRunStreaming,
   resolveEmbeddedSessionLane,
 } from "../agents/pi-embedded.js";
-import { ensureSandboxWorkspaceForSession } from "../agents/sandbox.js";
+import {
+  ensureSandboxWorkspaceForSession,
+  resolveSandboxRuntimeStatus,
+} from "../agents/sandbox.js";
 import { resolveAgentTimeoutMs } from "../agents/timeout.js";
 import {
   DEFAULT_AGENT_WORKSPACE_DIR,
@@ -25,19 +29,30 @@ import {
   type ClawdbotConfig,
   loadConfig,
 } from "../config/config.js";
-import { resolveSessionTranscriptPath } from "../config/sessions.js";
+import { resolveSessionFilePath } from "../config/sessions.js";
 import { logVerbose } from "../globals.js";
 import { clearCommandLane, getQueueSize } from "../process/command-queue.js";
+import { normalizeMainKey } from "../routing/session-key.js";
 import { defaultRuntime } from "../runtime.js";
 import { resolveCommandAuthorization } from "./command-auth.js";
 import { hasControlCommand } from "./command-detection.js";
+import {
+  listChatCommands,
+  shouldHandleTextCommands,
+} from "./commands-registry.js";
+import { buildInboundMediaNote } from "./media-note.js";
 import { getAbortMemory } from "./reply/abort.js";
 import { runReplyAgent } from "./reply/agent-runner.js";
 import { resolveBlockStreamingChunking } from "./reply/block-streaming.js";
 import { applySessionHints } from "./reply/body.js";
-import { buildCommandContext, handleCommands } from "./reply/commands.js";
+import {
+  buildCommandContext,
+  buildStatusReply,
+  handleCommands,
+} from "./reply/commands.js";
 import {
   handleDirectiveOnly,
+  type InlineDirectives,
   isDirectiveOnly,
   parseInlineDirectives,
   persistInlineDirectives,
@@ -48,7 +63,11 @@ import {
   defaultGroupActivation,
   resolveGroupRequireMention,
 } from "./reply/groups.js";
-import { stripMentions } from "./reply/mentions.js";
+import {
+  CURRENT_MESSAGE_MARKER,
+  stripMentions,
+  stripStructuralPrefixes,
+} from "./reply/mentions.js";
 import {
   createModelSelectionState,
   resolveContextTokens,
@@ -60,10 +79,15 @@ import {
   prependSystemEvents,
 } from "./reply/session-updates.js";
 import { createTypingController } from "./reply/typing.js";
+import {
+  createTypingSignaler,
+  resolveTypingMode,
+} from "./reply/typing-mode.js";
 import type { MsgContext, TemplateContext } from "./templating.js";
 import {
   type ElevatedLevel,
   normalizeThinkLevel,
+  type ReasoningLevel,
   type ThinkLevel,
   type VerboseLevel,
 } from "./thinking.js";
@@ -73,6 +97,7 @@ import type { GetReplyOptions, ReplyPayload } from "./types.js";
 
 export {
   extractElevatedDirective,
+  extractReasoningDirective,
   extractThinkDirective,
   extractVerboseDirective,
 } from "./reply/directives.js";
@@ -82,9 +107,6 @@ export type { GetReplyOptions, ReplyPayload } from "./types.js";
 
 const BARE_SESSION_RESET_PROMPT =
   "A new session was started via /new or /reset. Say hi briefly (1-2 sentences) and ask what the user wants to do next. Do not mention internal steps, files, tools, or reasoning.";
-
-const CONTROL_COMMAND_PREFIX_RE =
-  /^\/(?:status|help|thinking|think|t|verbose|v|elevated|elev|model|queue|activation|send|restart|reset|new|compact)\b/i;
 
 function normalizeAllowToken(value?: string) {
   if (!value) return "";
@@ -192,16 +214,119 @@ function isApprovedElevatedSender(params: {
   return false;
 }
 
+function resolveElevatedPermissions(params: {
+  cfg: ClawdbotConfig;
+  agentId: string;
+  ctx: MsgContext;
+  provider: string;
+}): {
+  enabled: boolean;
+  allowed: boolean;
+  failures: Array<{ gate: string; key: string }>;
+} {
+  const globalConfig = params.cfg.tools?.elevated;
+  const agentConfig = resolveAgentConfig(params.cfg, params.agentId)?.tools
+    ?.elevated;
+  const globalEnabled = globalConfig?.enabled !== false;
+  const agentEnabled = agentConfig?.enabled !== false;
+  const enabled = globalEnabled && agentEnabled;
+  const failures: Array<{ gate: string; key: string }> = [];
+  if (!globalEnabled)
+    failures.push({ gate: "enabled", key: "tools.elevated.enabled" });
+  if (!agentEnabled)
+    failures.push({
+      gate: "enabled",
+      key: "agents.list[].tools.elevated.enabled",
+    });
+  if (!enabled) return { enabled, allowed: false, failures };
+  if (!params.provider) {
+    failures.push({ gate: "provider", key: "ctx.Provider" });
+    return { enabled, allowed: false, failures };
+  }
+
+  const discordFallback =
+    params.provider === "discord"
+      ? params.cfg.discord?.dm?.allowFrom
+      : undefined;
+  const globalAllowed = isApprovedElevatedSender({
+    provider: params.provider,
+    ctx: params.ctx,
+    allowFrom: globalConfig?.allowFrom,
+    discordFallback,
+  });
+  if (!globalAllowed) {
+    failures.push({
+      gate: "allowFrom",
+      key:
+        params.provider === "discord" && discordFallback
+          ? "tools.elevated.allowFrom.discord (or discord.dm.allowFrom fallback)"
+          : `tools.elevated.allowFrom.${params.provider}`,
+    });
+    return { enabled, allowed: false, failures };
+  }
+
+  const agentAllowed = agentConfig?.allowFrom
+    ? isApprovedElevatedSender({
+        provider: params.provider,
+        ctx: params.ctx,
+        allowFrom: agentConfig.allowFrom,
+      })
+    : true;
+  if (!agentAllowed) {
+    failures.push({
+      gate: "allowFrom",
+      key: `agents.list[].tools.elevated.allowFrom.${params.provider}`,
+    });
+  }
+  return { enabled, allowed: globalAllowed && agentAllowed, failures };
+}
+
+function formatElevatedUnavailableMessage(params: {
+  runtimeSandboxed: boolean;
+  failures: Array<{ gate: string; key: string }>;
+  sessionKey?: string;
+}): string {
+  const lines: string[] = [];
+  lines.push(
+    `elevated is not available right now (runtime=${params.runtimeSandboxed ? "sandboxed" : "direct"}).`,
+  );
+  if (params.failures.length > 0) {
+    lines.push(
+      `Failing gates: ${params.failures
+        .map((f) => `${f.gate} (${f.key})`)
+        .join(", ")}`,
+    );
+  } else {
+    lines.push(
+      "Failing gates: enabled (tools.elevated.enabled / agents.list[].tools.elevated.enabled), allowFrom (tools.elevated.allowFrom.<provider>).",
+    );
+  }
+  lines.push("Fix-it keys:");
+  lines.push("- tools.elevated.enabled");
+  lines.push("- tools.elevated.allowFrom.<provider>");
+  lines.push("- agents.list[].tools.elevated.enabled");
+  lines.push("- agents.list[].tools.elevated.allowFrom.<provider>");
+  if (params.sessionKey) {
+    lines.push(`See: clawdbot sandbox explain --session ${params.sessionKey}`);
+  }
+  return lines.join("\n");
+}
+
 export async function getReplyFromConfig(
   ctx: MsgContext,
   opts?: GetReplyOptions,
   configOverride?: ClawdbotConfig,
 ): Promise<ReplyPayload | ReplyPayload[] | undefined> {
   const cfg = configOverride ?? loadConfig();
-  const agentCfg = cfg.agent;
+  const agentId = resolveSessionAgentId({
+    sessionKey: ctx.SessionKey,
+    config: cfg,
+  });
+  const agentCfg = cfg.agents?.defaults;
   const sessionCfg = cfg.session;
   const { defaultProvider, defaultModel, aliasIndex } = resolveDefaultModel({
     cfg,
+    agentId,
   });
   let provider = defaultProvider;
   let model = defaultModel;
@@ -220,12 +345,11 @@ export async function getReplyFromConfig(
     }
   }
 
-  const agentId = resolveAgentIdFromSessionKey(ctx.SessionKey);
   const workspaceDirRaw =
     resolveAgentWorkspaceDir(cfg, agentId) ?? DEFAULT_AGENT_WORKSPACE_DIR;
   const workspace = await ensureAgentWorkspace({
     dir: workspaceDirRaw,
-    ensureBootstrapFiles: !cfg.agent?.skipBootstrap,
+    ensureBootstrapFiles: !agentCfg?.skipBootstrap,
   });
   const workspaceDir = workspace.dir;
   const agentDir = resolveAgentDir(cfg, agentId);
@@ -243,7 +367,7 @@ export async function getReplyFromConfig(
   opts?.onTypingController?.(typing);
 
   let transcribedText: string | undefined;
-  if (cfg.routing?.transcribeAudio && isAudio(ctx.MediaType)) {
+  if (cfg.audio?.transcription && isAudio(ctx.MediaType)) {
     const transcribed = await transcribeInboundAudio(cfg, ctx, defaultRuntime);
     if (transcribed?.text) {
       transcribedText = transcribed.text;
@@ -254,7 +378,7 @@ export async function getReplyFromConfig(
   }
 
   const commandAuthorized = ctx.CommandAuthorized ?? true;
-  const commandAuth = resolveCommandAuthorization({
+  resolveCommandAuthorization({
     ctx,
     cfg,
     commandAuthorized,
@@ -280,47 +404,164 @@ export async function getReplyFromConfig(
     triggerBodyNormalized,
   } = sessionState;
 
-  const rawBody = sessionCtx.BodyStripped ?? sessionCtx.Body ?? "";
-  const parsedDirectives = parseInlineDirectives(rawBody);
+  // Prefer CommandBody/RawBody (clean message without structural context) for directive parsing.
+  // Keep `Body`/`BodyStripped` as the best-available prompt text (may include context).
+  const commandSource =
+    sessionCtx.CommandBody ??
+    sessionCtx.RawBody ??
+    sessionCtx.BodyStripped ??
+    sessionCtx.Body ??
+    "";
+  const clearInlineDirectives = (cleaned: string): InlineDirectives => ({
+    cleaned,
+    hasThinkDirective: false,
+    thinkLevel: undefined,
+    rawThinkLevel: undefined,
+    hasVerboseDirective: false,
+    verboseLevel: undefined,
+    rawVerboseLevel: undefined,
+    hasReasoningDirective: false,
+    reasoningLevel: undefined,
+    rawReasoningLevel: undefined,
+    hasElevatedDirective: false,
+    elevatedLevel: undefined,
+    rawElevatedLevel: undefined,
+    hasStatusDirective: false,
+    hasModelDirective: false,
+    rawModelDirective: undefined,
+    hasQueueDirective: false,
+    queueMode: undefined,
+    queueReset: false,
+    rawQueueMode: undefined,
+    debounceMs: undefined,
+    cap: undefined,
+    dropPolicy: undefined,
+    rawDebounce: undefined,
+    rawCap: undefined,
+    rawDrop: undefined,
+    hasQueueOptions: false,
+  });
+  const reservedCommands = new Set(
+    listChatCommands().flatMap((cmd) =>
+      cmd.textAliases.map((a) => a.replace(/^\//, "").toLowerCase()),
+    ),
+  );
+  const configuredAliases = Object.values(cfg.agents?.defaults?.models ?? {})
+    .map((entry) => entry.alias?.trim())
+    .filter((alias): alias is string => Boolean(alias))
+    .filter((alias) => !reservedCommands.has(alias.toLowerCase()));
+  let parsedDirectives = parseInlineDirectives(commandSource, {
+    modelAliases: configuredAliases,
+  });
+  if (
+    isGroup &&
+    ctx.WasMentioned !== true &&
+    parsedDirectives.hasElevatedDirective
+  ) {
+    if (parsedDirectives.elevatedLevel !== "off") {
+      parsedDirectives = {
+        ...parsedDirectives,
+        hasElevatedDirective: false,
+        elevatedLevel: undefined,
+        rawElevatedLevel: undefined,
+      };
+    }
+  }
+  const hasDirective =
+    parsedDirectives.hasThinkDirective ||
+    parsedDirectives.hasVerboseDirective ||
+    parsedDirectives.hasReasoningDirective ||
+    parsedDirectives.hasElevatedDirective ||
+    parsedDirectives.hasStatusDirective ||
+    parsedDirectives.hasModelDirective ||
+    parsedDirectives.hasQueueDirective;
+  if (hasDirective) {
+    const stripped = stripStructuralPrefixes(parsedDirectives.cleaned);
+    const noMentions = isGroup
+      ? stripMentions(stripped, ctx, cfg, agentId)
+      : stripped;
+    if (noMentions.trim().length > 0) {
+      const directiveOnlyCheck = parseInlineDirectives(noMentions, {
+        modelAliases: configuredAliases,
+      });
+      if (directiveOnlyCheck.cleaned.trim().length > 0) {
+        parsedDirectives = clearInlineDirectives(parsedDirectives.cleaned);
+      }
+    }
+  }
   const directives = commandAuthorized
     ? parsedDirectives
     : {
         ...parsedDirectives,
         hasThinkDirective: false,
         hasVerboseDirective: false,
+        hasReasoningDirective: false,
         hasStatusDirective: false,
         hasModelDirective: false,
         hasQueueDirective: false,
         queueReset: false,
       };
-  sessionCtx.Body = parsedDirectives.cleaned;
-  sessionCtx.BodyStripped = parsedDirectives.cleaned;
+  const existingBody = sessionCtx.BodyStripped ?? sessionCtx.Body ?? "";
+  const cleanedBody = (() => {
+    if (!existingBody) return parsedDirectives.cleaned;
+    if (!sessionCtx.CommandBody && !sessionCtx.RawBody) {
+      return parseInlineDirectives(existingBody, {
+        modelAliases: configuredAliases,
+      }).cleaned;
+    }
+
+    const markerIndex = existingBody.indexOf(CURRENT_MESSAGE_MARKER);
+    if (markerIndex < 0) {
+      return parseInlineDirectives(existingBody, {
+        modelAliases: configuredAliases,
+      }).cleaned;
+    }
+
+    const head = existingBody.slice(
+      0,
+      markerIndex + CURRENT_MESSAGE_MARKER.length,
+    );
+    const tail = existingBody.slice(
+      markerIndex + CURRENT_MESSAGE_MARKER.length,
+    );
+    const cleanedTail = parseInlineDirectives(tail, {
+      modelAliases: configuredAliases,
+    }).cleaned;
+    return `${head}${cleanedTail}`;
+  })();
+
+  sessionCtx.Body = cleanedBody;
+  sessionCtx.BodyStripped = cleanedBody;
 
   const messageProviderKey =
     sessionCtx.Provider?.trim().toLowerCase() ??
     ctx.Provider?.trim().toLowerCase() ??
     "";
-  const elevatedConfig = agentCfg?.elevated;
-  const discordElevatedFallback =
-    messageProviderKey === "discord" ? cfg.discord?.dm?.allowFrom : undefined;
-  const elevatedEnabled = elevatedConfig?.enabled !== false;
-  const elevatedAllowed =
-    elevatedEnabled &&
-    Boolean(
-      messageProviderKey &&
-        isApprovedElevatedSender({
-          provider: messageProviderKey,
-          ctx,
-          allowFrom: elevatedConfig?.allowFrom,
-          discordFallback: discordElevatedFallback,
-        }),
-    );
+  const elevated = resolveElevatedPermissions({
+    cfg,
+    agentId,
+    ctx,
+    provider: messageProviderKey,
+  });
+  const elevatedEnabled = elevated.enabled;
+  const elevatedAllowed = elevated.allowed;
+  const elevatedFailures = elevated.failures;
   if (
     directives.hasElevatedDirective &&
     (!elevatedEnabled || !elevatedAllowed)
   ) {
     typing.cleanup();
-    return { text: "elevated is not available right now." };
+    const runtimeSandboxed = resolveSandboxRuntimeStatus({
+      cfg,
+      sessionKey: ctx.SessionKey,
+    }).sandboxed;
+    return {
+      text: formatElevatedUnavailableMessage({
+        runtimeSandboxed,
+        failures: elevatedFailures,
+        sessionKey: ctx.SessionKey,
+      }),
+    };
   }
 
   const requireMention = resolveGroupRequireMention({
@@ -338,6 +579,10 @@ export async function getReplyFromConfig(
     (directives.verboseLevel as VerboseLevel | undefined) ??
     (sessionEntry?.verboseLevel as VerboseLevel | undefined) ??
     (agentCfg?.verboseDefault as VerboseLevel | undefined);
+  const resolvedReasoningLevel: ReasoningLevel =
+    (directives.reasoningLevel as ReasoningLevel | undefined) ??
+    (sessionEntry?.reasoningLevel as ReasoningLevel | undefined) ??
+    "off";
   const resolvedElevatedLevel = elevatedAllowed
     ? ((directives.elevatedLevel as ElevatedLevel | undefined) ??
       (sessionEntry?.elevatedLevel as ElevatedLevel | undefined) ??
@@ -345,14 +590,24 @@ export async function getReplyFromConfig(
       "on")
     : "off";
   const resolvedBlockStreaming =
-    agentCfg?.blockStreamingDefault === "off" ? "off" : "on";
+    opts?.disableBlockStreaming === true
+      ? "off"
+      : opts?.disableBlockStreaming === false
+        ? "on"
+        : agentCfg?.blockStreamingDefault === "on"
+          ? "on"
+          : "off";
   const resolvedBlockStreamingBreak: "text_end" | "message_end" =
     agentCfg?.blockStreamingBreak === "message_end"
       ? "message_end"
       : "text_end";
   const blockStreamingEnabled = resolvedBlockStreaming === "on";
   const blockReplyChunking = blockStreamingEnabled
-    ? resolveBlockStreamingChunking(cfg, sessionCtx.Provider)
+    ? resolveBlockStreamingChunking(
+        cfg,
+        sessionCtx.Provider,
+        sessionCtx.AccountId,
+      )
     : undefined;
 
   const modelState = await createModelSelectionState({
@@ -390,15 +645,42 @@ export async function getReplyFromConfig(
     ? undefined
     : directives.rawModelDirective;
 
+  const command = buildCommandContext({
+    ctx,
+    cfg,
+    agentId,
+    sessionKey,
+    isGroup,
+    triggerBodyNormalized,
+    commandAuthorized,
+  });
+  const allowTextCommands = shouldHandleTextCommands({
+    cfg,
+    surface: command.surface,
+    commandSource: ctx.CommandSource,
+  });
+
   if (
     isDirectiveOnly({
       directives,
       cleanedBody: directives.cleaned,
       ctx,
       cfg,
+      agentId,
       isGroup,
     })
   ) {
+    const currentThinkLevel =
+      (sessionEntry?.thinkingLevel as ThinkLevel | undefined) ??
+      (agentCfg?.thinkingDefault as ThinkLevel | undefined);
+    const currentVerboseLevel =
+      (sessionEntry?.verboseLevel as VerboseLevel | undefined) ??
+      (agentCfg?.verboseDefault as VerboseLevel | undefined);
+    const currentReasoningLevel =
+      (sessionEntry?.reasoningLevel as ReasoningLevel | undefined) ?? "off";
+    const currentElevatedLevel =
+      (sessionEntry?.elevatedLevel as ElevatedLevel | undefined) ??
+      (agentCfg?.elevatedDefault as ElevatedLevel | undefined);
     const directiveReply = await handleDirectiveOnly({
       cfg,
       directives,
@@ -408,6 +690,8 @@ export async function getReplyFromConfig(
       storePath,
       elevatedEnabled,
       elevatedAllowed,
+      elevatedFailures,
+      messageProviderKey,
       defaultProvider,
       defaultModel,
       aliasIndex,
@@ -418,15 +702,48 @@ export async function getReplyFromConfig(
       model,
       initialModelLabel,
       formatModelSwitchEvent,
+      currentThinkLevel,
+      currentVerboseLevel,
+      currentReasoningLevel,
+      currentElevatedLevel,
     });
+    let statusReply: ReplyPayload | undefined;
+    if (directives.hasStatusDirective && allowTextCommands) {
+      statusReply = await buildStatusReply({
+        cfg,
+        command,
+        sessionEntry,
+        sessionKey,
+        sessionScope,
+        provider,
+        model,
+        contextTokens,
+        resolvedThinkLevel:
+          currentThinkLevel ??
+          (agentCfg?.thinkingDefault as ThinkLevel | undefined),
+        resolvedVerboseLevel: (currentVerboseLevel ?? "off") as VerboseLevel,
+        resolvedReasoningLevel: (currentReasoningLevel ??
+          "off") as ReasoningLevel,
+        resolvedElevatedLevel,
+        resolveDefaultThinkingLevel: async () =>
+          currentThinkLevel ??
+          (agentCfg?.thinkingDefault as ThinkLevel | undefined),
+        isGroup,
+        defaultGroupActivation: () => defaultActivation,
+      });
+    }
     typing.cleanup();
-    return directiveReply;
+    if (statusReply?.text && directiveReply?.text) {
+      return { text: `${directiveReply.text}\n${statusReply.text}` };
+    }
+    return statusReply ?? directiveReply;
   }
 
   const persisted = await persistInlineDirectives({
     directives,
     effectiveModelDirective,
     cfg,
+    agentDir,
     sessionEntry,
     sessionStore,
     sessionKey,
@@ -460,14 +777,6 @@ export async function getReplyFromConfig(
         }
       : undefined;
 
-  const command = buildCommandContext({
-    ctx,
-    cfg,
-    sessionKey,
-    isGroup,
-    triggerBodyNormalized,
-    commandAuthorized,
-  });
   const isEmptyConfig = Object.keys(cfg).length === 0;
   if (
     command.isWhatsAppProvider &&
@@ -488,6 +797,7 @@ export async function getReplyFromConfig(
     ctx,
     cfg,
     command,
+    agentId,
     directives,
     sessionEntry,
     sessionStore,
@@ -498,6 +808,7 @@ export async function getReplyFromConfig(
     defaultGroupActivation: () => defaultActivation,
     resolvedThinkLevel,
     resolvedVerboseLevel: resolvedVerboseLevel ?? "off",
+    resolvedReasoningLevel,
     resolvedElevatedLevel,
     resolveDefaultThinkingLevel: modelState.resolveDefaultThinkingLevel,
     provider,
@@ -522,7 +833,17 @@ export async function getReplyFromConfig(
   const isGroupChat = sessionCtx.ChatType === "group";
   const wasMentioned = ctx.WasMentioned === true;
   const isHeartbeat = opts?.isHeartbeat === true;
-  const shouldEagerType = (!isGroupChat || wasMentioned) && !isHeartbeat;
+  const typingMode = resolveTypingMode({
+    configured: sessionCfg?.typingMode ?? agentCfg?.typingMode,
+    isGroupChat,
+    wasMentioned,
+    isHeartbeat,
+  });
+  const typingSignals = createTypingSignaler({
+    typing,
+    mode: typingMode,
+    isHeartbeat,
+  });
   const shouldInjectGroupIntro = Boolean(
     isGroupChat &&
       (isFirstTurnInSession || sessionEntry?.groupActivationNeedsSystemIntro),
@@ -535,20 +856,25 @@ export async function getReplyFromConfig(
         silentToken: SILENT_REPLY_TOKEN,
       })
     : "";
+  const groupSystemPrompt = sessionCtx.GroupSystemPrompt?.trim() ?? "";
+  const extraSystemPrompt = [groupIntro, groupSystemPrompt]
+    .filter(Boolean)
+    .join("\n\n");
   const baseBody = sessionCtx.BodyStripped ?? sessionCtx.Body ?? "";
-  const rawBodyTrimmed = (ctx.Body ?? "").trim();
+  // Use CommandBody/RawBody for bare reset detection (clean message without structural context).
+  const rawBodyTrimmed = (
+    ctx.CommandBody ??
+    ctx.RawBody ??
+    ctx.Body ??
+    ""
+  ).trim();
   const baseBodyTrimmedRaw = baseBody.trim();
-  const strippedCommandBody = isGroup
-    ? stripMentions(triggerBodyNormalized, ctx, cfg)
-    : triggerBodyNormalized;
   if (
-    !commandAuth.isAuthorizedSender &&
-    CONTROL_COMMAND_PREFIX_RE.test(strippedCommandBody.trim())
+    allowTextCommands &&
+    !commandAuthorized &&
+    !baseBodyTrimmedRaw &&
+    hasControlCommand(commandSource)
   ) {
-    typing.cleanup();
-    return undefined;
-  }
-  if (!commandAuthorized && !baseBodyTrimmedRaw && hasControlCommand(rawBody)) {
     typing.cleanup();
     return undefined;
   }
@@ -581,7 +907,7 @@ export async function getReplyFromConfig(
   const isGroupSession =
     sessionEntry?.chatType === "group" || sessionEntry?.chatType === "room";
   const isMainSession =
-    !isGroupSession && sessionKey === (sessionCfg?.mainKey ?? "main");
+    !isGroupSession && sessionKey === normalizeMainKey(sessionCfg?.mainKey);
   prefixedBodyBase = await prependSystemEvents({
     cfg,
     sessionKey,
@@ -589,6 +915,11 @@ export async function getReplyFromConfig(
     isNewSession,
     prefixedBodyBase,
   });
+  const threadStarterBody = ctx.ThreadStarterBody?.trim();
+  const threadStarterNote =
+    isNewSession && threadStarterBody
+      ? `[Thread starter - for context]\n${threadStarterBody}`
+      : undefined;
   const skillResult = await ensureSkillSnapshot({
     sessionEntry,
     sessionStore,
@@ -598,45 +929,44 @@ export async function getReplyFromConfig(
     isFirstTurnInSession,
     workspaceDir,
     cfg,
+    skillFilter: opts?.skillFilter,
   });
   sessionEntry = skillResult.sessionEntry ?? sessionEntry;
   systemSent = skillResult.systemSent;
   const skillsSnapshot = skillResult.skillsSnapshot;
   const prefixedBody = transcribedText
-    ? [prefixedBodyBase, `Transcript:\n${transcribedText}`]
+    ? [threadStarterNote, prefixedBodyBase, `Transcript:\n${transcribedText}`]
         .filter(Boolean)
         .join("\n\n")
-    : prefixedBodyBase;
-  const mediaNote = ctx.MediaPath?.length
-    ? `[media attached: ${ctx.MediaPath}${ctx.MediaType ? ` (${ctx.MediaType})` : ""}${ctx.MediaUrl ? ` | ${ctx.MediaUrl}` : ""}]`
-    : undefined;
+    : [threadStarterNote, prefixedBodyBase].filter(Boolean).join("\n\n");
+  const mediaNote = buildInboundMediaNote(ctx);
   const mediaReplyHint = mediaNote
     ? "To send an image back, add a line like: MEDIA:https://example.com/image.jpg (no spaces). Keep caption in the text body."
     : undefined;
-  let commandBody = mediaNote
+  let prefixedCommandBody = mediaNote
     ? [mediaNote, mediaReplyHint, prefixedBody ?? ""]
         .filter(Boolean)
         .join("\n")
         .trim()
     : prefixedBody;
-  if (!resolvedThinkLevel && commandBody) {
-    const parts = commandBody.split(/\s+/);
+  if (!resolvedThinkLevel && prefixedCommandBody) {
+    const parts = prefixedCommandBody.split(/\s+/);
     const maybeLevel = normalizeThinkLevel(parts[0]);
     if (maybeLevel) {
       resolvedThinkLevel = maybeLevel;
-      commandBody = parts.slice(1).join(" ").trim();
+      prefixedCommandBody = parts.slice(1).join(" ").trim();
     }
   }
   if (!resolvedThinkLevel) {
     resolvedThinkLevel = await modelState.resolveDefaultThinkingLevel();
   }
   const sessionIdFinal = sessionId ?? crypto.randomUUID();
-  const sessionFile = resolveSessionTranscriptPath(sessionIdFinal);
+  const sessionFile = resolveSessionFilePath(sessionIdFinal, sessionEntry);
   const queueBodyBase = transcribedText
-    ? [baseBodyFinal, `Transcript:\n${transcribedText}`]
+    ? [threadStarterNote, baseBodyFinal, `Transcript:\n${transcribedText}`]
         .filter(Boolean)
         .join("\n\n")
-    : baseBodyFinal;
+    : [threadStarterNote, baseBodyFinal].filter(Boolean).join("\n\n");
   const queuedBody = mediaNote
     ? [mediaNote, mediaReplyHint, queueBodyBase]
         .filter(Boolean)
@@ -673,14 +1003,21 @@ export async function getReplyFromConfig(
   const authProfileId = sessionEntry?.authProfileOverride;
   const followupRun = {
     prompt: queuedBody,
+    messageId: sessionCtx.MessageSid,
     summaryLine: baseBodyTrimmedRaw,
     enqueuedAt: Date.now(),
+    // Originating channel for reply routing.
+    originatingChannel: ctx.OriginatingChannel,
+    originatingTo: ctx.OriginatingTo,
+    originatingAccountId: ctx.AccountId,
+    originatingThreadId: ctx.MessageThreadId,
     run: {
       agentId,
       agentDir,
       sessionId: sessionIdFinal,
       sessionKey,
       messageProvider: sessionCtx.Provider?.trim().toLowerCase() || undefined,
+      agentAccountId: sessionCtx.AccountId,
       sessionFile,
       workspaceDir,
       config: cfg,
@@ -690,6 +1027,7 @@ export async function getReplyFromConfig(
       authProfileId,
       thinkLevel: resolvedThinkLevel,
       verboseLevel: resolvedVerboseLevel,
+      reasoningLevel: resolvedReasoningLevel,
       elevatedLevel: resolvedElevatedLevel,
       bashElevated: {
         enabled: elevatedEnabled,
@@ -700,17 +1038,17 @@ export async function getReplyFromConfig(
       blockReplyBreak: resolvedBlockStreamingBreak,
       ownerNumbers:
         command.ownerList.length > 0 ? command.ownerList : undefined,
-      extraSystemPrompt: groupIntro || undefined,
+      extraSystemPrompt: extraSystemPrompt || undefined,
       ...(provider === "ollama" ? { enforceFinalTag: true } : {}),
     },
   };
 
-  if (shouldEagerType) {
-    await typing.startTypingLoop();
+  if (typingSignals.shouldStartImmediately) {
+    await typingSignals.signalRunStart();
   }
 
   return runReplyAgent({
-    commandBody,
+    commandBody: prefixedCommandBody,
     followupRun,
     queueKey,
     resolvedQueue,
@@ -733,6 +1071,7 @@ export async function getReplyFromConfig(
     resolvedBlockStreamingBreak,
     sessionCtx,
     shouldInjectGroupIntro,
+    typingMode,
   });
 }
 
@@ -744,8 +1083,18 @@ async function stageSandboxMedia(params: {
   workspaceDir: string;
 }) {
   const { ctx, sessionCtx, cfg, sessionKey, workspaceDir } = params;
-  const rawPath = ctx.MediaPath?.trim();
-  if (!rawPath || !sessionKey) return;
+  const hasPathsArray =
+    Array.isArray(ctx.MediaPaths) && ctx.MediaPaths.length > 0;
+  const pathsFromArray = Array.isArray(ctx.MediaPaths)
+    ? ctx.MediaPaths
+    : undefined;
+  const rawPaths =
+    pathsFromArray && pathsFromArray.length > 0
+      ? pathsFromArray
+      : ctx.MediaPath?.trim()
+        ? [ctx.MediaPath.trim()]
+        : [];
+  if (rawPaths.length === 0 || !sessionKey) return;
 
   const sandbox = await ensureSandboxWorkspaceForSession({
     config: cfg,
@@ -754,44 +1103,83 @@ async function stageSandboxMedia(params: {
   });
   if (!sandbox) return;
 
-  let source = rawPath;
-  if (source.startsWith("file://")) {
-    try {
-      source = fileURLToPath(source);
-    } catch {
-      return;
+  const resolveAbsolutePath = (value: string): string | null => {
+    let resolved = value.trim();
+    if (!resolved) return null;
+    if (resolved.startsWith("file://")) {
+      try {
+        resolved = fileURLToPath(resolved);
+      } catch {
+        return null;
+      }
     }
-  }
-  if (!path.isAbsolute(source)) return;
-
-  const originalMediaPath = ctx.MediaPath;
-  const originalMediaUrl = ctx.MediaUrl;
+    if (!path.isAbsolute(resolved)) return null;
+    return resolved;
+  };
 
   try {
-    const fileName = path.basename(source);
-    if (!fileName) return;
     const destDir = path.join(sandbox.workspaceDir, "media", "inbound");
     await fs.mkdir(destDir, { recursive: true });
-    const dest = path.join(destDir, fileName);
-    await fs.copyFile(source, dest);
 
-    const relative = path.posix.join("media", "inbound", fileName);
-    ctx.MediaPath = relative;
-    sessionCtx.MediaPath = relative;
+    const usedNames = new Set<string>();
+    const staged = new Map<string, string>(); // absolute source -> relative sandbox path
 
-    if (originalMediaUrl) {
-      let normalizedUrl = originalMediaUrl;
-      if (normalizedUrl.startsWith("file://")) {
-        try {
-          normalizedUrl = fileURLToPath(normalizedUrl);
-        } catch {
-          normalizedUrl = originalMediaUrl;
-        }
+    for (const raw of rawPaths) {
+      const source = resolveAbsolutePath(raw);
+      if (!source) continue;
+      if (staged.has(source)) continue;
+
+      const baseName = path.basename(source);
+      if (!baseName) continue;
+      const parsed = path.parse(baseName);
+      let fileName = baseName;
+      let suffix = 1;
+      while (usedNames.has(fileName)) {
+        fileName = `${parsed.name}-${suffix}${parsed.ext}`;
+        suffix += 1;
       }
-      if (normalizedUrl === originalMediaPath || normalizedUrl === source) {
-        ctx.MediaUrl = relative;
-        sessionCtx.MediaUrl = relative;
+      usedNames.add(fileName);
+
+      const dest = path.join(destDir, fileName);
+      await fs.copyFile(source, dest);
+      const relative = path.posix.join("media", "inbound", fileName);
+      staged.set(source, relative);
+    }
+
+    const rewriteIfStaged = (value: string | undefined): string | undefined => {
+      const raw = value?.trim();
+      if (!raw) return value;
+      const abs = resolveAbsolutePath(raw);
+      if (!abs) return value;
+      const mapped = staged.get(abs);
+      return mapped ?? value;
+    };
+
+    const nextMediaPaths = hasPathsArray
+      ? rawPaths.map((p) => rewriteIfStaged(p) ?? p)
+      : undefined;
+    if (nextMediaPaths) {
+      ctx.MediaPaths = nextMediaPaths;
+      sessionCtx.MediaPaths = nextMediaPaths;
+      ctx.MediaPath = nextMediaPaths[0];
+      sessionCtx.MediaPath = nextMediaPaths[0];
+    } else {
+      const rewritten = rewriteIfStaged(ctx.MediaPath);
+      if (rewritten && rewritten !== ctx.MediaPath) {
+        ctx.MediaPath = rewritten;
+        sessionCtx.MediaPath = rewritten;
       }
+    }
+
+    if (Array.isArray(ctx.MediaUrls) && ctx.MediaUrls.length > 0) {
+      const nextUrls = ctx.MediaUrls.map((u) => rewriteIfStaged(u) ?? u);
+      ctx.MediaUrls = nextUrls;
+      sessionCtx.MediaUrls = nextUrls;
+    }
+    const rewrittenUrl = rewriteIfStaged(ctx.MediaUrl);
+    if (rewrittenUrl && rewrittenUrl !== ctx.MediaUrl) {
+      ctx.MediaUrl = rewrittenUrl;
+      sessionCtx.MediaUrl = rewrittenUrl;
     }
   } catch (err) {
     logVerbose(`Failed to stage inbound media for sandbox: ${String(err)}`);

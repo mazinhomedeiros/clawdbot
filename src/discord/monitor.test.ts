@@ -1,6 +1,8 @@
+import type { Guild } from "@buape/carbon";
 import { describe, expect, it } from "vitest";
 import {
   allowListMatches,
+  buildDiscordMediaPayload,
   type DiscordGuildEntryResolved,
   isDiscordGroupAllowedByPolicy,
   normalizeDiscordAllowList,
@@ -12,8 +14,7 @@ import {
   shouldEmitDiscordReactionNotification,
 } from "./monitor.js";
 
-const fakeGuild = (id: string, name: string) =>
-  ({ id, name }) as unknown as import("discord.js").Guild;
+const fakeGuild = (id: string, name: string) => ({ id, name }) as Guild;
 
 const makeEntries = (
   entries: Record<string, Partial<DiscordGuildEntryResolved>>,
@@ -95,7 +96,14 @@ describe("discord guild/channel resolution", () => {
     const guildInfo: DiscordGuildEntryResolved = {
       channels: {
         general: { allow: true },
-        help: { allow: true, requireMention: true },
+        help: {
+          allow: true,
+          requireMention: true,
+          skills: ["search"],
+          enabled: false,
+          users: ["123"],
+          systemPrompt: "Use short answers.",
+        },
       },
     };
     const channel = resolveDiscordChannelConfig({
@@ -115,6 +123,10 @@ describe("discord guild/channel resolution", () => {
     });
     expect(help?.allowed).toBe(true);
     expect(help?.requireMention).toBe(true);
+    expect(help?.skills).toEqual(["search"]);
+    expect(help?.enabled).toBe(false);
+    expect(help?.users).toEqual(["123"]);
+    expect(help?.systemPrompt).toBe("Use short answers.");
   });
 
   it("denies channel when config present but no match", () => {
@@ -344,5 +356,28 @@ describe("discord reaction notification gating", () => {
         allowlist: ["123", "other"],
       }),
     ).toBe(true);
+  });
+});
+
+describe("discord media payload", () => {
+  it("preserves attachment order for MediaPaths/MediaUrls", () => {
+    const payload = buildDiscordMediaPayload([
+      { path: "/tmp/a.png", contentType: "image/png" },
+      { path: "/tmp/b.png", contentType: "image/png" },
+      { path: "/tmp/c.png", contentType: "image/png" },
+    ]);
+    expect(payload.MediaPath).toBe("/tmp/a.png");
+    expect(payload.MediaUrl).toBe("/tmp/a.png");
+    expect(payload.MediaType).toBe("image/png");
+    expect(payload.MediaPaths).toEqual([
+      "/tmp/a.png",
+      "/tmp/b.png",
+      "/tmp/c.png",
+    ]);
+    expect(payload.MediaUrls).toEqual([
+      "/tmp/a.png",
+      "/tmp/b.png",
+      "/tmp/c.png",
+    ]);
   });
 });

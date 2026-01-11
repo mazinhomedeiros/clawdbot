@@ -32,9 +32,21 @@ export type GatewayClientOptions = {
   maxProtocol?: number;
   onEvent?: (evt: EventFrame) => void;
   onHelloOk?: (hello: HelloOk) => void;
+  onConnectError?: (err: Error) => void;
   onClose?: (code: number, reason: string) => void;
   onGap?: (info: { expected: number; received: number }) => void;
 };
+
+export const GATEWAY_CLOSE_CODE_HINTS: Readonly<Record<number, string>> = {
+  1000: "normal closure",
+  1006: "abnormal closure (no close frame)",
+  1008: "policy violation",
+  1012: "service restart",
+};
+
+export function describeGatewayCloseCode(code: number): string | undefined {
+  return GATEWAY_CLOSE_CODE_HINTS[code];
+}
 
 export class GatewayClient {
   private ws: WebSocket | null = null;
@@ -119,6 +131,9 @@ export class GatewayClient {
         this.opts.onHelloOk?.(helloOk);
       })
       .catch((err) => {
+        this.opts.onConnectError?.(
+          err instanceof Error ? err : new Error(String(err)),
+        );
         const msg = `gateway connect failed: ${String(err)}`;
         if (this.opts.mode === "probe") logDebug(msg);
         else logError(msg);

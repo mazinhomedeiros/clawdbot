@@ -1,4 +1,5 @@
 import AppKit
+import ClawdbotProtocol
 import Foundation
 import Testing
 
@@ -23,7 +24,7 @@ struct LowCoverageHelperTests {
         #expect(dict["list"]?.arrayValue?.count == 2)
 
         let foundation = any.foundationValue as? [String: Any]
-        #expect(foundation?["title"] as? String == "Hello")
+        #expect((foundation?["title"] as? String) == "Hello")
     }
 
     @Test func attributedStringStripsForegroundColor() {
@@ -54,6 +55,25 @@ struct LowCoverageHelperTests {
     @Test func shellExecutorTimesOut() async {
         let result = await ShellExecutor.runDetailed(command: ["/bin/sleep", "1"], cwd: nil, env: nil, timeout: 0.05)
         #expect(result.timedOut == true)
+    }
+
+    @Test func shellExecutorDrainsStdoutAndStderr() async {
+        let script = """
+        i=0
+        while [ $i -lt 2000 ]; do
+          echo "stdout-$i"
+          echo "stderr-$i" 1>&2
+          i=$((i+1))
+        done
+        """
+        let result = await ShellExecutor.runDetailed(
+            command: ["/bin/sh", "-c", script],
+            cwd: nil,
+            env: nil,
+            timeout: 2)
+        #expect(result.success == true)
+        #expect(result.stdout.contains("stdout-1999"))
+        #expect(result.stderr.contains("stderr-1999"))
     }
 
     @Test func pairedNodesStorePersists() async throws {
@@ -92,34 +112,22 @@ struct LowCoverageHelperTests {
         _ = PresenceReporter._testPrimaryIPv4Address()
     }
 
-    @Test func gatewayLaunchAgentHelpers() {
-        let keyBind = "CLAWDBOT_GATEWAY_BIND"
-        let keyToken = "CLAWDBOT_GATEWAY_TOKEN"
-        let previousBind = ProcessInfo.processInfo.environment[keyBind]
-        let previousToken = ProcessInfo.processInfo.environment[keyToken]
-        defer {
-            if let previousBind {
-                setenv(keyBind, previousBind, 1)
-            } else {
-                unsetenv(keyBind)
-            }
-            if let previousToken {
-                setenv(keyToken, previousToken, 1)
-            } else {
-                unsetenv(keyToken)
-            }
-        }
+    @Test func gatewayLaunchAgentHelpers() async throws {
+        await TestIsolation.withEnvValues(
+            [
+                "CLAWDBOT_GATEWAY_BIND": "Lan",
+                "CLAWDBOT_GATEWAY_TOKEN": " secret ",
+            ]) {
+                #expect(GatewayLaunchAgentManager._testPreferredGatewayBind() == "lan")
+                #expect(GatewayLaunchAgentManager._testPreferredGatewayToken() == "secret")
+                #expect(
+                    GatewayLaunchAgentManager._testEscapePlistValue("a&b<c>\"'") ==
+                        "a&amp;b&lt;c&gt;&quot;&apos;")
 
-        setenv(keyBind, "Lan", 1)
-        setenv(keyToken, " secret ", 1)
-        #expect(GatewayLaunchAgentManager._testPreferredGatewayBind() == "lan")
-        #expect(GatewayLaunchAgentManager._testPreferredGatewayToken() == "secret")
-        #expect(
-            GatewayLaunchAgentManager._testEscapePlistValue("a&b<c>\"'") ==
-                "a&amp;b&lt;c&gt;&quot;&apos;")
-
-        #expect(GatewayLaunchAgentManager._testGatewayExecutablePath(bundlePath: "/App") == "/App/Contents/Resources/Relay/clawdbot")
-        #expect(GatewayLaunchAgentManager._testRelayDir(bundlePath: "/App") == "/App/Contents/Resources/Relay")
+                #expect(GatewayLaunchAgentManager
+                    ._testGatewayExecutablePath(bundlePath: "/App") == "/App/Contents/Resources/Relay/clawdbot")
+                #expect(GatewayLaunchAgentManager._testRelayDir(bundlePath: "/App") == "/App/Contents/Resources/Relay")
+            }
     }
 
     @Test func portGuardianParsesListenersAndBuildsReports() {

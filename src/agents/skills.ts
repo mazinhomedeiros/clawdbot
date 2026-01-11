@@ -11,6 +11,8 @@ import {
 import type { ClawdbotConfig, SkillConfig } from "../config/config.js";
 import { CONFIG_DIR, resolveUserPath } from "../utils.js";
 
+const fsp = fs.promises;
+
 export type SkillInstallSpec = {
   id?: string;
   kind: "brew" | "node" | "go" | "uv";
@@ -382,8 +384,27 @@ function shouldIncludeSkill(params: {
 function filterSkillEntries(
   entries: SkillEntry[],
   config?: ClawdbotConfig,
+  skillFilter?: string[],
 ): SkillEntry[] {
-  return entries.filter((entry) => shouldIncludeSkill({ entry, config }));
+  let filtered = entries.filter((entry) =>
+    shouldIncludeSkill({ entry, config }),
+  );
+  // If skillFilter is provided, only include skills in the filter list.
+  if (skillFilter !== undefined) {
+    const normalized = skillFilter
+      .map((entry) => String(entry).trim())
+      .filter(Boolean);
+    const label = normalized.length > 0 ? normalized.join(", ") : "(none)";
+    console.log(`[skills] Applying skill filter: ${label}`);
+    filtered =
+      normalized.length > 0
+        ? filtered.filter((entry) => normalized.includes(entry.skill.name))
+        : [];
+    console.log(
+      `[skills] After filter: ${filtered.map((entry) => entry.skill.name).join(", ")}`,
+    );
+  }
+  return filtered;
 }
 
 export function applySkillEnvOverrides(params: {
@@ -548,10 +569,16 @@ export function buildWorkspaceSkillSnapshot(
     managedSkillsDir?: string;
     bundledSkillsDir?: string;
     entries?: SkillEntry[];
+    /** If provided, only include skills with these names */
+    skillFilter?: string[];
   },
 ): SkillSnapshot {
   const skillEntries = opts?.entries ?? loadSkillEntries(workspaceDir, opts);
-  const eligible = filterSkillEntries(skillEntries, opts?.config);
+  const eligible = filterSkillEntries(
+    skillEntries,
+    opts?.config,
+    opts?.skillFilter,
+  );
   const resolvedSkills = eligible.map((entry) => entry.skill);
   return {
     prompt: formatSkillsForPrompt(resolvedSkills),
@@ -570,11 +597,35 @@ export function buildWorkspaceSkillsPrompt(
     managedSkillsDir?: string;
     bundledSkillsDir?: string;
     entries?: SkillEntry[];
+    /** If provided, only include skills with these names */
+    skillFilter?: string[];
   },
 ): string {
   const skillEntries = opts?.entries ?? loadSkillEntries(workspaceDir, opts);
-  const eligible = filterSkillEntries(skillEntries, opts?.config);
+  const eligible = filterSkillEntries(
+    skillEntries,
+    opts?.config,
+    opts?.skillFilter,
+  );
   return formatSkillsForPrompt(eligible.map((entry) => entry.skill));
+}
+
+export function resolveSkillsPromptForRun(params: {
+  skillsSnapshot?: SkillSnapshot;
+  entries?: SkillEntry[];
+  config?: ClawdbotConfig;
+  workspaceDir: string;
+}): string {
+  const snapshotPrompt = params.skillsSnapshot?.prompt?.trim();
+  if (snapshotPrompt) return snapshotPrompt;
+  if (params.entries && params.entries.length > 0) {
+    const prompt = buildWorkspaceSkillsPrompt(params.workspaceDir, {
+      entries: params.entries,
+      config: params.config,
+    });
+    return prompt.trim() ? prompt : "";
+  }
+  return "";
 }
 
 export function loadWorkspaceSkillEntries(
@@ -586,6 +637,41 @@ export function loadWorkspaceSkillEntries(
   },
 ): SkillEntry[] {
   return loadSkillEntries(workspaceDir, opts);
+}
+
+export async function syncSkillsToWorkspace(params: {
+  sourceWorkspaceDir: string;
+  targetWorkspaceDir: string;
+  config?: ClawdbotConfig;
+  managedSkillsDir?: string;
+  bundledSkillsDir?: string;
+}) {
+  const sourceDir = resolveUserPath(params.sourceWorkspaceDir);
+  const targetDir = resolveUserPath(params.targetWorkspaceDir);
+  if (sourceDir === targetDir) return;
+  const targetSkillsDir = path.join(targetDir, "skills");
+
+  const entries = loadSkillEntries(sourceDir, {
+    config: params.config,
+    managedSkillsDir: params.managedSkillsDir,
+    bundledSkillsDir: params.bundledSkillsDir,
+  });
+
+  await fsp.rm(targetSkillsDir, { recursive: true, force: true });
+  await fsp.mkdir(targetSkillsDir, { recursive: true });
+
+  for (const entry of entries) {
+    const dest = path.join(targetSkillsDir, entry.skill.name);
+    try {
+      await fsp.cp(entry.skill.baseDir, dest, { recursive: true, force: true });
+    } catch (error) {
+      const message =
+        error instanceof Error ? error.message : JSON.stringify(error);
+      console.warn(
+        `[skills] Failed to copy ${entry.skill.name} to sandbox: ${message}`,
+      );
+    }
+  }
 }
 
 export function filterWorkspaceSkillEntries(

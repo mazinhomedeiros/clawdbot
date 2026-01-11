@@ -11,19 +11,24 @@ import {
 } from "../agents/workspace.js";
 import type { ClawdbotConfig } from "../config/config.js";
 import { CONFIG_PATH_CLAWDBOT } from "../config/config.js";
-import { resolveSessionTranscriptsDir } from "../config/sessions.js";
+import { resolveSessionTranscriptsDirForAgent } from "../config/sessions.js";
 import { callGateway } from "../gateway/call.js";
 import { normalizeControlUiBasePath } from "../gateway/control-ui.js";
 import { pickPrimaryTailnetIPv4 } from "../infra/tailnet.js";
 import { runCommandWithTimeout } from "../process/exec.js";
 import type { RuntimeEnv } from "../runtime.js";
+import { stylePromptTitle } from "../terminal/prompt-style.js";
 import { CONFIG_DIR, resolveUserPath } from "../utils.js";
 import { VERSION } from "../version.js";
-import type { NodeManagerChoice, ResetScope } from "./onboard-types.js";
+import type {
+  NodeManagerChoice,
+  OnboardMode,
+  ResetScope,
+} from "./onboard-types.js";
 
 export function guardCancel<T>(value: T, runtime: RuntimeEnv): T {
   if (isCancel(value)) {
-    cancel("Setup cancelled.");
+    cancel(stylePromptTitle("Setup cancelled.") ?? "Setup cancelled.");
     runtime.exit(0);
   }
   return value;
@@ -31,13 +36,13 @@ export function guardCancel<T>(value: T, runtime: RuntimeEnv): T {
 
 export function summarizeExistingConfig(config: ClawdbotConfig): string {
   const rows: string[] = [];
-  if (config.agent?.workspace)
-    rows.push(`workspace: ${config.agent.workspace}`);
-  if (config.agent?.model) {
+  const defaults = config.agents?.defaults;
+  if (defaults?.workspace) rows.push(`workspace: ${defaults.workspace}`);
+  if (defaults?.model) {
     const model =
-      typeof config.agent.model === "string"
-        ? config.agent.model
-        : config.agent.model.primary;
+      typeof defaults.model === "string"
+        ? defaults.model
+        : defaults.model.primary;
     if (model) rows.push(`model: ${model}`);
   }
   if (config.gateway?.mode) rows.push(`gateway.mode: ${config.gateway.mode}`);
@@ -72,7 +77,7 @@ export function printWizardHeader(runtime: RuntimeEnv) {
 
 export function applyWizardMetadata(
   cfg: ClawdbotConfig,
-  params: { command: string; mode: "local" | "remote" },
+  params: { command: string; mode: OnboardMode },
 ): ClawdbotConfig {
   const commit =
     process.env.GIT_COMMIT?.trim() || process.env.GIT_SHA?.trim() || undefined;
@@ -195,6 +200,9 @@ export function formatControlUiSshHint(params: {
     "Then open:",
     localUrl,
     authedUrl,
+    "Docs:",
+    "https://docs.clawd.bot/gateway/remote",
+    "https://docs.clawd.bot/web/control-ui",
   ]
     .filter(Boolean)
     .join("\n");
@@ -223,14 +231,14 @@ export async function openUrl(url: string): Promise<boolean> {
 export async function ensureWorkspaceAndSessions(
   workspaceDir: string,
   runtime: RuntimeEnv,
-  options?: { skipBootstrap?: boolean },
+  options?: { skipBootstrap?: boolean; agentId?: string },
 ) {
   const ws = await ensureAgentWorkspace({
     dir: workspaceDir,
     ensureBootstrapFiles: !options?.skipBootstrap,
   });
   runtime.log(`Workspace OK: ${ws.dir}`);
-  const sessionsDir = resolveSessionTranscriptsDir();
+  const sessionsDir = resolveSessionTranscriptsDirForAgent(options?.agentId);
   await fs.mkdir(sessionsDir, { recursive: true });
   runtime.log(`Sessions OK: ${sessionsDir}`);
 }
@@ -272,7 +280,7 @@ export async function handleReset(
   await moveToTrash(CONFIG_PATH_CLAWDBOT, runtime);
   if (scope === "config") return;
   await moveToTrash(path.join(CONFIG_DIR, "credentials"), runtime);
-  await moveToTrash(resolveSessionTranscriptsDir(), runtime);
+  await moveToTrash(resolveSessionTranscriptsDirForAgent(), runtime);
   if (scope === "full") {
     await moveToTrash(workspaceDir, runtime);
   }

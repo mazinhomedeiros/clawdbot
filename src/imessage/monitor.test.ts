@@ -78,9 +78,8 @@ beforeEach(() => {
       groups: { "*": { requireMention: true } },
     },
     session: { mainKey: "main" },
-    routing: {
+    messages: {
       groupChat: { mentionPatterns: ["@clawd"] },
-      allowFrom: [],
     },
   };
   requestMock.mockReset().mockImplementation((method: string) => {
@@ -159,7 +158,7 @@ describe("monitorIMessageProvider", () => {
   it("allows group messages when requireMention is true but no mentionPatterns exist", async () => {
     config = {
       ...config,
-      routing: { groupChat: { mentionPatterns: [] }, allowFrom: [] },
+      messages: { groupChat: { mentionPatterns: [] } },
       imessage: { groups: { "*": { requireMention: true } } },
     };
     const run = monitorIMessageProvider();
@@ -214,6 +213,46 @@ describe("monitorIMessageProvider", () => {
 
     expect(replyMock).not.toHaveBeenCalled();
     expect(sendMock).not.toHaveBeenCalled();
+  });
+
+  it("treats configured chat_id as a group session even when is_group is false", async () => {
+    config = {
+      ...config,
+      imessage: {
+        dmPolicy: "open",
+        allowFrom: ["*"],
+        groups: { "2": { requireMention: false } },
+      },
+    };
+
+    const run = monitorIMessageProvider();
+    await waitForSubscribe();
+
+    notificationHandler?.({
+      method: "message",
+      params: {
+        message: {
+          id: 14,
+          chat_id: 2,
+          sender: "+15550001111",
+          is_from_me: false,
+          text: "hello",
+          is_group: false,
+        },
+      },
+    });
+
+    await flush();
+    closeResolve?.();
+    await run;
+
+    expect(replyMock).toHaveBeenCalled();
+    const ctx = replyMock.mock.calls[0]?.[0] as {
+      ChatType?: string;
+      SessionKey?: string;
+    };
+    expect(ctx.ChatType).toBe("group");
+    expect(ctx.SessionKey).toBe("agent:main:imessage:group:2");
   });
 
   it("prefixes tool and final replies with responsePrefix", async () => {
@@ -284,6 +323,9 @@ describe("monitorIMessageProvider", () => {
     expect(replyMock).not.toHaveBeenCalled();
     expect(upsertPairingRequestMock).toHaveBeenCalled();
     expect(sendMock).toHaveBeenCalledTimes(1);
+    expect(String(sendMock.mock.calls[0]?.[1] ?? "")).toContain(
+      "Your iMessage sender id: +15550001111",
+    );
     expect(String(sendMock.mock.calls[0]?.[1] ?? "")).toContain(
       "Pairing code: PAIRCODE",
     );
@@ -411,5 +453,41 @@ describe("monitorIMessageProvider", () => {
         to: "chat_id:7",
       }),
     );
+  });
+
+  it("does not trigger unhandledRejection when aborting during shutdown", async () => {
+    requestMock.mockImplementation((method: string) => {
+      if (method === "watch.subscribe")
+        return Promise.resolve({ subscription: 1 });
+      if (method === "watch.unsubscribe")
+        return Promise.reject(new Error("imsg rpc closed"));
+      return Promise.resolve({});
+    });
+
+    const abortController = new AbortController();
+    const unhandled: unknown[] = [];
+    const onUnhandled = (reason: unknown) => {
+      unhandled.push(reason);
+    };
+    process.on("unhandledRejection", onUnhandled);
+
+    try {
+      const run = monitorIMessageProvider({
+        abortSignal: abortController.signal,
+      });
+      await waitForSubscribe();
+      await flush();
+
+      abortController.abort();
+      await flush();
+
+      closeResolve?.();
+      await run;
+    } finally {
+      process.off("unhandledRejection", onUnhandled);
+    }
+
+    expect(unhandled).toHaveLength(0);
+    expect(stopMock).toHaveBeenCalled();
   });
 });

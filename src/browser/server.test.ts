@@ -707,6 +707,50 @@ describe("browser control server", () => {
     expect(started.error ?? "").toMatch(/attachOnly/i);
   });
 
+  it("allows attachOnly servers to ensure reachability via callback", async () => {
+    cfgAttachOnly = true;
+    reachable = false;
+    const { startBrowserBridgeServer } = await import("./bridge-server.js");
+
+    const ensured = vi.fn(async () => {
+      reachable = true;
+    });
+
+    const bridge = await startBrowserBridgeServer({
+      resolved: {
+        enabled: true,
+        controlUrl: "http://127.0.0.1:0",
+        controlHost: "127.0.0.1",
+        controlPort: 0,
+        cdpProtocol: "http",
+        cdpHost: "127.0.0.1",
+        cdpIsLoopback: true,
+        color: "#FF4500",
+        headless: true,
+        noSandbox: false,
+        attachOnly: true,
+        defaultProfile: "clawd",
+        profiles: {
+          clawd: { cdpPort: testPort + 1, color: "#FF4500" },
+        },
+      },
+      onEnsureAttachTarget: ensured,
+    });
+
+    const started = (await realFetch(`${bridge.baseUrl}/start`, {
+      method: "POST",
+    }).then((r) => r.json())) as { ok?: boolean; error?: string };
+    expect(started.error).toBeUndefined();
+    expect(started.ok).toBe(true);
+    const status = (await realFetch(`${bridge.baseUrl}/`).then((r) =>
+      r.json(),
+    )) as { running?: boolean };
+    expect(status.running).toBe(true);
+    expect(ensured).toHaveBeenCalledTimes(1);
+
+    await new Promise<void>((resolve) => bridge.server.close(() => resolve()));
+  });
+
   it("opens tabs via CDP createTarget path", async () => {
     const { startBrowserControlServerFromConfig } = await import("./server.js");
     await startBrowserControlServerFromConfig();
@@ -893,6 +937,61 @@ describe("backward compatibility (profile parameter)", () => {
     expect(Array.isArray(result.profiles)).toBe(true);
     // Should at least have the default clawd profile
     expect(result.profiles.some((p) => p.name === "clawd")).toBe(true);
+  });
+
+  it("GET /tabs?profile=clawd returns tabs for specified profile", async () => {
+    const { startBrowserControlServerFromConfig } = await import("./server.js");
+    await startBrowserControlServerFromConfig();
+    const base = `http://127.0.0.1:${testPort}`;
+
+    await realFetch(`${base}/start`, { method: "POST" });
+
+    const result = (await realFetch(`${base}/tabs?profile=clawd`).then((r) =>
+      r.json(),
+    )) as { running: boolean; tabs: unknown[] };
+    expect(result.running).toBe(true);
+    expect(Array.isArray(result.tabs)).toBe(true);
+  });
+
+  it("POST /tabs/open?profile=clawd opens tab in specified profile", async () => {
+    const { startBrowserControlServerFromConfig } = await import("./server.js");
+    await startBrowserControlServerFromConfig();
+    const base = `http://127.0.0.1:${testPort}`;
+
+    await realFetch(`${base}/start`, { method: "POST" });
+
+    const result = (await realFetch(`${base}/tabs/open?profile=clawd`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ url: "https://example.com" }),
+    }).then((r) => r.json())) as { targetId?: string };
+    expect(result.targetId).toBe("newtab1");
+  });
+
+  it("GET /tabs?profile=unknown returns 404", async () => {
+    const { startBrowserControlServerFromConfig } = await import("./server.js");
+    await startBrowserControlServerFromConfig();
+    const base = `http://127.0.0.1:${testPort}`;
+
+    const result = await realFetch(`${base}/tabs?profile=unknown`);
+    expect(result.status).toBe(404);
+    const body = (await result.json()) as { error: string };
+    expect(body.error).toContain("not found");
+  });
+
+  it("POST /tabs/open?profile=unknown returns 404", async () => {
+    const { startBrowserControlServerFromConfig } = await import("./server.js");
+    await startBrowserControlServerFromConfig();
+    const base = `http://127.0.0.1:${testPort}`;
+
+    const result = await realFetch(`${base}/tabs/open?profile=unknown`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ url: "https://example.com" }),
+    });
+    expect(result.status).toBe(404);
+    const body = (await result.json()) as { error: string };
+    expect(body.error).toContain("not found");
   });
 });
 

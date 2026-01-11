@@ -1,4 +1,5 @@
 import { describe, expect, test } from "vitest";
+import { resolveMainSessionKeyFromConfig } from "../config/sessions.js";
 import { drainSystemEvents, peekSystemEvents } from "../infra/system-events.js";
 import {
   cronIsolatedRun,
@@ -10,6 +11,8 @@ import {
 } from "./test-helpers.js";
 
 installGatewayTestHooks();
+
+const resolveMainKey = () => resolveMainSessionKeyFromConfig();
 
 describe("gateway server hooks", () => {
   test("hooks wake requires auth", async () => {
@@ -40,7 +43,7 @@ describe("gateway server hooks", () => {
     expect(res.status).toBe(200);
     const events = await waitForSystemEvent();
     expect(events.some((e) => e.includes("Ping"))).toBe(true);
-    drainSystemEvents();
+    drainSystemEvents(resolveMainKey());
     await server.close();
   });
 
@@ -63,7 +66,38 @@ describe("gateway server hooks", () => {
     expect(res.status).toBe(202);
     const events = await waitForSystemEvent();
     expect(events.some((e) => e.includes("Hook Email: done"))).toBe(true);
-    drainSystemEvents();
+    drainSystemEvents(resolveMainKey());
+    await server.close();
+  });
+
+  test("hooks agent forwards model override", async () => {
+    testState.hooksConfig = { enabled: true, token: "hook-secret" };
+    cronIsolatedRun.mockClear();
+    cronIsolatedRun.mockResolvedValueOnce({
+      status: "ok",
+      summary: "done",
+    });
+    const port = await getFreePort();
+    const server = await startGatewayServer(port);
+    const res = await fetch(`http://127.0.0.1:${port}/hooks/agent`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: "Bearer hook-secret",
+      },
+      body: JSON.stringify({
+        message: "Do it",
+        name: "Email",
+        model: "openai/gpt-4.1-mini",
+      }),
+    });
+    expect(res.status).toBe(202);
+    await waitForSystemEvent();
+    const call = cronIsolatedRun.mock.calls[0]?.[0] as {
+      job?: { payload?: { model?: string } };
+    };
+    expect(call?.job?.payload?.model).toBe("openai/gpt-4.1-mini");
+    drainSystemEvents(resolveMainKey());
     await server.close();
   });
 
@@ -82,7 +116,7 @@ describe("gateway server hooks", () => {
     expect(res.status).toBe(200);
     const events = await waitForSystemEvent();
     expect(events.some((e) => e.includes("Query auth"))).toBe(true);
-    drainSystemEvents();
+    drainSystemEvents(resolveMainKey());
     await server.close();
   });
 
@@ -99,7 +133,7 @@ describe("gateway server hooks", () => {
       body: JSON.stringify({ message: "Nope", provider: "sms" }),
     });
     expect(res.status).toBe(400);
-    expect(peekSystemEvents().length).toBe(0);
+    expect(peekSystemEvents(resolveMainKey()).length).toBe(0);
     await server.close();
   });
 
@@ -118,7 +152,7 @@ describe("gateway server hooks", () => {
     expect(res.status).toBe(200);
     const events = await waitForSystemEvent();
     expect(events.some((e) => e.includes("Header auth"))).toBe(true);
-    drainSystemEvents();
+    drainSystemEvents(resolveMainKey());
     await server.close();
   });
 

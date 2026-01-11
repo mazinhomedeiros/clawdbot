@@ -1,15 +1,7 @@
 import { randomUUID } from "node:crypto";
 import fs from "node:fs";
-import { DEFAULT_MODEL, DEFAULT_PROVIDER } from "../agents/defaults.js";
 import type { ModelCatalogEntry } from "../agents/model-catalog.js";
-import {
-  buildAllowedModelSet,
-  buildModelAliasIndex,
-  modelKey,
-  resolveConfiguredModelRef,
-  resolveModelRefFromString,
-  resolveThinkingDefault,
-} from "../agents/model-selection.js";
+import { resolveThinkingDefault } from "../agents/model-selection.js";
 import {
   abortEmbeddedPiRun,
   isEmbeddedPiRunActive,
@@ -17,12 +9,6 @@ import {
   waitForEmbeddedPiRunEnd,
 } from "../agents/pi-embedded.js";
 import { resolveAgentTimeoutMs } from "../agents/timeout.js";
-import { normalizeGroupActivation } from "../auto-reply/group-activation.js";
-import {
-  normalizeElevatedLevel,
-  normalizeThinkLevel,
-  normalizeVerboseLevel,
-} from "../auto-reply/thinking.js";
 import type { CliDeps } from "../cli/deps.js";
 import { agentCommand } from "../commands/agent.js";
 import type { HealthSummary } from "../commands/health.js";
@@ -37,8 +23,8 @@ import {
 import { buildConfigSchema } from "../config/schema.js";
 import {
   loadSessionStore,
-  resolveMainSessionKey,
-  resolveStorePath,
+  mergeSessionEntry,
+  resolveMainSessionKeyFromConfig,
   type SessionEntry,
   saveSessionStore,
 } from "../config/sessions.js";
@@ -48,10 +34,19 @@ import {
   setVoiceWakeTriggers,
 } from "../infra/voicewake.js";
 import { clearCommandLane } from "../process/command-queue.js";
-import { isSubagentSessionKey } from "../routing/session-key.js";
+import { normalizeMainKey } from "../routing/session-key.js";
 import { defaultRuntime } from "../runtime.js";
-import { normalizeSendPolicy } from "../sessions/send-policy.js";
-import { buildMessageWithAttachments } from "./chat-attachments.js";
+import {
+  abortChatRunById,
+  abortChatRunsForSessionKey,
+  type ChatAbortControllerEntry,
+  isChatStopCommandText,
+  resolveChatRunExpiresAtMs,
+} from "./chat-abort.js";
+import {
+  type ChatImageContent,
+  parseMessageWithAttachments,
+} from "./chat-attachments.js";
 import {
   ErrorCodes,
   errorShape,
@@ -61,6 +56,7 @@ import {
   type SessionsListParams,
   type SessionsPatchParams,
   type SessionsResetParams,
+  type SessionsResolveParams,
   validateChatAbortParams,
   validateChatHistoryParams,
   validateChatSendParams,
@@ -73,6 +69,7 @@ import {
   validateSessionsListParams,
   validateSessionsPatchParams,
   validateSessionsResetParams,
+  validateSessionsResolveParams,
   validateTalkModeParams,
 } from "./protocol/index.js";
 import type { ChatRunEntry } from "./server-chat.js";
@@ -86,12 +83,16 @@ import {
   archiveFileOnDisk,
   capArrayByJsonBytes,
   listSessionsFromStore,
+  loadCombinedSessionStoreForGateway,
   loadSessionEntry,
   readSessionMessages,
+  resolveGatewaySessionStoreTarget,
   resolveSessionModelRef,
   resolveSessionTranscriptCandidates,
   type SessionsPatchResult,
 } from "./session-utils.js";
+import { applySessionsPatchToStore } from "./sessions-patch.js";
+import { resolveSessionKeyFromResolveParams } from "./sessions-resolve.js";
 import { formatForLog } from "./ws-log.js";
 
 export type BridgeHandlersContext = {
@@ -115,10 +116,8 @@ export type BridgeHandlersContext = {
     clientRunId: string,
     sessionKey?: string,
   ) => ChatRunEntry | undefined;
-  chatAbortControllers: Map<
-    string,
-    { controller: AbortController; sessionId: string; sessionKey: string }
-  >;
+  chatAbortControllers: Map<string, ChatAbortControllerEntry>;
+  chatAbortedRuns: Map<string, number>;
   chatRunBuffers: Map<string, string>;
   chatDeltaSentAt: Map<string, number>;
   dedupe: Map<string, DedupeEntry>;
@@ -303,8 +302,7 @@ export function createBridgeHandlers(ctx: BridgeHandlersContext) {
           }
           const p = params as SessionsListParams;
           const cfg = loadConfig();
-          const storePath = resolveStorePath(cfg.session?.store);
-          const store = loadSessionStore(storePath);
+          const { storePath, store } = loadCombinedSessionStoreForGateway(cfg);
           const result = listSessionsFromStore({
             cfg,
             storePath,
@@ -312,6 +310,36 @@ export function createBridgeHandlers(ctx: BridgeHandlersContext) {
             opts: p,
           });
           return { ok: true, payloadJSON: JSON.stringify(result) };
+        }
+        case "sessions.resolve": {
+          const params = parseParams();
+          if (!validateSessionsResolveParams(params)) {
+            return {
+              ok: false,
+              error: {
+                code: ErrorCodes.INVALID_REQUEST,
+                message: `invalid sessions.resolve params: ${formatValidationErrors(validateSessionsResolveParams.errors)}`,
+              },
+            };
+          }
+
+          const p = params as SessionsResolveParams;
+          const cfg = loadConfig();
+          const resolved = resolveSessionKeyFromResolveParams({ cfg, p });
+          if (!resolved.ok) {
+            return {
+              ok: false,
+              error: {
+                code: resolved.error.code,
+                message: resolved.error.message,
+                details: resolved.error.details,
+              },
+            };
+          }
+          return {
+            ok: true,
+            payloadJSON: JSON.stringify({ ok: true, key: resolved.key }),
+          };
         }
         case "sessions.patch": {
           const params = parseParams();
@@ -338,234 +366,40 @@ export function createBridgeHandlers(ctx: BridgeHandlersContext) {
           }
 
           const cfg = loadConfig();
-          const storePath = resolveStorePath(cfg.session?.store);
+          const target = resolveGatewaySessionStoreTarget({ cfg, key });
+          const storePath = target.storePath;
           const store = loadSessionStore(storePath);
-          const now = Date.now();
-
-          const existing = store[key];
-          const next: SessionEntry = existing
-            ? {
-                ...existing,
-                updatedAt: Math.max(existing.updatedAt ?? 0, now),
-              }
-            : { sessionId: randomUUID(), updatedAt: now };
-
-          if ("spawnedBy" in p) {
-            const raw = p.spawnedBy;
-            if (raw === null) {
-              if (existing?.spawnedBy) {
-                return {
-                  ok: false,
-                  error: {
-                    code: ErrorCodes.INVALID_REQUEST,
-                    message: "spawnedBy cannot be cleared once set",
-                  },
-                };
-              }
-            } else if (raw !== undefined) {
-              const trimmed = String(raw).trim();
-              if (!trimmed) {
-                return {
-                  ok: false,
-                  error: {
-                    code: ErrorCodes.INVALID_REQUEST,
-                    message: "invalid spawnedBy: empty",
-                  },
-                };
-              }
-              if (!isSubagentSessionKey(key)) {
-                return {
-                  ok: false,
-                  error: {
-                    code: ErrorCodes.INVALID_REQUEST,
-                    message:
-                      "spawnedBy is only supported for subagent:* sessions",
-                  },
-                };
-              }
-              if (existing?.spawnedBy && existing.spawnedBy !== trimmed) {
-                return {
-                  ok: false,
-                  error: {
-                    code: ErrorCodes.INVALID_REQUEST,
-                    message: "spawnedBy cannot be changed once set",
-                  },
-                };
-              }
-              next.spawnedBy = trimmed;
-            }
+          const primaryKey = target.storeKeys[0] ?? key;
+          const existingKey = target.storeKeys.find(
+            (candidate) => store[candidate],
+          );
+          if (existingKey && existingKey !== primaryKey && !store[primaryKey]) {
+            store[primaryKey] = store[existingKey];
+            delete store[existingKey];
           }
-
-          if ("thinkingLevel" in p) {
-            const raw = p.thinkingLevel;
-            if (raw === null) {
-              delete next.thinkingLevel;
-            } else if (raw !== undefined) {
-              const normalized = normalizeThinkLevel(String(raw));
-              if (!normalized) {
-                return {
-                  ok: false,
-                  error: {
-                    code: ErrorCodes.INVALID_REQUEST,
-                    message: `invalid thinkingLevel: ${String(raw)}`,
-                  },
-                };
-              }
-              next.thinkingLevel = normalized;
-            }
+          const applied = await applySessionsPatchToStore({
+            cfg,
+            store,
+            storeKey: primaryKey,
+            patch: p,
+            loadGatewayModelCatalog: ctx.loadGatewayModelCatalog,
+          });
+          if (!applied.ok) {
+            return {
+              ok: false,
+              error: {
+                code: applied.error.code,
+                message: applied.error.message,
+                details: applied.error.details,
+              },
+            };
           }
-
-          if ("verboseLevel" in p) {
-            const raw = p.verboseLevel;
-            if (raw === null) {
-              delete next.verboseLevel;
-            } else if (raw !== undefined) {
-              const normalized = normalizeVerboseLevel(String(raw));
-              if (!normalized) {
-                return {
-                  ok: false,
-                  error: {
-                    code: ErrorCodes.INVALID_REQUEST,
-                    message: `invalid verboseLevel: ${String(raw)}`,
-                  },
-                };
-              }
-              next.verboseLevel = normalized;
-            }
-          }
-
-          if ("elevatedLevel" in p) {
-            const raw = p.elevatedLevel;
-            if (raw === null) {
-              delete next.elevatedLevel;
-            } else if (raw !== undefined) {
-              const normalized = normalizeElevatedLevel(String(raw));
-              if (!normalized) {
-                return {
-                  ok: false,
-                  error: {
-                    code: ErrorCodes.INVALID_REQUEST,
-                    message: `invalid elevatedLevel: ${String(raw)}`,
-                  },
-                };
-              }
-              next.elevatedLevel = normalized;
-            }
-          }
-
-          if ("model" in p) {
-            const raw = p.model;
-            if (raw === null) {
-              delete next.providerOverride;
-              delete next.modelOverride;
-            } else if (raw !== undefined) {
-              const trimmed = String(raw).trim();
-              if (!trimmed) {
-                return {
-                  ok: false,
-                  error: {
-                    code: ErrorCodes.INVALID_REQUEST,
-                    message: "invalid model: empty",
-                  },
-                };
-              }
-              const resolvedDefault = resolveConfiguredModelRef({
-                cfg,
-                defaultProvider: DEFAULT_PROVIDER,
-                defaultModel: DEFAULT_MODEL,
-              });
-              const aliasIndex = buildModelAliasIndex({
-                cfg,
-                defaultProvider: resolvedDefault.provider,
-              });
-              const resolved = resolveModelRefFromString({
-                raw: trimmed,
-                defaultProvider: resolvedDefault.provider,
-                aliasIndex,
-              });
-              if (!resolved) {
-                return {
-                  ok: false,
-                  error: {
-                    code: ErrorCodes.INVALID_REQUEST,
-                    message: `invalid model: ${trimmed}`,
-                  },
-                };
-              }
-              const catalog = await ctx.loadGatewayModelCatalog();
-              const allowed = buildAllowedModelSet({
-                cfg,
-                catalog,
-                defaultProvider: resolvedDefault.provider,
-              });
-              const key = modelKey(resolved.ref.provider, resolved.ref.model);
-              if (!allowed.allowAny && !allowed.allowedKeys.has(key)) {
-                return {
-                  ok: false,
-                  error: {
-                    code: ErrorCodes.INVALID_REQUEST,
-                    message: `model not allowed: ${key}`,
-                  },
-                };
-              }
-              if (
-                resolved.ref.provider === resolvedDefault.provider &&
-                resolved.ref.model === resolvedDefault.model
-              ) {
-                delete next.providerOverride;
-                delete next.modelOverride;
-              } else {
-                next.providerOverride = resolved.ref.provider;
-                next.modelOverride = resolved.ref.model;
-              }
-            }
-          }
-
-          if ("sendPolicy" in p) {
-            const raw = p.sendPolicy;
-            if (raw === null) {
-              delete next.sendPolicy;
-            } else if (raw !== undefined) {
-              const normalized = normalizeSendPolicy(String(raw));
-              if (!normalized) {
-                return {
-                  ok: false,
-                  error: {
-                    code: ErrorCodes.INVALID_REQUEST,
-                    message: 'invalid sendPolicy (use "allow"|"deny")',
-                  },
-                };
-              }
-              next.sendPolicy = normalized;
-            }
-          }
-
-          if ("groupActivation" in p) {
-            const raw = p.groupActivation;
-            if (raw === null) {
-              delete next.groupActivation;
-            } else if (raw !== undefined) {
-              const normalized = normalizeGroupActivation(String(raw));
-              if (!normalized) {
-                return {
-                  ok: false,
-                  error: {
-                    code: ErrorCodes.INVALID_REQUEST,
-                    message: `invalid groupActivation: ${String(raw)}`,
-                  },
-                };
-              }
-              next.groupActivation = normalized;
-            }
-          }
-
-          store[key] = next;
           await saveSessionStore(storePath, store);
           const payload: SessionsPatchResult = {
             ok: true,
             path: storePath,
-            key,
-            entry: next,
+            key: target.canonicalKey,
+            entry: applied.entry,
           };
           return { ok: true, payloadJSON: JSON.stringify(payload) };
         }
@@ -602,9 +436,11 @@ export function createBridgeHandlers(ctx: BridgeHandlersContext) {
             abortedLastRun: false,
             thinkingLevel: entry?.thinkingLevel,
             verboseLevel: entry?.verboseLevel,
+            reasoningLevel: entry?.reasoningLevel,
             model: entry?.model,
             contextTokens: entry?.contextTokens,
             sendPolicy: entry?.sendPolicy,
+            label: entry?.label,
             displayName: entry?.displayName,
             chatType: entry?.chatType,
             provider: entry?.provider,
@@ -646,7 +482,7 @@ export function createBridgeHandlers(ctx: BridgeHandlersContext) {
             };
           }
 
-          const mainKey = resolveMainSessionKey(loadConfig());
+          const mainKey = resolveMainSessionKeyFromConfig();
           if (key === mainKey) {
             return {
               ok: false,
@@ -685,6 +521,7 @@ export function createBridgeHandlers(ctx: BridgeHandlersContext) {
             for (const candidate of resolveSessionTranscriptCandidates(
               sessionId,
               storePath,
+              entry?.sessionFile,
             )) {
               if (!fs.existsSync(candidate)) continue;
               try {
@@ -751,6 +588,7 @@ export function createBridgeHandlers(ctx: BridgeHandlersContext) {
           const filePath = resolveSessionTranscriptCandidates(
             sessionId,
             storePath,
+            entry?.sessionFile,
           ).find((candidate) => fs.existsSync(candidate));
           if (!filePath) {
             return {
@@ -821,7 +659,7 @@ export function createBridgeHandlers(ctx: BridgeHandlersContext) {
           const sessionId = entry?.sessionId;
           const rawMessages =
             sessionId && storePath
-              ? readSessionMessages(sessionId, storePath)
+              ? readSessionMessages(sessionId, storePath, entry?.sessionFile)
               : [];
           const max = typeof limit === "number" ? limit : 200;
           const sliced =
@@ -832,7 +670,7 @@ export function createBridgeHandlers(ctx: BridgeHandlersContext) {
           ).items;
           let thinkingLevel = entry?.thinkingLevel;
           if (!thinkingLevel) {
-            const configured = cfg.agent?.thinkingDefault;
+            const configured = cfg.agents?.defaults?.thinkingDefault;
             if (configured) {
               thinkingLevel = configured;
             } else {
@@ -870,13 +708,41 @@ export function createBridgeHandlers(ctx: BridgeHandlersContext) {
 
           const { sessionKey, runId } = params as {
             sessionKey: string;
-            runId: string;
+            runId?: string;
           };
+          const ops = {
+            chatAbortControllers: ctx.chatAbortControllers,
+            chatRunBuffers: ctx.chatRunBuffers,
+            chatDeltaSentAt: ctx.chatDeltaSentAt,
+            chatAbortedRuns: ctx.chatAbortedRuns,
+            removeChatRun: ctx.removeChatRun,
+            agentRunSeq: ctx.agentRunSeq,
+            broadcast: ctx.broadcast,
+            bridgeSendToSession: ctx.bridgeSendToSession,
+          };
+          if (!runId) {
+            const res = abortChatRunsForSessionKey(ops, {
+              sessionKey,
+              stopReason: "rpc",
+            });
+            return {
+              ok: true,
+              payloadJSON: JSON.stringify({
+                ok: true,
+                aborted: res.aborted,
+                runIds: res.runIds,
+              }),
+            };
+          }
           const active = ctx.chatAbortControllers.get(runId);
           if (!active) {
             return {
               ok: true,
-              payloadJSON: JSON.stringify({ ok: true, aborted: false }),
+              payloadJSON: JSON.stringify({
+                ok: true,
+                aborted: false,
+                runIds: [],
+              }),
             };
           }
           if (active.sessionKey !== sessionKey) {
@@ -888,24 +754,18 @@ export function createBridgeHandlers(ctx: BridgeHandlersContext) {
               },
             };
           }
-
-          active.controller.abort();
-          ctx.chatAbortControllers.delete(runId);
-          ctx.chatRunBuffers.delete(runId);
-          ctx.chatDeltaSentAt.delete(runId);
-          ctx.removeChatRun(runId, runId, sessionKey);
-
-          const payload = {
+          const res = abortChatRunById(ops, {
             runId,
             sessionKey,
-            seq: (ctx.agentRunSeq.get(runId) ?? 0) + 1,
-            state: "aborted" as const,
-          };
-          ctx.broadcast("chat", payload);
-          ctx.bridgeSendToSession(sessionKey, "chat", payload);
+            stopReason: "rpc",
+          });
           return {
             ok: true,
-            payloadJSON: JSON.stringify({ ok: true, aborted: true }),
+            payloadJSON: JSON.stringify({
+              ok: true,
+              aborted: res.aborted,
+              runIds: res.aborted ? [runId] : [],
+            }),
           };
         }
         case "chat.send": {
@@ -934,33 +794,39 @@ export function createBridgeHandlers(ctx: BridgeHandlersContext) {
             timeoutMs?: number;
             idempotencyKey: string;
           };
+          const stopCommand = isChatStopCommandText(p.message);
           const normalizedAttachments =
-            p.attachments?.map((a) => ({
-              type: typeof a?.type === "string" ? a.type : undefined,
-              mimeType:
-                typeof a?.mimeType === "string" ? a.mimeType : undefined,
-              fileName:
-                typeof a?.fileName === "string" ? a.fileName : undefined,
-              content:
-                typeof a?.content === "string"
-                  ? a.content
-                  : ArrayBuffer.isView(a?.content)
-                    ? Buffer.from(
-                        a.content.buffer,
-                        a.content.byteOffset,
-                        a.content.byteLength,
-                      ).toString("base64")
-                    : undefined,
-            })) ?? [];
+            p.attachments
+              ?.map((a) => ({
+                type: typeof a?.type === "string" ? a.type : undefined,
+                mimeType:
+                  typeof a?.mimeType === "string" ? a.mimeType : undefined,
+                fileName:
+                  typeof a?.fileName === "string" ? a.fileName : undefined,
+                content:
+                  typeof a?.content === "string"
+                    ? a.content
+                    : ArrayBuffer.isView(a?.content)
+                      ? Buffer.from(
+                          a.content.buffer,
+                          a.content.byteOffset,
+                          a.content.byteLength,
+                        ).toString("base64")
+                      : undefined,
+              }))
+              .filter((a) => a.content) ?? [];
 
-          let messageWithAttachments = p.message;
+          let parsedMessage = p.message;
+          let parsedImages: ChatImageContent[] = [];
           if (normalizedAttachments.length > 0) {
             try {
-              messageWithAttachments = buildMessageWithAttachments(
+              const parsed = await parseMessageWithAttachments(
                 p.message,
                 normalizedAttachments,
-                { maxBytes: 5_000_000 },
+                { maxBytes: 5_000_000, log: ctx.logBridge },
               );
+              parsedMessage = parsed.message;
+              parsedImages = parsed.images;
             } catch (err) {
               return {
                 ok: false,
@@ -981,17 +847,36 @@ export function createBridgeHandlers(ctx: BridgeHandlersContext) {
           });
           const now = Date.now();
           const sessionId = entry?.sessionId ?? randomUUID();
-          const sessionEntry: SessionEntry = {
+          const sessionEntry = mergeSessionEntry(entry, {
             sessionId,
             updatedAt: now,
-            thinkingLevel: entry?.thinkingLevel,
-            verboseLevel: entry?.verboseLevel,
-            systemSent: entry?.systemSent,
-            lastProvider: entry?.lastProvider,
-            lastTo: entry?.lastTo,
-          };
+          });
           const clientRunId = p.idempotencyKey;
           registerAgentRunContext(clientRunId, { sessionKey: p.sessionKey });
+
+          if (stopCommand) {
+            const res = abortChatRunsForSessionKey(
+              {
+                chatAbortControllers: ctx.chatAbortControllers,
+                chatRunBuffers: ctx.chatRunBuffers,
+                chatDeltaSentAt: ctx.chatDeltaSentAt,
+                chatAbortedRuns: ctx.chatAbortedRuns,
+                removeChatRun: ctx.removeChatRun,
+                agentRunSeq: ctx.agentRunSeq,
+                broadcast: ctx.broadcast,
+                bridgeSendToSession: ctx.bridgeSendToSession,
+              },
+              { sessionKey: p.sessionKey, stopReason: "stop" },
+            );
+            return {
+              ok: true,
+              payloadJSON: JSON.stringify({
+                ok: true,
+                aborted: res.aborted,
+                runIds: res.runIds,
+              }),
+            };
+          }
 
           const cached = ctx.dedupe.get(`chat:${clientRunId}`);
           if (cached) {
@@ -1007,12 +892,25 @@ export function createBridgeHandlers(ctx: BridgeHandlersContext) {
             };
           }
 
+          const activeExisting = ctx.chatAbortControllers.get(clientRunId);
+          if (activeExisting) {
+            return {
+              ok: true,
+              payloadJSON: JSON.stringify({
+                runId: clientRunId,
+                status: "in_flight",
+              }),
+            };
+          }
+
           try {
             const abortController = new AbortController();
             ctx.chatAbortControllers.set(clientRunId, {
               controller: abortController,
               sessionId,
               sessionKey: p.sessionKey,
+              startedAtMs: now,
+              expiresAtMs: resolveChatRunExpiresAtMs({ now, timeoutMs }),
             });
             ctx.addChatRun(clientRunId, {
               sessionKey: p.sessionKey,
@@ -1026,10 +924,16 @@ export function createBridgeHandlers(ctx: BridgeHandlersContext) {
               }
             }
 
-            await agentCommand(
+            const ackPayload = {
+              runId: clientRunId,
+              status: "started" as const,
+            };
+            void agentCommand(
               {
-                message: messageWithAttachments,
+                message: parsedMessage,
+                images: parsedImages.length > 0 ? parsedImages : undefined,
                 sessionId,
+                sessionKey: p.sessionKey,
                 runId: clientRunId,
                 thinking: p.thinking,
                 deliver: p.deliver,
@@ -1039,17 +943,32 @@ export function createBridgeHandlers(ctx: BridgeHandlersContext) {
               },
               defaultRuntime,
               ctx.deps,
-            );
-            const payload = {
-              runId: clientRunId,
-              status: "ok" as const,
-            };
-            ctx.dedupe.set(`chat:${clientRunId}`, {
-              ts: Date.now(),
-              ok: true,
-              payload,
-            });
-            return { ok: true, payloadJSON: JSON.stringify(payload) };
+            )
+              .then(() => {
+                ctx.dedupe.set(`chat:${clientRunId}`, {
+                  ts: Date.now(),
+                  ok: true,
+                  payload: { runId: clientRunId, status: "ok" as const },
+                });
+              })
+              .catch((err) => {
+                const error = errorShape(ErrorCodes.UNAVAILABLE, String(err));
+                ctx.dedupe.set(`chat:${clientRunId}`, {
+                  ts: Date.now(),
+                  ok: false,
+                  payload: {
+                    runId: clientRunId,
+                    status: "error" as const,
+                    summary: String(err),
+                  },
+                  error,
+                });
+              })
+              .finally(() => {
+                ctx.chatAbortControllers.delete(clientRunId);
+              });
+
+            return { ok: true, payloadJSON: JSON.stringify(ackPayload) };
           } catch (err) {
             const error = errorShape(ErrorCodes.UNAVAILABLE, String(err));
             const payload = {
@@ -1070,8 +989,6 @@ export function createBridgeHandlers(ctx: BridgeHandlersContext) {
                 message: String(err),
               },
             };
-          } finally {
-            ctx.chatAbortControllers.delete(clientRunId);
           }
         }
         default:
@@ -1114,8 +1031,7 @@ export function createBridgeHandlers(ctx: BridgeHandlersContext) {
         if (text.length > 20_000) return;
         const sessionKeyRaw =
           typeof obj.sessionKey === "string" ? obj.sessionKey.trim() : "";
-        const mainKey =
-          (loadConfig().session?.mainKey ?? "main").trim() || "main";
+        const mainKey = normalizeMainKey(loadConfig().session?.mainKey);
         const sessionKey = sessionKeyRaw.length > 0 ? sessionKeyRaw : mainKey;
         const { storePath, store, entry } = loadSessionEntry(sessionKey);
         const now = Date.now();
@@ -1125,6 +1041,7 @@ export function createBridgeHandlers(ctx: BridgeHandlersContext) {
           updatedAt: now,
           thinkingLevel: entry?.thinkingLevel,
           verboseLevel: entry?.verboseLevel,
+          reasoningLevel: entry?.reasoningLevel,
           systemSent: entry?.systemSent,
           sendPolicy: entry?.sendPolicy,
           lastProvider: entry?.lastProvider,
@@ -1145,6 +1062,7 @@ export function createBridgeHandlers(ctx: BridgeHandlersContext) {
           {
             message: text,
             sessionId,
+            sessionKey,
             thinking: "low",
             deliver: false,
             messageProvider: "node",
@@ -1207,6 +1125,7 @@ export function createBridgeHandlers(ctx: BridgeHandlersContext) {
           updatedAt: now,
           thinkingLevel: entry?.thinkingLevel,
           verboseLevel: entry?.verboseLevel,
+          reasoningLevel: entry?.reasoningLevel,
           systemSent: entry?.systemSent,
           sendPolicy: entry?.sendPolicy,
           lastProvider: entry?.lastProvider,
@@ -1220,6 +1139,7 @@ export function createBridgeHandlers(ctx: BridgeHandlersContext) {
           {
             message,
             sessionId,
+            sessionKey,
             thinking: link?.thinking ?? undefined,
             deliver,
             to,

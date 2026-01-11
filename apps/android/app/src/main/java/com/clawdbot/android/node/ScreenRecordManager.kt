@@ -4,6 +4,7 @@ import android.content.Context
 import android.hardware.display.DisplayManager
 import android.media.MediaRecorder
 import android.media.projection.MediaProjectionManager
+import android.os.Build
 import android.util.Base64
 import com.clawdbot.android.ScreenCaptureRequester
 import kotlinx.coroutines.Dispatchers
@@ -65,7 +66,7 @@ class ScreenRecordManager(private val context: Context) {
       val file = File.createTempFile("clawdbot-screen-", ".mp4")
       if (includeAudio) ensureMicPermission()
 
-      val recorder = MediaRecorder()
+      val recorder = createMediaRecorder()
       var virtualDisplay: android.hardware.display.VirtualDisplay? = null
       try {
         if (includeAudio) {
@@ -120,6 +121,8 @@ class ScreenRecordManager(private val context: Context) {
         """{"format":"mp4","base64":"$base64","durationMs":$durationMs,"fps":$fpsInt,"screenIndex":0,"hasAudio":$includeAudio}""",
       )
     }
+
+  private fun createMediaRecorder(): MediaRecorder = MediaRecorder(context)
 
   private suspend fun ensureMicPermission() {
     val granted =

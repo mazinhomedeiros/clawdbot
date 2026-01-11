@@ -9,163 +9,35 @@ import {
   normalizeAgentId,
   parseAgentSessionKey,
 } from "../../routing/session-key.js";
-import { readLatestAssistantReply, runAgentStep } from "./agent-step.js";
+import type { GatewayMessageProvider } from "../../utils/message-provider.js";
+import { resolveAgentConfig } from "../agent-scope.js";
+import { AGENT_LANE_SUBAGENT } from "../lanes.js";
+import { buildSubagentSystemPrompt } from "../subagent-announce.js";
+import { registerSubagentRun } from "../subagent-registry.js";
 import type { AnyAgentTool } from "./common.js";
 import { jsonResult, readStringParam } from "./common.js";
-import { resolveAnnounceTarget } from "./sessions-announce-target.js";
 import {
   resolveDisplaySessionKey,
   resolveInternalSessionKey,
   resolveMainSessionAlias,
 } from "./sessions-helpers.js";
-import { isAnnounceSkip } from "./sessions-send-helpers.js";
 
 const SessionsSpawnToolSchema = Type.Object({
   task: Type.String(),
   label: Type.Optional(Type.String()),
-  timeoutSeconds: Type.Optional(Type.Integer({ minimum: 0 })),
+  agentId: Type.Optional(Type.String()),
+  model: Type.Optional(Type.String()),
+  runTimeoutSeconds: Type.Optional(Type.Number({ minimum: 0 })),
+  // Back-compat alias. Prefer runTimeoutSeconds.
+  timeoutSeconds: Type.Optional(Type.Number({ minimum: 0 })),
   cleanup: Type.Optional(
     Type.Union([Type.Literal("delete"), Type.Literal("keep")]),
   ),
 });
 
-function buildSubagentSystemPrompt(params: {
-  requesterSessionKey?: string;
-  requesterProvider?: string;
-  childSessionKey: string;
-  label?: string;
-}) {
-  const lines = [
-    "Sub-agent context:",
-    params.label ? `Label: ${params.label}` : undefined,
-    params.requesterSessionKey
-      ? `Requester session: ${params.requesterSessionKey}.`
-      : undefined,
-    params.requesterProvider
-      ? `Requester provider: ${params.requesterProvider}.`
-      : undefined,
-    `Your session: ${params.childSessionKey}.`,
-    "Run the task. Provide a clear final answer (plain text).",
-    'After you finish, you may be asked to produce an "announce" message to post back to the requester chat.',
-  ].filter(Boolean);
-  return lines.join("\n");
-}
-
-function buildSubagentAnnouncePrompt(params: {
-  requesterSessionKey?: string;
-  requesterProvider?: string;
-  announceChannel: string;
-  task: string;
-  subagentReply?: string;
-}) {
-  const lines = [
-    "Sub-agent announce step:",
-    params.requesterSessionKey
-      ? `Requester session: ${params.requesterSessionKey}.`
-      : undefined,
-    params.requesterProvider
-      ? `Requester provider: ${params.requesterProvider}.`
-      : undefined,
-    `Post target provider: ${params.announceChannel}.`,
-    `Original task: ${params.task}`,
-    params.subagentReply
-      ? `Sub-agent result: ${params.subagentReply}`
-      : "Sub-agent result: (not available).",
-    'Reply exactly "ANNOUNCE_SKIP" to stay silent.',
-    "Any other reply will be posted to the requester chat provider.",
-  ].filter(Boolean);
-  return lines.join("\n");
-}
-
-async function runSubagentAnnounceFlow(params: {
-  childSessionKey: string;
-  childRunId: string;
-  requesterSessionKey: string;
-  requesterProvider?: string;
-  requesterDisplayKey: string;
-  task: string;
-  timeoutMs: number;
-  cleanup: "delete" | "keep";
-  roundOneReply?: string;
-}) {
-  try {
-    let reply = params.roundOneReply;
-    if (!reply) {
-      const waitMs = Math.min(params.timeoutMs, 60_000);
-      const wait = (await callGateway({
-        method: "agent.wait",
-        params: {
-          runId: params.childRunId,
-          timeoutMs: waitMs,
-        },
-        timeoutMs: waitMs + 2000,
-      })) as { status?: string };
-      if (wait?.status !== "ok") return;
-      reply = await readLatestAssistantReply({
-        sessionKey: params.childSessionKey,
-      });
-    }
-
-    const announceTarget = await resolveAnnounceTarget({
-      sessionKey: params.requesterSessionKey,
-      displayKey: params.requesterDisplayKey,
-    });
-    if (!announceTarget) return;
-
-    const announcePrompt = buildSubagentAnnouncePrompt({
-      requesterSessionKey: params.requesterSessionKey,
-      requesterProvider: params.requesterProvider,
-      announceChannel: announceTarget.provider,
-      task: params.task,
-      subagentReply: reply,
-    });
-
-    const announceReply = await runAgentStep({
-      sessionKey: params.childSessionKey,
-      message: "Sub-agent announce step.",
-      extraSystemPrompt: announcePrompt,
-      timeoutMs: params.timeoutMs,
-      lane: "nested",
-    });
-
-    if (
-      !announceReply ||
-      !announceReply.trim() ||
-      isAnnounceSkip(announceReply)
-    )
-      return;
-
-    await callGateway({
-      method: "send",
-      params: {
-        to: announceTarget.to,
-        message: announceReply.trim(),
-        provider: announceTarget.provider,
-        accountId: announceTarget.accountId,
-        idempotencyKey: crypto.randomUUID(),
-      },
-      timeoutMs: 10_000,
-    });
-  } catch {
-    // Best-effort follow-ups; ignore failures to avoid breaking the caller response.
-  } finally {
-    if (params.cleanup === "delete") {
-      try {
-        await callGateway({
-          method: "sessions.delete",
-          params: { key: params.childSessionKey, deleteTranscript: true },
-          timeoutMs: 10_000,
-        });
-      } catch {
-        // ignore
-      }
-    }
-  }
-}
-
 export function createSessionsSpawnTool(opts?: {
   agentSessionKey?: string;
-  agentProvider?: string;
+  agentProvider?: GatewayMessageProvider;
   sandboxed?: boolean;
 }): AnyAgentTool {
   return {
@@ -178,16 +50,28 @@ export function createSessionsSpawnTool(opts?: {
       const params = args as Record<string, unknown>;
       const task = readStringParam(params, "task", { required: true });
       const label = typeof params.label === "string" ? params.label.trim() : "";
+      const requestedAgentId = readStringParam(params, "agentId");
+      const model = readStringParam(params, "model");
       const cleanup =
         params.cleanup === "keep" || params.cleanup === "delete"
           ? (params.cleanup as "keep" | "delete")
-          : "delete";
-      const timeoutSeconds =
-        typeof params.timeoutSeconds === "number" &&
-        Number.isFinite(params.timeoutSeconds)
-          ? Math.max(0, Math.floor(params.timeoutSeconds))
-          : 0;
-      const timeoutMs = timeoutSeconds * 1000;
+          : "keep";
+      const runTimeoutSeconds = (() => {
+        const explicit =
+          typeof params.runTimeoutSeconds === "number" &&
+          Number.isFinite(params.runTimeoutSeconds)
+            ? Math.max(0, Math.floor(params.runTimeoutSeconds))
+            : undefined;
+        if (explicit !== undefined) return explicit;
+        const legacy =
+          typeof params.timeoutSeconds === "number" &&
+          Number.isFinite(params.timeoutSeconds)
+            ? Math.max(0, Math.floor(params.timeoutSeconds))
+            : undefined;
+        return legacy ?? 0;
+      })();
+      let modelWarning: string | undefined;
+      let modelApplied = false;
 
       const cfg = loadConfig();
       const { mainKey, alias } = resolveMainSessionAlias(cfg);
@@ -217,16 +101,60 @@ export function createSessionsSpawnTool(opts?: {
       const requesterAgentId = normalizeAgentId(
         parseAgentSessionKey(requesterInternalKey)?.agentId,
       );
-      const childSessionKey = `agent:${requesterAgentId}:subagent:${crypto.randomUUID()}`;
-      if (opts?.sandboxed === true) {
+      const targetAgentId = requestedAgentId
+        ? normalizeAgentId(requestedAgentId)
+        : requesterAgentId;
+      if (targetAgentId !== requesterAgentId) {
+        const allowAgents =
+          resolveAgentConfig(cfg, requesterAgentId)?.subagents?.allowAgents ??
+          [];
+        const allowAny = allowAgents.some((value) => value.trim() === "*");
+        const normalizedTargetId = targetAgentId.toLowerCase();
+        const allowSet = new Set(
+          allowAgents
+            .filter((value) => value.trim() && value.trim() !== "*")
+            .map((value) => normalizeAgentId(value).toLowerCase()),
+        );
+        if (!allowAny && !allowSet.has(normalizedTargetId)) {
+          const allowedText = allowAny
+            ? "*"
+            : allowSet.size > 0
+              ? Array.from(allowSet).join(", ")
+              : "none";
+          return jsonResult({
+            status: "forbidden",
+            error: `agentId is not allowed for sessions_spawn (allowed: ${allowedText})`,
+          });
+        }
+      }
+      const childSessionKey = `agent:${targetAgentId}:subagent:${crypto.randomUUID()}`;
+      const shouldPatchSpawnedBy = opts?.sandboxed === true;
+      if (model) {
         try {
           await callGateway({
             method: "sessions.patch",
-            params: { key: childSessionKey, spawnedBy: requesterInternalKey },
+            params: { key: childSessionKey, model },
             timeoutMs: 10_000,
           });
-        } catch {
-          // best-effort; scoping relies on this metadata but spawning still works without it
+          modelApplied = true;
+        } catch (err) {
+          const messageText =
+            err instanceof Error
+              ? err.message
+              : typeof err === "string"
+                ? err
+                : "error";
+          const recoverable =
+            messageText.includes("invalid model") ||
+            messageText.includes("model not allowed");
+          if (!recoverable) {
+            return jsonResult({
+              status: "error",
+              error: messageText,
+              childSessionKey,
+            });
+          }
+          modelWarning = messageText;
         }
       }
       const childSystemPrompt = buildSubagentSystemPrompt({
@@ -234,6 +162,7 @@ export function createSessionsSpawnTool(opts?: {
         requesterProvider: opts?.agentProvider,
         childSessionKey,
         label: label || undefined,
+        task,
       });
 
       const childIdem = crypto.randomUUID();
@@ -244,10 +173,14 @@ export function createSessionsSpawnTool(opts?: {
           params: {
             message: task,
             sessionKey: childSessionKey,
+            provider: opts?.agentProvider,
             idempotencyKey: childIdem,
             deliver: false,
-            lane: "subagent",
+            lane: AGENT_LANE_SUBAGENT,
             extraSystemPrompt: childSystemPrompt,
+            timeout: runTimeoutSeconds > 0 ? runTimeoutSeconds : undefined,
+            label: label || undefined,
+            spawnedBy: shouldPatchSpawnedBy ? requesterInternalKey : undefined,
           },
           timeoutMs: 10_000,
         })) as { runId?: string };
@@ -269,109 +202,23 @@ export function createSessionsSpawnTool(opts?: {
         });
       }
 
-      if (timeoutSeconds === 0) {
-        void runSubagentAnnounceFlow({
-          childSessionKey,
-          childRunId,
-          requesterSessionKey: requesterInternalKey,
-          requesterProvider: opts?.agentProvider,
-          requesterDisplayKey,
-          task,
-          timeoutMs: 30_000,
-          cleanup,
-        });
-        return jsonResult({
-          status: "accepted",
-          childSessionKey,
-          runId: childRunId,
-        });
-      }
-
-      let waitStatus: string | undefined;
-      let waitError: string | undefined;
-      try {
-        const wait = (await callGateway({
-          method: "agent.wait",
-          params: {
-            runId: childRunId,
-            timeoutMs,
-          },
-          timeoutMs: timeoutMs + 2000,
-        })) as { status?: string; error?: string };
-        waitStatus = typeof wait?.status === "string" ? wait.status : undefined;
-        waitError = typeof wait?.error === "string" ? wait.error : undefined;
-      } catch (err) {
-        const messageText =
-          err instanceof Error
-            ? err.message
-            : typeof err === "string"
-              ? err
-              : "error";
-        return jsonResult({
-          status: messageText.includes("gateway timeout") ? "timeout" : "error",
-          error: messageText,
-          childSessionKey,
-          runId: childRunId,
-        });
-      }
-
-      if (waitStatus === "timeout") {
-        void runSubagentAnnounceFlow({
-          childSessionKey,
-          childRunId,
-          requesterSessionKey: requesterInternalKey,
-          requesterProvider: opts?.agentProvider,
-          requesterDisplayKey,
-          task,
-          timeoutMs: 30_000,
-          cleanup,
-        });
-        return jsonResult({
-          status: "timeout",
-          error: waitError,
-          childSessionKey,
-          runId: childRunId,
-        });
-      }
-      if (waitStatus === "error") {
-        void runSubagentAnnounceFlow({
-          childSessionKey,
-          childRunId,
-          requesterSessionKey: requesterInternalKey,
-          requesterProvider: opts?.agentProvider,
-          requesterDisplayKey,
-          task,
-          timeoutMs: 30_000,
-          cleanup,
-        });
-        return jsonResult({
-          status: "error",
-          error: waitError ?? "agent error",
-          childSessionKey,
-          runId: childRunId,
-        });
-      }
-
-      const replyText = await readLatestAssistantReply({
-        sessionKey: childSessionKey,
-      });
-      void runSubagentAnnounceFlow({
+      registerSubagentRun({
+        runId: childRunId,
         childSessionKey,
-        childRunId,
         requesterSessionKey: requesterInternalKey,
         requesterProvider: opts?.agentProvider,
         requesterDisplayKey,
         task,
-        timeoutMs: 30_000,
         cleanup,
-        roundOneReply: replyText,
+        label: label || undefined,
       });
 
       return jsonResult({
-        status: "ok",
+        status: "accepted",
         childSessionKey,
         runId: childRunId,
-        reply: replyText,
+        modelApplied: model ? modelApplied : undefined,
+        warning: modelWarning,
       });
     },
   };

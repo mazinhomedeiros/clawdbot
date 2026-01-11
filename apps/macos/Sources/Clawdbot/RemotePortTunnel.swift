@@ -38,7 +38,12 @@ final class RemotePortTunnel {
         Task { await PortGuardian.shared.removeRecord(pid: pid) }
     }
 
-    static func create(remotePort: Int, preferredLocalPort: UInt16? = nil) async throws -> RemotePortTunnel {
+    static func create(
+        remotePort: Int,
+        preferredLocalPort: UInt16? = nil,
+        allowRemoteUrlOverride: Bool = true,
+        allowRandomLocalPort: Bool = true) async throws -> RemotePortTunnel
+    {
         let settings = CommandResolver.connectionSettings()
         guard settings.mode == .remote, let parsed = CommandResolver.parseSSHTarget(settings.target) else {
             throw NSError(
@@ -47,9 +52,14 @@ final class RemotePortTunnel {
                 userInfo: [NSLocalizedDescriptionKey: "Remote mode is not configured"])
         }
 
-        let localPort = try await Self.findPort(preferred: preferredLocalPort)
+        let localPort = try await Self.findPort(
+            preferred: preferredLocalPort,
+            allowRandom: allowRandomLocalPort)
         let sshHost = parsed.host.trimmingCharacters(in: .whitespacesAndNewlines)
-        let remotePortOverride = Self.resolveRemotePortOverride(for: sshHost)
+        let remotePortOverride =
+            allowRemoteUrlOverride && remotePort == GatewayEnvironment.gatewayPort()
+            ? Self.resolveRemotePortOverride(for: sshHost)
+            : nil
         let resolvedRemotePort = remotePortOverride ?? remotePort
         if let override = remotePortOverride {
             Self.logger.info(
@@ -165,8 +175,16 @@ final class RemotePortTunnel {
         return trimmed.split(separator: ".").first.map(String.init) ?? trimmed
     }
 
-    private static func findPort(preferred: UInt16?) async throws -> UInt16 {
+    private static func findPort(preferred: UInt16?, allowRandom: Bool) async throws -> UInt16 {
         if let preferred, self.portIsFree(preferred) { return preferred }
+        if let preferred, !allowRandom {
+            throw NSError(
+                domain: "RemotePortTunnel",
+                code: 5,
+                userInfo: [
+                    NSLocalizedDescriptionKey: "Local port \(preferred) is unavailable",
+                ])
+        }
 
         return try await withCheckedThrowingContinuation { cont in
             let queue = DispatchQueue(label: "com.clawdbot.remote.tunnel.port", qos: .utility)

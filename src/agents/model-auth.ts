@@ -9,6 +9,7 @@ import {
   resolveApiKeyForProfile,
   resolveAuthProfileOrder,
 } from "./auth-profiles.js";
+import { normalizeProviderId } from "./model-selection.js";
 
 export {
   ensureAuthProfileStore,
@@ -100,8 +101,10 @@ export async function resolveApiKeyForProvider(params: {
 }
 
 export type EnvApiKeyResult = { apiKey: string; source: string };
+export type ModelAuthMode = "api-key" | "oauth" | "token" | "mixed" | "unknown";
 
 export function resolveEnvApiKey(provider: string): EnvApiKeyResult | null {
+  const normalized = normalizeProviderId(provider);
   const applied = new Set(getShellEnvAppliedKeys());
   const pick = (envVar: string): EnvApiKeyResult | null => {
     const value = process.env[envVar]?.trim();
@@ -112,20 +115,28 @@ export function resolveEnvApiKey(provider: string): EnvApiKeyResult | null {
     return { apiKey: value, source };
   };
 
-  if (provider === "github-copilot") {
+  if (normalized === "github-copilot") {
     return (
       pick("COPILOT_GITHUB_TOKEN") ?? pick("GH_TOKEN") ?? pick("GITHUB_TOKEN")
     );
   }
 
-  if (provider === "anthropic") {
+  if (normalized === "anthropic") {
     return pick("ANTHROPIC_OAUTH_TOKEN") ?? pick("ANTHROPIC_API_KEY");
   }
 
-  if (provider === "google-vertex") {
-    const envKey = getEnvApiKey(provider);
+  if (normalized === "zai") {
+    return pick("ZAI_API_KEY") ?? pick("Z_AI_API_KEY");
+  }
+
+  if (normalized === "google-vertex") {
+    const envKey = getEnvApiKey(normalized);
     if (!envKey) return null;
     return { apiKey: envKey, source: "gcloud adc" };
+  }
+
+  if (normalized === "opencode") {
+    return pick("OPENCODE_API_KEY") ?? pick("OPENCODE_ZEN_API_KEY");
   }
 
   const envMap: Record<string, string> = {
@@ -135,12 +146,48 @@ export function resolveEnvApiKey(provider: string): EnvApiKeyResult | null {
     cerebras: "CEREBRAS_API_KEY",
     xai: "XAI_API_KEY",
     openrouter: "OPENROUTER_API_KEY",
-    zai: "ZAI_API_KEY",
+    minimax: "MINIMAX_API_KEY",
     mistral: "MISTRAL_API_KEY",
+    opencode: "OPENCODE_API_KEY",
   };
-  const envVar = envMap[provider];
+  const envVar = envMap[normalized];
   if (!envVar) return null;
   return pick(envVar);
+}
+
+export function resolveModelAuthMode(
+  provider?: string,
+  cfg?: ClawdbotConfig,
+  store?: AuthProfileStore,
+): ModelAuthMode | undefined {
+  const resolved = provider?.trim();
+  if (!resolved) return undefined;
+
+  const authStore = store ?? ensureAuthProfileStore();
+  const profiles = listProfilesForProvider(authStore, resolved);
+  if (profiles.length > 0) {
+    const modes = new Set(
+      profiles
+        .map((id) => authStore.profiles[id]?.type)
+        .filter((mode): mode is "api_key" | "oauth" | "token" => Boolean(mode)),
+    );
+    const distinct = ["oauth", "token", "api_key"].filter((k) =>
+      modes.has(k as "oauth" | "token" | "api_key"),
+    );
+    if (distinct.length >= 2) return "mixed";
+    if (modes.has("oauth")) return "oauth";
+    if (modes.has("token")) return "token";
+    if (modes.has("api_key")) return "api-key";
+  }
+
+  const envKey = resolveEnvApiKey(resolved);
+  if (envKey?.apiKey) {
+    return envKey.source.includes("OAUTH_TOKEN") ? "oauth" : "api-key";
+  }
+
+  if (getCustomProviderApiKey(cfg, resolved)) return "api-key";
+
+  return "unknown";
 }
 
 export async function getApiKeyForModel(params: {

@@ -1,21 +1,15 @@
 import path from "node:path";
 
 import {
-  confirm,
-  intro,
-  multiselect,
-  note,
-  outro,
-  select,
-  spinner,
-  text,
+  confirm as clackConfirm,
+  intro as clackIntro,
+  multiselect as clackMultiselect,
+  note as clackNote,
+  outro as clackOutro,
+  select as clackSelect,
+  text as clackText,
 } from "@clack/prompts";
-import {
-  loginAnthropic,
-  loginOpenAICodex,
-  type OAuthCredentials,
-  type OAuthProvider,
-} from "@mariozechner/pi-ai";
+import { ensureAuthProfileStore } from "../agents/auth-profiles.js";
 import type { ClawdbotConfig } from "../config/config.js";
 import {
   CONFIG_PATH_CLAWDBOT,
@@ -25,31 +19,42 @@ import {
 } from "../config/config.js";
 import { GATEWAY_LAUNCH_AGENT_LABEL } from "../daemon/constants.js";
 import { resolveGatewayProgramArguments } from "../daemon/program-args.js";
+import { resolvePreferredNodePath } from "../daemon/runtime-paths.js";
 import { resolveGatewayService } from "../daemon/service.js";
+import { buildServiceEnvironment } from "../daemon/service-env.js";
 import { ensureControlUiAssetsBuilt } from "../infra/control-ui-assets.js";
+import { listChatProviders } from "../providers/registry.js";
 import type { RuntimeEnv } from "../runtime.js";
 import { defaultRuntime } from "../runtime.js";
+import {
+  stylePromptHint,
+  stylePromptMessage,
+  stylePromptTitle,
+} from "../terminal/prompt-style.js";
 import { resolveUserPath, sleep } from "../utils.js";
 import { createClackPrompter } from "../wizard/clack-prompter.js";
 import {
-  isRemoteEnvironment,
-  loginAntigravityVpsAware,
-} from "./antigravity-oauth.js";
-import { healthCommand } from "./health.js";
+  WizardCancelledError,
+  type WizardPrompter,
+} from "../wizard/prompts.js";
 import {
-  applyAuthProfileConfig,
-  applyMinimaxConfig,
-  setAnthropicApiKey,
-  writeOAuthCredentials,
-} from "./onboard-auth.js";
+  applyAuthChoice,
+  resolvePreferredProviderForAuthChoice,
+} from "./auth-choice.js";
+import { buildAuthChoiceOptions } from "./auth-choice-options.js";
+import {
+  DEFAULT_GATEWAY_DAEMON_RUNTIME,
+  GATEWAY_DAEMON_RUNTIME_OPTIONS,
+  type GatewayDaemonRuntime,
+} from "./daemon-runtime.js";
+import { healthCommand } from "./health.js";
+import { formatHealthCheckFailure } from "./health-format.js";
+import { applyPrimaryModel, promptDefaultModel } from "./model-picker.js";
 import {
   applyWizardMetadata,
   DEFAULT_WORKSPACE,
-  detectBrowserOpenSupport,
   ensureWorkspaceAndSessions,
-  formatControlUiSshHint,
   guardCancel,
-  openUrl,
   printWizardHeader,
   probeGatewayReachable,
   randomToken,
@@ -59,25 +64,64 @@ import {
 import { setupProviders } from "./onboard-providers.js";
 import { promptRemoteGatewayConfig } from "./onboard-remote.js";
 import { setupSkills } from "./onboard-skills.js";
-import {
-  applyOpenAICodexModelDefault,
-  OPENAI_CODEX_DEFAULT_MODEL,
-} from "./openai-codex-model-default.js";
+import type { AuthChoice } from "./onboard-types.js";
 import { ensureSystemdUserLingerInteractive } from "./systemd-linger.js";
 
-type WizardSection =
-  | "model"
-  | "providers"
-  | "gateway"
-  | "daemon"
-  | "workspace"
-  | "skills"
-  | "health";
+export const CONFIGURE_WIZARD_SECTIONS = [
+  "workspace",
+  "model",
+  "gateway",
+  "daemon",
+  "providers",
+  "skills",
+  "health",
+] as const;
+
+export type WizardSection = (typeof CONFIGURE_WIZARD_SECTIONS)[number];
+
+type ProvidersWizardMode = "configure" | "remove";
 
 type ConfigureWizardParams = {
   command: "configure" | "update";
   sections?: WizardSection[];
 };
+
+const intro = (message: string) =>
+  clackIntro(stylePromptTitle(message) ?? message);
+const outro = (message: string) =>
+  clackOutro(stylePromptTitle(message) ?? message);
+const note = (message: string, title?: string) =>
+  clackNote(message, stylePromptTitle(title));
+const text = (params: Parameters<typeof clackText>[0]) =>
+  clackText({
+    ...params,
+    message: stylePromptMessage(params.message),
+  });
+const confirm = (params: Parameters<typeof clackConfirm>[0]) =>
+  clackConfirm({
+    ...params,
+    message: stylePromptMessage(params.message),
+  });
+const select = <T>(params: Parameters<typeof clackSelect<T>>[0]) =>
+  clackSelect({
+    ...params,
+    message: stylePromptMessage(params.message),
+    options: params.options.map((opt) =>
+      opt.hint === undefined
+        ? opt
+        : { ...opt, hint: stylePromptHint(opt.hint) },
+    ),
+  });
+const multiselect = <T>(params: Parameters<typeof clackMultiselect<T>>[0]) =>
+  clackMultiselect({
+    ...params,
+    message: stylePromptMessage(params.message),
+    options: params.options.map((opt) =>
+      opt.hint === undefined
+        ? opt
+        : { ...opt, hint: stylePromptHint(opt.hint) },
+    ),
+  });
 
 async function promptGatewayConfig(
   cfg: ClawdbotConfig,
@@ -145,6 +189,14 @@ async function promptGatewayConfig(
 
   let tailscaleResetOnExit = false;
   if (tailscaleMode !== "off") {
+    note(
+      [
+        "Docs:",
+        "https://docs.clawd.bot/gateway/tailscale",
+        "https://docs.clawd.bot/web",
+      ].join("\n"),
+      "Tailscale",
+    );
     tailscaleResetOnExit = Boolean(
       guardCancel(
         await confirm({
@@ -237,262 +289,40 @@ async function promptGatewayConfig(
 async function promptAuthConfig(
   cfg: ClawdbotConfig,
   runtime: RuntimeEnv,
+  prompter: WizardPrompter,
 ): Promise<ClawdbotConfig> {
-  const authChoice = guardCancel(
-    await select({
-      message: "Model/auth choice",
-      options: [
-        { value: "oauth", label: "Anthropic OAuth (Claude Pro/Max)" },
-        { value: "openai-codex", label: "OpenAI Codex (ChatGPT OAuth)" },
-        {
-          value: "antigravity",
-          label: "Google Antigravity (Claude Opus 4.5, Gemini 3, etc.)",
-        },
-        { value: "apiKey", label: "Anthropic API key" },
-        { value: "minimax", label: "Minimax M2.1 (LM Studio)" },
-        { value: "skip", label: "Skip for now" },
-      ],
+  const authChoice: AuthChoice = await prompter.select({
+    message: "Model/auth choice",
+    options: buildAuthChoiceOptions({
+      store: ensureAuthProfileStore(undefined, {
+        allowKeychainPrompt: false,
+      }),
+      includeSkip: true,
+      includeClaudeCliIfMissing: true,
     }),
-    runtime,
-  ) as "oauth" | "openai-codex" | "antigravity" | "apiKey" | "minimax" | "skip";
+  });
 
   let next = cfg;
-
-  if (authChoice === "oauth") {
-    note(
-      "Browser will open. Paste the code shown after login (code#state).",
-      "Anthropic OAuth",
-    );
-    const spin = spinner();
-    spin.start("Waiting for authorization…");
-    let oauthCreds: OAuthCredentials | null = null;
-    try {
-      oauthCreds = await loginAnthropic(
-        async (url) => {
-          await openUrl(url);
-          runtime.log(`Open: ${url}`);
-        },
-        async () => {
-          const code = guardCancel(
-            await text({
-              message: "Paste authorization code (code#state)",
-              validate: (value) => (value?.trim() ? undefined : "Required"),
-            }),
-            runtime,
-          );
-          return String(code);
-        },
-      );
-      spin.stop("OAuth complete");
-      if (oauthCreds) {
-        await writeOAuthCredentials("anthropic", oauthCreds);
-        next = applyAuthProfileConfig(next, {
-          profileId: "anthropic:default",
-          provider: "anthropic",
-          mode: "oauth",
-        });
-      }
-    } catch (err) {
-      spin.stop("OAuth failed");
-      runtime.error(String(err));
-    }
-  } else if (authChoice === "openai-codex") {
-    const isRemote = isRemoteEnvironment();
-    note(
-      isRemote
-        ? [
-            "You are running in a remote/VPS environment.",
-            "A URL will be shown for you to open in your LOCAL browser.",
-            "After signing in, paste the redirect URL back here.",
-          ].join("\n")
-        : [
-            "Browser will open for OpenAI authentication.",
-            "If the callback doesn't auto-complete, paste the redirect URL.",
-            "OpenAI OAuth uses localhost:1455 for the callback.",
-          ].join("\n"),
-      "OpenAI Codex OAuth",
-    );
-    const spin = spinner();
-    spin.start("Starting OAuth flow…");
-    let manualCodePromise: Promise<string> | undefined;
-    try {
-      const creds = await loginOpenAICodex({
-        onAuth: async ({ url }) => {
-          if (isRemote) {
-            spin.message("OAuth URL ready (see below)…");
-            runtime.log(`\nOpen this URL in your LOCAL browser:\n\n${url}\n`);
-            manualCodePromise = text({
-              message: "Paste the redirect URL (or authorization code)",
-              validate: (value) => (value?.trim() ? undefined : "Required"),
-            }).then((value) => String(guardCancel(value, runtime)));
-          } else {
-            spin.message("Complete sign-in in browser…");
-            await openUrl(url);
-            runtime.log(`Open: ${url}`);
-          }
-        },
-        onPrompt: async (prompt) => {
-          if (manualCodePromise) return manualCodePromise;
-          const code = guardCancel(
-            await text({
-              message: prompt.message,
-              placeholder: prompt.placeholder,
-              validate: (value) => (value?.trim() ? undefined : "Required"),
-            }),
-            runtime,
-          );
-          return String(code);
-        },
-        onProgress: (msg) => spin.message(msg),
-      });
-      spin.stop("OpenAI OAuth complete");
-      if (creds) {
-        await writeOAuthCredentials(
-          "openai-codex" as unknown as OAuthProvider,
-          creds,
-        );
-        next = applyAuthProfileConfig(next, {
-          profileId: "openai-codex:default",
-          provider: "openai-codex",
-          mode: "oauth",
-        });
-        const applied = applyOpenAICodexModelDefault(next);
-        next = applied.next;
-        if (applied.changed) {
-          note(
-            `Default model set to ${OPENAI_CODEX_DEFAULT_MODEL}`,
-            "Model configured",
-          );
-        }
-      }
-    } catch (err) {
-      spin.stop("OpenAI OAuth failed");
-      runtime.error(String(err));
-    }
-  } else if (authChoice === "antigravity") {
-    const isRemote = isRemoteEnvironment();
-    note(
-      isRemote
-        ? [
-            "You are running in a remote/VPS environment.",
-            "A URL will be shown for you to open in your LOCAL browser.",
-            "After signing in, copy the redirect URL and paste it back here.",
-          ].join("\n")
-        : [
-            "Browser will open for Google authentication.",
-            "Sign in with your Google account that has Antigravity access.",
-            "The callback will be captured automatically on localhost:51121.",
-          ].join("\n"),
-      "Google Antigravity OAuth",
-    );
-    const spin = spinner();
-    spin.start("Starting OAuth flow…");
-    let oauthCreds: OAuthCredentials | null = null;
-    try {
-      oauthCreds = await loginAntigravityVpsAware(
-        async (url) => {
-          if (isRemote) {
-            spin.stop("OAuth URL ready");
-            runtime.log(`\nOpen this URL in your LOCAL browser:\n\n${url}\n`);
-          } else {
-            spin.message("Complete sign-in in browser…");
-            await openUrl(url);
-            runtime.log(`Open: ${url}`);
-          }
-        },
-        (msg) => spin.message(msg),
-      );
-      spin.stop("Antigravity OAuth complete");
-      if (oauthCreds) {
-        await writeOAuthCredentials("google-antigravity", oauthCreds);
-        next = applyAuthProfileConfig(next, {
-          profileId: `google-antigravity:${oauthCreds.email ?? "default"}`,
-          provider: "google-antigravity",
-          mode: "oauth",
-        });
-        // Set default model to Claude Opus 4.5 via Antigravity
-        next = {
-          ...next,
-          agent: {
-            ...next.agent,
-            model: {
-              ...(next.agent?.model &&
-              "fallbacks" in (next.agent.model as Record<string, unknown>)
-                ? {
-                    fallbacks: (next.agent.model as { fallbacks?: string[] })
-                      .fallbacks,
-                  }
-                : undefined),
-              primary: "google-antigravity/claude-opus-4-5-thinking",
-            },
-            models: {
-              ...next.agent?.models,
-              "google-antigravity/claude-opus-4-5-thinking":
-                next.agent?.models?.[
-                  "google-antigravity/claude-opus-4-5-thinking"
-                ] ?? {},
-            },
-          },
-        };
-        note(
-          "Default model set to google-antigravity/claude-opus-4-5-thinking",
-          "Model configured",
-        );
-      }
-    } catch (err) {
-      spin.stop("Antigravity OAuth failed");
-      runtime.error(String(err));
-    }
-  } else if (authChoice === "apiKey") {
-    const key = guardCancel(
-      await text({
-        message: "Enter Anthropic API key",
-        validate: (value) => (value?.trim() ? undefined : "Required"),
-      }),
+  if (authChoice !== "skip") {
+    const applied = await applyAuthChoice({
+      authChoice,
+      config: next,
+      prompter,
       runtime,
-    );
-    await setAnthropicApiKey(String(key).trim());
-    next = applyAuthProfileConfig(next, {
-      profileId: "anthropic:default",
-      provider: "anthropic",
-      mode: "api_key",
+      setDefaultModel: true,
     });
-  } else if (authChoice === "minimax") {
-    next = applyMinimaxConfig(next);
+    next = applied.config;
   }
 
-  const modelInput = guardCancel(
-    await text({
-      message: "Default model (blank to keep)",
-      initialValue:
-        typeof next.agent?.model === "string"
-          ? next.agent?.model
-          : (next.agent?.model?.primary ?? ""),
-    }),
-    runtime,
-  );
-  const model = String(modelInput ?? "").trim();
-  if (model) {
-    next = {
-      ...next,
-      agent: {
-        ...next.agent,
-        model: {
-          ...(next.agent?.model &&
-          "fallbacks" in (next.agent.model as Record<string, unknown>)
-            ? {
-                fallbacks: (next.agent.model as { fallbacks?: string[] })
-                  .fallbacks,
-              }
-            : undefined),
-          primary: model,
-        },
-        models: {
-          ...next.agent?.models,
-          [model]: next.agent?.models?.[model] ?? {},
-        },
-      },
-    };
+  const modelSelection = await promptDefaultModel({
+    config: next,
+    prompter,
+    allowKeep: true,
+    ignoreAllowlist: true,
+    preferredProvider: resolvePreferredProviderForAuthChoice(authChoice),
+  });
+  if (modelSelection.model) {
+    next = applyPrimaryModel(next, modelSelection.model);
   }
 
   return next;
@@ -502,11 +332,13 @@ async function maybeInstallDaemon(params: {
   runtime: RuntimeEnv;
   port: number;
   gatewayToken?: string;
+  daemonRuntime?: GatewayDaemonRuntime;
 }) {
   const service = resolveGatewayService();
   const loaded = await service.isLoaded({ env: process.env });
   let shouldCheckLinger = false;
   let shouldInstall = true;
+  let daemonRuntime = params.daemonRuntime ?? DEFAULT_GATEWAY_DAEMON_RUNTIME;
   if (loaded) {
     const action = guardCancel(
       await select({
@@ -531,17 +363,37 @@ async function maybeInstallDaemon(params: {
   }
 
   if (shouldInstall) {
+    if (!params.daemonRuntime) {
+      daemonRuntime = guardCancel(
+        await select({
+          message: "Gateway daemon runtime",
+          options: GATEWAY_DAEMON_RUNTIME_OPTIONS,
+          initialValue: DEFAULT_GATEWAY_DAEMON_RUNTIME,
+        }),
+        params.runtime,
+      ) as GatewayDaemonRuntime;
+    }
     const devMode =
       process.argv[1]?.includes(`${path.sep}src${path.sep}`) &&
       process.argv[1]?.endsWith(".ts");
+    const nodePath = await resolvePreferredNodePath({
+      env: process.env,
+      runtime: daemonRuntime,
+    });
     const { programArguments, workingDirectory } =
-      await resolveGatewayProgramArguments({ port: params.port, dev: devMode });
-    const environment: Record<string, string | undefined> = {
-      PATH: process.env.PATH,
-      CLAWDBOT_GATEWAY_TOKEN: params.gatewayToken,
-      CLAWDBOT_LAUNCHD_LABEL:
+      await resolveGatewayProgramArguments({
+        port: params.port,
+        dev: devMode,
+        runtime: daemonRuntime,
+        nodePath,
+      });
+    const environment = buildServiceEnvironment({
+      env: process.env,
+      port: params.port,
+      token: params.gatewayToken,
+      launchdLabel:
         process.platform === "darwin" ? GATEWAY_LAUNCH_AGENT_LABEL : undefined,
-    };
+    });
     await service.install({
       env: process.env,
       stdout: process.stdout,
@@ -567,272 +419,396 @@ async function maybeInstallDaemon(params: {
   }
 }
 
-export async function runConfigureWizard(
-  opts: ConfigureWizardParams,
-  runtime: RuntimeEnv = defaultRuntime,
-) {
-  printWizardHeader(runtime);
-  intro(
-    opts.command === "update" ? "Clawdbot update wizard" : "Clawdbot configure",
-  );
-  const prompter = createClackPrompter();
+async function removeProviderConfigWizard(
+  cfg: ClawdbotConfig,
+  runtime: RuntimeEnv,
+): Promise<ClawdbotConfig> {
+  let next = { ...cfg };
 
-  const snapshot = await readConfigFileSnapshot();
-  let baseConfig: ClawdbotConfig = snapshot.valid ? snapshot.config : {};
+  const listConfiguredProviders = () =>
+    listChatProviders().filter((meta) => {
+      const value = (next as Record<string, unknown>)[meta.id];
+      return value !== undefined;
+    });
 
-  if (snapshot.exists) {
-    const title = snapshot.valid
-      ? "Existing config detected"
-      : "Invalid config";
-    note(summarizeExistingConfig(baseConfig), title);
-    if (!snapshot.valid && snapshot.issues.length > 0) {
+  while (true) {
+    const configured = listConfiguredProviders();
+    if (configured.length === 0) {
       note(
-        snapshot.issues
-          .map((iss) => `- ${iss.path}: ${iss.message}`)
-          .join("\n"),
-        "Config issues",
+        [
+          "No provider config found in clawdbot.json.",
+          "Tip: `clawdbot providers status` shows what is configured and enabled.",
+        ].join("\n"),
+        "Remove provider",
       );
+      return next;
     }
-    if (!snapshot.valid) {
-      const reset = guardCancel(
-        await confirm({
-          message: "Config invalid. Start fresh?",
-          initialValue: true,
-        }),
-        runtime,
-      );
-      if (reset) baseConfig = {};
-    }
-  }
 
-  const localUrl = "ws://127.0.0.1:18789";
-  const localProbe = await probeGatewayReachable({
-    url: localUrl,
-    token:
-      baseConfig.gateway?.auth?.token ?? process.env.CLAWDBOT_GATEWAY_TOKEN,
-    password:
-      baseConfig.gateway?.auth?.password ??
-      process.env.CLAWDBOT_GATEWAY_PASSWORD,
-  });
-  const remoteUrl = baseConfig.gateway?.remote?.url?.trim() ?? "";
-  const remoteProbe = remoteUrl
-    ? await probeGatewayReachable({
-        url: remoteUrl,
-        token: baseConfig.gateway?.remote?.token,
-      })
-    : null;
-
-  const mode = guardCancel(
-    await select({
-      message: "Where will the Gateway run?",
-      options: [
-        {
-          value: "local",
-          label: "Local (this machine)",
-          hint: localProbe.ok
-            ? `Gateway reachable (${localUrl})`
-            : `No gateway detected (${localUrl})`,
-        },
-        {
-          value: "remote",
-          label: "Remote (info-only)",
-          hint: !remoteUrl
-            ? "No remote URL configured yet"
-            : remoteProbe?.ok
-              ? `Gateway reachable (${remoteUrl})`
-              : `Configured but unreachable (${remoteUrl})`,
-        },
-      ],
-    }),
-    runtime,
-  ) as "local" | "remote";
-
-  if (mode === "remote") {
-    let remoteConfig = await promptRemoteGatewayConfig(baseConfig, prompter);
-    remoteConfig = applyWizardMetadata(remoteConfig, {
-      command: opts.command,
-      mode,
-    });
-    await writeConfigFile(remoteConfig);
-    runtime.log(`Updated ${CONFIG_PATH_CLAWDBOT}`);
-    outro("Remote gateway configured.");
-    return;
-  }
-
-  const selected = opts.sections
-    ? opts.sections
-    : (guardCancel(
-        await multiselect({
-          message: "Select sections to configure",
-          options: [
-            { value: "workspace", label: "Workspace" },
-            { value: "model", label: "Model/auth" },
-            { value: "gateway", label: "Gateway config" },
-            { value: "daemon", label: "Gateway daemon" },
-            { value: "providers", label: "Providers" },
-            { value: "skills", label: "Skills" },
-            { value: "health", label: "Health check" },
-          ],
-        }),
-        runtime,
-      ) as WizardSection[]);
-
-  if (!selected || selected.length === 0) {
-    outro("No changes selected.");
-    return;
-  }
-
-  let nextConfig = { ...baseConfig };
-  let workspaceDir =
-    nextConfig.agent?.workspace ??
-    baseConfig.agent?.workspace ??
-    DEFAULT_WORKSPACE;
-  let gatewayPort = resolveGatewayPort(baseConfig);
-  let gatewayToken: string | undefined;
-
-  if (selected.includes("workspace")) {
-    const workspaceInput = guardCancel(
-      await text({
-        message: "Workspace directory",
-        initialValue: workspaceDir,
+    const provider = guardCancel(
+      await select({
+        message: "Remove which provider config?",
+        options: [
+          ...configured.map((meta) => ({
+            value: meta.id,
+            label: meta.label,
+            hint: "Deletes tokens + settings from config (credentials stay on disk)",
+          })),
+          { value: "done", label: "Done" },
+        ],
       }),
       runtime,
-    );
-    workspaceDir = resolveUserPath(
-      String(workspaceInput ?? "").trim() || DEFAULT_WORKSPACE,
-    );
-    nextConfig = {
-      ...nextConfig,
-      agent: {
-        ...nextConfig.agent,
-        workspace: workspaceDir,
-      },
-    };
-    await ensureWorkspaceAndSessions(workspaceDir, runtime);
-  }
+    ) as string;
 
-  if (selected.includes("model")) {
-    nextConfig = await promptAuthConfig(nextConfig, runtime);
-  }
+    if (provider === "done") return next;
 
-  if (selected.includes("gateway")) {
-    const gateway = await promptGatewayConfig(nextConfig, runtime);
-    nextConfig = gateway.config;
-    gatewayPort = gateway.port;
-    gatewayToken = gateway.token;
-  }
-
-  if (selected.includes("providers")) {
-    nextConfig = await setupProviders(nextConfig, runtime, prompter, {
-      allowDisable: true,
-      allowSignalInstall: true,
-    });
-  }
-
-  if (selected.includes("skills")) {
-    const wsDir = resolveUserPath(workspaceDir);
-    nextConfig = await setupSkills(nextConfig, wsDir, runtime, prompter);
-  }
-
-  nextConfig = applyWizardMetadata(nextConfig, {
-    command: opts.command,
-    mode,
-  });
-  await writeConfigFile(nextConfig);
-  runtime.log(`Updated ${CONFIG_PATH_CLAWDBOT}`);
-
-  if (selected.includes("daemon")) {
-    if (!selected.includes("gateway")) {
-      const portInput = guardCancel(
-        await text({
-          message: "Gateway port for daemon install",
-          initialValue: String(gatewayPort),
-          validate: (value) =>
-            Number.isFinite(Number(value)) ? undefined : "Invalid port",
-        }),
-        runtime,
-      );
-      gatewayPort = Number.parseInt(String(portInput), 10);
-    }
-
-    await maybeInstallDaemon({
-      runtime,
-      port: gatewayPort,
-      gatewayToken,
-    });
-  }
-
-  if (selected.includes("health")) {
-    await sleep(1000);
-    try {
-      await healthCommand({ json: false, timeoutMs: 10_000 }, runtime);
-    } catch (err) {
-      runtime.error(`Health check failed: ${String(err)}`);
-    }
-  }
-
-  const controlUiAssets = await ensureControlUiAssetsBuilt(runtime);
-  if (!controlUiAssets.ok && controlUiAssets.message) {
-    runtime.error(controlUiAssets.message);
-  }
-
-  note(
-    (() => {
-      const bind = nextConfig.gateway?.bind ?? "loopback";
-      const links = resolveControlUiLinks({
-        bind,
-        port: gatewayPort,
-        basePath: nextConfig.gateway?.controlUi?.basePath,
-      });
-      return [`Web UI: ${links.httpUrl}`, `Gateway WS: ${links.wsUrl}`].join(
-        "\n",
-      );
-    })(),
-    "Control UI",
-  );
-
-  const browserSupport = await detectBrowserOpenSupport();
-  if (!browserSupport.ok) {
-    note(
-      formatControlUiSshHint({
-        port: gatewayPort,
-        basePath: nextConfig.gateway?.controlUi?.basePath,
-        token: gatewayToken,
-      }),
-      "Open Control UI",
-    );
-  } else {
-    const wantsOpen = guardCancel(
+    const label =
+      listChatProviders().find((meta) => meta.id === provider)?.label ??
+      provider;
+    const confirmed = guardCancel(
       await confirm({
-        message: "Open Control UI now?",
+        message: `Delete ${label} configuration from ${CONFIG_PATH_CLAWDBOT}?`,
         initialValue: false,
       }),
       runtime,
     );
-    if (wantsOpen) {
-      const bind = nextConfig.gateway?.bind ?? "loopback";
-      const links = resolveControlUiLinks({
-        bind,
-        port: gatewayPort,
-        basePath: nextConfig.gateway?.controlUi?.basePath,
-      });
-      const opened = await openUrl(links.httpUrl);
-      if (!opened) {
+    if (!confirmed) continue;
+
+    const clone = { ...next } as Record<string, unknown>;
+    delete clone[provider];
+    next = clone as ClawdbotConfig;
+
+    note(
+      [
+        `${label} removed from config.`,
+        "Note: credentials/sessions on disk are unchanged.",
+      ].join("\n"),
+      "Provider removed",
+    );
+  }
+}
+
+export async function runConfigureWizard(
+  opts: ConfigureWizardParams,
+  runtime: RuntimeEnv = defaultRuntime,
+) {
+  try {
+    printWizardHeader(runtime);
+    intro(
+      opts.command === "update"
+        ? "Clawdbot update wizard"
+        : "Clawdbot configure",
+    );
+    const prompter = createClackPrompter();
+
+    const snapshot = await readConfigFileSnapshot();
+    let baseConfig: ClawdbotConfig = snapshot.valid ? snapshot.config : {};
+
+    if (snapshot.exists) {
+      const title = snapshot.valid
+        ? "Existing config detected"
+        : "Invalid config";
+      note(summarizeExistingConfig(baseConfig), title);
+      if (!snapshot.valid && snapshot.issues.length > 0) {
         note(
-          formatControlUiSshHint({
-            port: gatewayPort,
-            basePath: nextConfig.gateway?.controlUi?.basePath,
-            token: gatewayToken,
+          [
+            ...snapshot.issues.map((iss) => `- ${iss.path}: ${iss.message}`),
+            "",
+            "Docs: https://docs.clawd.bot/gateway/configuration",
+          ].join("\n"),
+          "Config issues",
+        );
+      }
+      if (!snapshot.valid) {
+        const reset = guardCancel(
+          await confirm({
+            message: "Config invalid. Start fresh?",
+            initialValue: true,
           }),
-          "Open Control UI",
+          runtime,
+        );
+        if (reset) baseConfig = {};
+      }
+    }
+
+    const localUrl = "ws://127.0.0.1:18789";
+    const localProbe = await probeGatewayReachable({
+      url: localUrl,
+      token:
+        baseConfig.gateway?.auth?.token ?? process.env.CLAWDBOT_GATEWAY_TOKEN,
+      password:
+        baseConfig.gateway?.auth?.password ??
+        process.env.CLAWDBOT_GATEWAY_PASSWORD,
+    });
+    const remoteUrl = baseConfig.gateway?.remote?.url?.trim() ?? "";
+    const remoteProbe = remoteUrl
+      ? await probeGatewayReachable({
+          url: remoteUrl,
+          token: baseConfig.gateway?.remote?.token,
+        })
+      : null;
+
+    const mode = guardCancel(
+      await select({
+        message: "Where will the Gateway run?",
+        options: [
+          {
+            value: "local",
+            label: "Local (this machine)",
+            hint: localProbe.ok
+              ? `Gateway reachable (${localUrl})`
+              : `No gateway detected (${localUrl})`,
+          },
+          {
+            value: "remote",
+            label: "Remote (info-only)",
+            hint: !remoteUrl
+              ? "No remote URL configured yet"
+              : remoteProbe?.ok
+                ? `Gateway reachable (${remoteUrl})`
+                : `Configured but unreachable (${remoteUrl})`,
+          },
+        ],
+      }),
+      runtime,
+    ) as "local" | "remote";
+
+    if (mode === "remote") {
+      let remoteConfig = await promptRemoteGatewayConfig(baseConfig, prompter);
+      remoteConfig = applyWizardMetadata(remoteConfig, {
+        command: opts.command,
+        mode,
+      });
+      await writeConfigFile(remoteConfig);
+      runtime.log(`Updated ${CONFIG_PATH_CLAWDBOT}`);
+      outro("Remote gateway configured.");
+      return;
+    }
+
+    const selected = opts.sections
+      ? opts.sections
+      : (guardCancel(
+          await multiselect({
+            message: "Select sections to configure",
+            options: [
+              {
+                value: "workspace",
+                label: "Workspace",
+                hint: "Set default workspace + ensure sessions",
+              },
+              {
+                value: "model",
+                label: "Model/auth",
+                hint: "Pick model + auth profile sources",
+              },
+              {
+                value: "gateway",
+                label: "Gateway config",
+                hint: "Port/bind/auth/control UI settings",
+              },
+              {
+                value: "daemon",
+                label: "Gateway daemon",
+                hint: "Install/manage the background service",
+              },
+              {
+                value: "providers",
+                label: "Providers",
+                hint: "Link WhatsApp/Telegram/etc and defaults",
+              },
+              {
+                value: "skills",
+                label: "Skills",
+                hint: "Install/enable workspace skills",
+              },
+              {
+                value: "health",
+                label: "Health check",
+                hint: "Run gateway + provider checks",
+              },
+            ],
+          }),
+          runtime,
+        ) as WizardSection[]);
+
+    if (!selected || selected.length === 0) {
+      outro("No changes selected.");
+      return;
+    }
+
+    let nextConfig = { ...baseConfig };
+    let workspaceDir =
+      nextConfig.agents?.defaults?.workspace ??
+      baseConfig.agents?.defaults?.workspace ??
+      DEFAULT_WORKSPACE;
+    let gatewayPort = resolveGatewayPort(baseConfig);
+    let gatewayToken: string | undefined;
+
+    if (selected.includes("workspace")) {
+      const workspaceInput = guardCancel(
+        await text({
+          message: "Workspace directory",
+          initialValue: workspaceDir,
+        }),
+        runtime,
+      );
+      workspaceDir = resolveUserPath(
+        String(workspaceInput ?? "").trim() || DEFAULT_WORKSPACE,
+      );
+      nextConfig = {
+        ...nextConfig,
+        agents: {
+          ...nextConfig.agents,
+          defaults: {
+            ...nextConfig.agents?.defaults,
+            workspace: workspaceDir,
+          },
+        },
+      };
+      await ensureWorkspaceAndSessions(workspaceDir, runtime);
+    }
+
+    if (selected.includes("model")) {
+      nextConfig = await promptAuthConfig(nextConfig, runtime, prompter);
+    }
+
+    if (selected.includes("gateway")) {
+      const gateway = await promptGatewayConfig(nextConfig, runtime);
+      nextConfig = gateway.config;
+      gatewayPort = gateway.port;
+      gatewayToken = gateway.token;
+    }
+
+    if (selected.includes("providers")) {
+      const providerMode = guardCancel(
+        await select({
+          message: "Providers",
+          options: [
+            {
+              value: "configure",
+              label: "Configure/link",
+              hint: "Add/update providers; disable unselected accounts",
+            },
+            {
+              value: "remove",
+              label: "Remove provider config",
+              hint: "Delete provider tokens/settings from clawdbot.json",
+            },
+          ],
+          initialValue: "configure",
+        }),
+        runtime,
+      ) as ProvidersWizardMode;
+
+      if (providerMode === "configure") {
+        nextConfig = await setupProviders(nextConfig, runtime, prompter, {
+          allowDisable: true,
+          allowSignalInstall: true,
+        });
+      } else {
+        nextConfig = await removeProviderConfigWizard(nextConfig, runtime);
+      }
+    }
+
+    if (selected.includes("skills")) {
+      const wsDir = resolveUserPath(workspaceDir);
+      nextConfig = await setupSkills(nextConfig, wsDir, runtime, prompter);
+    }
+
+    nextConfig = applyWizardMetadata(nextConfig, {
+      command: opts.command,
+      mode,
+    });
+    await writeConfigFile(nextConfig);
+    runtime.log(`Updated ${CONFIG_PATH_CLAWDBOT}`);
+
+    if (selected.includes("daemon")) {
+      if (!selected.includes("gateway")) {
+        const portInput = guardCancel(
+          await text({
+            message: "Gateway port for daemon install",
+            initialValue: String(gatewayPort),
+            validate: (value) =>
+              Number.isFinite(Number(value)) ? undefined : "Invalid port",
+          }),
+          runtime,
+        );
+        gatewayPort = Number.parseInt(String(portInput), 10);
+      }
+
+      await maybeInstallDaemon({
+        runtime,
+        port: gatewayPort,
+        gatewayToken,
+      });
+    }
+
+    if (selected.includes("health")) {
+      await sleep(1000);
+      try {
+        await healthCommand({ json: false, timeoutMs: 10_000 }, runtime);
+      } catch (err) {
+        runtime.error(formatHealthCheckFailure(err));
+        note(
+          [
+            "Docs:",
+            "https://docs.clawd.bot/gateway/health",
+            "https://docs.clawd.bot/gateway/troubleshooting",
+          ].join("\n"),
+          "Health check help",
         );
       }
     }
-  }
 
-  outro("Configure complete.");
+    const controlUiAssets = await ensureControlUiAssetsBuilt(runtime);
+    if (!controlUiAssets.ok && controlUiAssets.message) {
+      runtime.error(controlUiAssets.message);
+    }
+
+    const bind = nextConfig.gateway?.bind ?? "loopback";
+    const links = resolveControlUiLinks({
+      bind,
+      port: gatewayPort,
+      basePath: nextConfig.gateway?.controlUi?.basePath,
+    });
+    const gatewayProbe = await probeGatewayReachable({
+      url: links.wsUrl,
+      token:
+        nextConfig.gateway?.auth?.token ?? process.env.CLAWDBOT_GATEWAY_TOKEN,
+      password:
+        nextConfig.gateway?.auth?.password ??
+        process.env.CLAWDBOT_GATEWAY_PASSWORD,
+    });
+    const gatewayStatusLine = gatewayProbe.ok
+      ? "Gateway: reachable"
+      : `Gateway: not detected${gatewayProbe.detail ? ` (${gatewayProbe.detail})` : ""}`;
+
+    note(
+      [
+        `Web UI: ${links.httpUrl}`,
+        `Gateway WS: ${links.wsUrl}`,
+        gatewayStatusLine,
+        "Docs: https://docs.clawd.bot/web/control-ui",
+      ].join("\n"),
+      "Control UI",
+    );
+
+    outro("Configure complete.");
+  } catch (err) {
+    if (err instanceof WizardCancelledError) {
+      runtime.exit(0);
+      return;
+    }
+    throw err;
+  }
 }
 
 export async function configureCommand(runtime: RuntimeEnv = defaultRuntime) {
   await runConfigureWizard({ command: "configure" }, runtime);
+}
+
+export async function configureCommandWithSections(
+  sections: WizardSection[],
+  runtime: RuntimeEnv = defaultRuntime,
+) {
+  await runConfigureWizard({ command: "configure", sections }, runtime);
 }

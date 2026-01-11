@@ -10,13 +10,27 @@ export async function onboardCommand(
   runtime: RuntimeEnv = defaultRuntime,
 ) {
   assertSupportedRuntime(runtime);
+  const authChoice =
+    opts.authChoice === "oauth" ? ("setup-token" as const) : opts.authChoice;
+  const normalizedOpts =
+    authChoice === opts.authChoice ? opts : { ...opts, authChoice };
 
-  if (opts.nonInteractive) {
-    await runNonInteractiveOnboarding(opts, runtime);
+  if (process.platform === "win32") {
+    runtime.log(
+      [
+        "Windows detected.",
+        "WSL2 is strongly recommended; native Windows is untested and more problematic.",
+        "Guide: https://docs.clawd.bot/windows",
+      ].join("\n"),
+    );
+  }
+
+  if (normalizedOpts.nonInteractive) {
+    await runNonInteractiveOnboarding(normalizedOpts, runtime);
     return;
   }
 
-  await runInteractiveOnboarding(opts, runtime);
+  await runInteractiveOnboarding(normalizedOpts, runtime);
 }
 
 export type { OnboardOptions } from "./onboard-types.js";

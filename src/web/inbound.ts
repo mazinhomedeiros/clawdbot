@@ -14,8 +14,11 @@ import {
 
 import { loadConfig } from "../config/config.js";
 import { logVerbose, shouldLogVerbose } from "../globals.js";
+import { createDedupeCache } from "../infra/dedupe.js";
+import { recordProviderActivity } from "../infra/provider-activity.js";
 import { createSubsystemLogger, getChildLogger } from "../logging.js";
 import { saveMediaBuffer } from "../media/store.js";
+import { buildPairingReply } from "../pairing/pairing-messages.js";
 import {
   readProviderAllowFromStore,
   upsertProviderPairingRequest,
@@ -28,6 +31,7 @@ import {
   isSelfChatMode,
   jidToE164,
   normalizeE164,
+  resolveJidToE164,
   toWhatsappJid,
 } from "../utils.js";
 import { resolveWhatsAppAccount } from "./accounts.js";
@@ -37,12 +41,24 @@ import {
   getStatusCode,
   waitForWaConnection,
 } from "./session.js";
+import { parseVcard } from "./vcard.js";
 
 export type WebListenerCloseReason = {
   status?: number;
   isLoggedOut: boolean;
   error?: unknown;
 };
+
+const RECENT_WEB_MESSAGE_TTL_MS = 20 * 60_000;
+const RECENT_WEB_MESSAGE_MAX = 5000;
+const recentInboundMessages = createDedupeCache({
+  ttlMs: RECENT_WEB_MESSAGE_TTL_MS,
+  maxSize: RECENT_WEB_MESSAGE_MAX,
+});
+
+export function resetWebInboundDedupe(): void {
+  recentInboundMessages.clear();
+}
 
 export type WebInboundMessage = {
   id?: string;
@@ -81,6 +97,7 @@ export async function monitorWebInbox(options: {
   accountId: string;
   authDir: string;
   onMessage: (msg: WebInboundMessage) => Promise<void>;
+  mediaMaxMb?: number;
 }) {
   const inboundLogger = getChildLogger({ module: "web-inbound" });
   const inboundConsoleLog = createSubsystemLogger(
@@ -112,12 +129,17 @@ export async function monitorWebInbox(options: {
   }
   const selfJid = sock.user?.id;
   const selfE164 = selfJid ? jidToE164(selfJid) : null;
-  const seen = new Set<string>();
   const groupMetaCache = new Map<
     string,
     { subject?: string; participants?: string[]; expires: number }
   >();
   const GROUP_META_TTL_MS = 5 * 60 * 1000; // 5 minutes
+  const lidLookup = sock.signalRepository?.lidMapping;
+
+  const resolveInboundJid = async (
+    jid: string | null | undefined,
+  ): Promise<string | null> =>
+    resolveJidToE164(jid, { authDir: options.authDir, lidLookup });
 
   const getGroupMeta = async (jid: string) => {
     const cached = groupMetaCache.get(jid);
@@ -125,9 +147,14 @@ export async function monitorWebInbox(options: {
     try {
       const meta = await sock.groupMetadata(jid);
       const participants =
-        meta.participants
-          ?.map((p) => jidToE164(p.id) ?? p.id)
-          .filter(Boolean) ?? [];
+        (
+          await Promise.all(
+            meta.participants?.map(async (p) => {
+              const mapped = await resolveInboundJid(p.id);
+              return mapped ?? p.id;
+            }) ?? [],
+          )
+        ).filter(Boolean) ?? [];
       const entry = {
         subject: meta.subject,
         participants,
@@ -147,10 +174,12 @@ export async function monitorWebInbox(options: {
   }) => {
     if (upsert.type !== "notify" && upsert.type !== "append") return;
     for (const msg of upsert.messages ?? []) {
+      recordProviderActivity({
+        provider: "whatsapp",
+        accountId: options.accountId,
+        direction: "inbound",
+      });
       const id = msg.key?.id ?? undefined;
-      // De-dupe on message id; Baileys can emit retries.
-      if (id && seen.has(id)) continue;
-      if (id) seen.add(id);
       // Note: not filtering fromMe here - echo detection happens in auto-reply layer
       const remoteJid = msg.key?.remoteJid;
       if (!remoteJid) continue;
@@ -158,13 +187,17 @@ export async function monitorWebInbox(options: {
       if (remoteJid.endsWith("@status") || remoteJid.endsWith("@broadcast"))
         continue;
       const group = isJidGroup(remoteJid);
+      if (id) {
+        const dedupeKey = `${options.accountId}:${remoteJid}:${id}`;
+        if (recentInboundMessages.check(dedupeKey)) continue;
+      }
       const participantJid = msg.key?.participant ?? undefined;
-      const from = group ? remoteJid : jidToE164(remoteJid);
+      const from = group ? remoteJid : await resolveInboundJid(remoteJid);
       // Skip if we still can't resolve an id to key conversation
       if (!from) continue;
       const senderE164 = group
         ? participantJid
-          ? jidToE164(participantJid)
+          ? await resolveInboundJid(participantJid)
           : null
         : from;
       let groupSubject: string | undefined;
@@ -202,6 +235,7 @@ export async function monitorWebInbox(options: {
           : undefined);
       const isSamePhone = from === selfE164;
       const isSelfChat = isSelfChatMode(selfE164, configuredAllowFrom);
+      const isFromMe = Boolean(msg.key?.fromMe);
 
       // Pre-compute normalized allowlists for filtering
       const dmHasWildcard = allowFrom?.includes("*") ?? false;
@@ -246,6 +280,10 @@ export async function monitorWebInbox(options: {
 
       // DM access control (secure defaults): "pairing" (default) / "allowlist" / "open" / "disabled"
       if (!group) {
+        if (isFromMe && !isSamePhone) {
+          logVerbose("Skipping outbound DM (fromMe); no pairing reply needed.");
+          continue;
+        }
         if (dmPolicy === "disabled") {
           logVerbose("Blocked dm (dmPolicy: disabled)");
           continue;
@@ -258,31 +296,30 @@ export async function monitorWebInbox(options: {
               normalizedAllowFrom.includes(candidate));
           if (!allowed) {
             if (dmPolicy === "pairing") {
-              const { code } = await upsertProviderPairingRequest({
+              const { code, created } = await upsertProviderPairingRequest({
                 provider: "whatsapp",
                 id: candidate,
                 meta: {
                   name: (msg.pushName ?? "").trim() || undefined,
                 },
               });
-              logVerbose(
-                `whatsapp pairing request sender=${candidate} name=${msg.pushName ?? "unknown"} code=${code}`,
-              );
-              try {
-                await sock.sendMessage(remoteJid, {
-                  text: [
-                    "Clawdbot: access not configured.",
-                    "",
-                    `Pairing code: ${code}`,
-                    "",
-                    "Ask the bot owner to approve with:",
-                    "clawdbot pairing approve --provider whatsapp <code>",
-                  ].join("\n"),
-                });
-              } catch (err) {
+              if (created) {
                 logVerbose(
-                  `whatsapp pairing reply failed for ${candidate}: ${String(err)}`,
+                  `whatsapp pairing request sender=${candidate} name=${msg.pushName ?? "unknown"}`,
                 );
+                try {
+                  await sock.sendMessage(remoteJid, {
+                    text: buildPairingReply({
+                      provider: "whatsapp",
+                      idLine: `Your WhatsApp phone number: ${candidate}`,
+                      code,
+                    }),
+                  });
+                } catch (err) {
+                  logVerbose(
+                    `whatsapp pairing reply failed for ${candidate}: ${String(err)}`,
+                  );
+                }
               }
             } else {
               logVerbose(
@@ -336,9 +373,16 @@ export async function monitorWebInbox(options: {
       try {
         const inboundMedia = await downloadInboundMedia(msg, sock);
         if (inboundMedia) {
+          const maxMb =
+            typeof options.mediaMaxMb === "number" && options.mediaMaxMb > 0
+              ? options.mediaMaxMb
+              : 50;
+          const maxBytes = maxMb * 1024 * 1024;
           const saved = await saveMediaBuffer(
             inboundMedia.buffer,
             inboundMedia.mimetype,
+            "inbound",
+            maxBytes,
           );
           mediaPath = saved.path;
           mediaType = inboundMedia.mimetype;
@@ -501,7 +545,7 @@ export async function monitorWebInbox(options: {
       text: string,
       mediaBuffer?: Buffer,
       mediaType?: string,
-      options?: ActiveWebSendOptions,
+      sendOptions?: ActiveWebSendOptions,
     ): Promise<{ messageId: string }> => {
       const jid = toWhatsappJid(to);
       let payload: AnyMessageContent;
@@ -519,7 +563,7 @@ export async function monitorWebInbox(options: {
             mimetype: mediaType,
           };
         } else if (mediaType.startsWith("video/")) {
-          const gifPlayback = options?.gifPlayback;
+          const gifPlayback = sendOptions?.gifPlayback;
           payload = {
             video: mediaBuffer,
             caption: text || undefined,
@@ -538,6 +582,12 @@ export async function monitorWebInbox(options: {
         payload = { text };
       }
       const result = await sock.sendMessage(jid, payload);
+      const accountId = sendOptions?.accountId ?? options.accountId;
+      recordProviderActivity({
+        provider: "whatsapp",
+        accountId,
+        direction: "outbound",
+      });
       return { messageId: result?.key?.id ?? "unknown" };
     },
     /**
@@ -556,7 +606,36 @@ export async function monitorWebInbox(options: {
           selectableCount: poll.maxSelections ?? 1,
         },
       });
+      recordProviderActivity({
+        provider: "whatsapp",
+        accountId: options.accountId,
+        direction: "outbound",
+      });
       return { messageId: result?.key?.id ?? "unknown" };
+    },
+    /**
+     * Send a reaction (emoji) to a specific message.
+     * Pass an empty string for emoji to remove the reaction.
+     */
+    sendReaction: async (
+      chatJid: string,
+      messageId: string,
+      emoji: string,
+      fromMe: boolean,
+      participant?: string,
+    ): Promise<void> => {
+      const jid = toWhatsappJid(chatJid);
+      await sock.sendMessage(jid, {
+        react: {
+          text: emoji,
+          key: {
+            remoteJid: jid,
+            id: messageId,
+            fromMe,
+            participant: participant ? toWhatsappJid(participant) : undefined,
+          },
+        },
+      });
     },
     /**
      * Send typing indicator ("composing") to a chat.
@@ -666,6 +745,12 @@ export function extractText(
       candidate.documentMessage?.caption;
     if (caption?.trim()) return caption.trim();
   }
+  const contactPlaceholder =
+    extractContactPlaceholder(message) ??
+    (extracted && extracted !== message
+      ? extractContactPlaceholder(extracted as proto.IMessage | undefined)
+      : undefined);
+  if (contactPlaceholder) return contactPlaceholder;
   return undefined;
 }
 
@@ -680,6 +765,89 @@ export function extractMediaPlaceholder(
   if (message.documentMessage) return "<media:document>";
   if (message.stickerMessage) return "<media:sticker>";
   return undefined;
+}
+
+function extractContactPlaceholder(
+  rawMessage: proto.IMessage | undefined,
+): string | undefined {
+  const message = unwrapMessage(rawMessage);
+  if (!message) return undefined;
+  const contact = message.contactMessage ?? undefined;
+  if (contact) {
+    const { name, phones } = describeContact({
+      displayName: contact.displayName,
+      vcard: contact.vcard,
+    });
+    return formatContactPlaceholder(name, phones);
+  }
+  const contactsArray = message.contactsArrayMessage?.contacts ?? undefined;
+  if (!contactsArray || contactsArray.length === 0) return undefined;
+  const labels = contactsArray
+    .map((entry) =>
+      describeContact({ displayName: entry.displayName, vcard: entry.vcard }),
+    )
+    .map((entry) => formatContactLabel(entry.name, entry.phones))
+    .filter((value): value is string => Boolean(value));
+  return formatContactsPlaceholder(labels, contactsArray.length);
+}
+
+function describeContact(input: {
+  displayName?: string | null;
+  vcard?: string | null;
+}): { name?: string; phones: string[] } {
+  const displayName = (input.displayName ?? "").trim();
+  const parsed = parseVcard(input.vcard ?? undefined);
+  const name = displayName || parsed.name;
+  return { name, phones: parsed.phones };
+}
+
+function formatContactPlaceholder(name?: string, phones?: string[]): string {
+  const label = formatContactLabel(name, phones);
+  if (!label) return "<contact>";
+  return `<contact: ${label}>`;
+}
+
+function formatContactsPlaceholder(labels: string[], total: number): string {
+  const cleaned = labels.map((label) => label.trim()).filter(Boolean);
+  if (cleaned.length === 0) {
+    const suffix = total === 1 ? "contact" : "contacts";
+    return `<contacts: ${total} ${suffix}>`;
+  }
+  const remaining = Math.max(total - cleaned.length, 0);
+  const suffix = remaining > 0 ? ` +${remaining} more` : "";
+  return `<contacts: ${cleaned.join(", ")}${suffix}>`;
+}
+
+function formatContactLabel(
+  name?: string,
+  phones?: string[],
+): string | undefined {
+  const phoneLabel = formatPhoneList(phones);
+  const parts = [name, phoneLabel].filter((value): value is string =>
+    Boolean(value),
+  );
+  if (parts.length === 0) return undefined;
+  return parts.join(", ");
+}
+
+function formatPhoneList(phones?: string[]): string | undefined {
+  const cleaned = phones?.map((phone) => phone.trim()).filter(Boolean) ?? [];
+  if (cleaned.length === 0) return undefined;
+  const { shown, remaining } = summarizeList(cleaned, cleaned.length, 1);
+  const [primary] = shown;
+  if (!primary) return undefined;
+  if (remaining === 0) return primary;
+  return `${primary} (+${remaining} more)`;
+}
+
+function summarizeList(
+  values: string[],
+  total: number,
+  maxShown: number,
+): { shown: string[]; remaining: number } {
+  const shown = values.slice(0, maxShown);
+  const remaining = Math.max(total - shown.length, 0);
+  return { shown, remaining };
 }
 
 export function extractLocationData(

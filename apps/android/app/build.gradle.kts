@@ -1,3 +1,5 @@
+import com.android.build.api.variant.impl.VariantOutputImpl
+
 plugins {
   id("com.android.application")
   id("org.jetbrains.kotlin.android")
@@ -19,8 +21,8 @@ android {
     applicationId = "com.clawdbot.android"
     minSdk = 31
     targetSdk = 36
-    versionCode = 1
-    versionName = "2.0.0-beta3"
+    versionCode = 20260109
+    versionName = "2026.1.9"
   }
 
   buildTypes {
@@ -47,6 +49,7 @@ android {
 
   lint {
     disable += setOf("IconLauncherShape")
+    warningsAsErrors = true
   }
 
   testOptions {
@@ -54,9 +57,23 @@ android {
   }
 }
 
+androidComponents {
+  onVariants { variant ->
+    variant.outputs
+      .filterIsInstance<VariantOutputImpl>()
+      .forEach { output ->
+        val versionName = output.versionName.orNull ?: "0"
+        val buildType = variant.buildType
+
+        val outputFileName = "clawdbot-${versionName}-${buildType}.apk"
+        output.outputFileName = outputFileName
+      }
+  }
+}
 kotlin {
   compilerOptions {
     jvmTarget.set(org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_17)
+    allWarningsAsErrors.set(true)
   }
 }
 
@@ -85,6 +102,7 @@ dependencies {
   implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.9.0")
 
   implementation("androidx.security:security-crypto:1.1.0")
+  implementation("androidx.exifinterface:exifinterface:1.4.2")
 
   // CameraX (for node.invoke camera.* parity)
   implementation("androidx.camera:camera-core:1.5.2")

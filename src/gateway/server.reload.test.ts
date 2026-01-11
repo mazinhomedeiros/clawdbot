@@ -42,6 +42,7 @@ const hoisted = vi.hoisted(() => {
         lastEventAt: null,
         lastError: null,
       },
+      whatsappAccounts: {},
       telegram: {
         running: false,
         lastStartAt: null,
@@ -49,18 +50,21 @@ const hoisted = vi.hoisted(() => {
         lastError: null,
         mode: null,
       },
+      telegramAccounts: {},
       discord: {
         running: false,
         lastStartAt: null,
         lastStopAt: null,
         lastError: null,
       },
+      discordAccounts: {},
       slack: {
         running: false,
         lastStartAt: null,
         lastStopAt: null,
         lastError: null,
       },
+      slackAccounts: {},
       signal: {
         running: false,
         lastStartAt: null,
@@ -68,6 +72,7 @@ const hoisted = vi.hoisted(() => {
         lastError: null,
         baseUrl: null,
       },
+      signalAccounts: {},
       imessage: {
         running: false,
         lastStartAt: null,
@@ -75,6 +80,13 @@ const hoisted = vi.hoisted(() => {
         lastError: null,
         cliPath: null,
         dbPath: null,
+      },
+      imessageAccounts: {},
+      msteams: {
+        running: false,
+        lastStartAt: null,
+        lastStopAt: null,
+        lastError: null,
       },
     })),
     startProviders: vi.fn(async () => {}),
@@ -90,6 +102,8 @@ const hoisted = vi.hoisted(() => {
     stopSignalProvider: vi.fn(async () => {}),
     startIMessageProvider: vi.fn(async () => {}),
     stopIMessageProvider: vi.fn(async () => {}),
+    startMSTeamsProvider: vi.fn(async () => {}),
+    stopMSTeamsProvider: vi.fn(async () => {}),
     markWhatsAppLoggedOut: vi.fn(),
   };
 
@@ -196,7 +210,7 @@ describe("gateway hot reload", () => {
         gmail: { account: "me@example.com" },
       },
       cron: { enabled: true, store: "/tmp/cron.json" },
-      agent: { heartbeat: { every: "1m" }, maxConcurrent: 2 },
+      agents: { defaults: { heartbeat: { every: "1m" }, maxConcurrent: 2 } },
       browser: { enabled: true, controlUrl: "http://127.0.0.1:18791" },
       web: { enabled: true },
       telegram: { botToken: "token" },
@@ -210,7 +224,7 @@ describe("gateway hot reload", () => {
         changedPaths: [
           "hooks.gmail.account",
           "cron.enabled",
-          "agent.heartbeat.every",
+          "agents.defaults.heartbeat.every",
           "browser.enabled",
           "web.enabled",
           "telegram.botToken",

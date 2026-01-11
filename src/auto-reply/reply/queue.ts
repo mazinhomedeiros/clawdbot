@@ -3,7 +3,14 @@ import { parseDurationMs } from "../../cli/parse-duration.js";
 import type { ClawdbotConfig } from "../../config/config.js";
 import type { SessionEntry } from "../../config/sessions.js";
 import { defaultRuntime } from "../../runtime.js";
-import type { ElevatedLevel, ThinkLevel, VerboseLevel } from "./directives.js";
+import type { OriginatingChannelType } from "../templating.js";
+import type {
+  ElevatedLevel,
+  ReasoningLevel,
+  ThinkLevel,
+  VerboseLevel,
+} from "./directives.js";
+import { isRoutableChannel } from "./route-reply.js";
 export type QueueMode =
   | "steer"
   | "followup"
@@ -20,14 +27,32 @@ export type QueueSettings = {
 };
 export type FollowupRun = {
   prompt: string;
+  /** Provider message ID, when available (for deduplication). */
+  messageId?: string;
   summaryLine?: string;
   enqueuedAt: number;
+  /**
+   * Originating channel for reply routing.
+   * When set, replies should be routed back to this provider
+   * instead of using the session's lastChannel.
+   */
+  originatingChannel?: OriginatingChannelType;
+  /**
+   * Originating destination for reply routing.
+   * The chat/channel/user ID where the reply should be sent.
+   */
+  originatingTo?: string;
+  /** Provider account id (multi-account). */
+  originatingAccountId?: string;
+  /** Telegram forum topic thread id. */
+  originatingThreadId?: number;
   run: {
     agentId: string;
     agentDir: string;
     sessionId: string;
     sessionKey?: string;
     messageProvider?: string;
+    agentAccountId?: string;
     sessionFile: string;
     workspaceDir: string;
     config: ClawdbotConfig;
@@ -37,6 +62,7 @@ export type FollowupRun = {
     authProfileId?: string;
     thinkLevel?: ThinkLevel;
     verboseLevel?: VerboseLevel;
+    reasoningLevel?: ReasoningLevel;
     elevatedLevel?: ElevatedLevel;
     bashElevated?: {
       enabled: boolean;
@@ -247,8 +273,9 @@ export function extractQueueDirective(body?: string): {
   const argsStart = start + "/queue".length;
   const args = body.slice(argsStart);
   const parsed = parseQueueDirectiveArgs(args);
-  const cleanedRaw =
-    body.slice(0, start) + body.slice(argsStart + parsed.consumed);
+  const cleanedRaw = `${body.slice(0, start)} ${body.slice(
+    argsStart + parsed.consumed,
+  )}`;
   const cleaned = cleanedRaw.replace(/\s+/g, " ").trim();
   return {
     cleaned,
@@ -312,14 +339,45 @@ function getFollowupQueue(
   FOLLOWUP_QUEUES.set(key, created);
   return created;
 }
+/**
+ * Check if a run is already queued using a stable dedup key.
+ */
+function isRunAlreadyQueued(
+  run: FollowupRun,
+  queue: FollowupQueueState,
+): boolean {
+  const hasSameRouting = (item: FollowupRun) =>
+    item.originatingChannel === run.originatingChannel &&
+    item.originatingTo === run.originatingTo &&
+    item.originatingAccountId === run.originatingAccountId &&
+    item.originatingThreadId === run.originatingThreadId;
+
+  const messageId = run.messageId?.trim();
+  if (messageId) {
+    return queue.items.some(
+      (item) => item.messageId?.trim() === messageId && hasSameRouting(item),
+    );
+  }
+  return queue.items.some(
+    (item) => item.prompt === run.prompt && hasSameRouting(item),
+  );
+}
+
 export function enqueueFollowupRun(
   key: string,
   run: FollowupRun,
   settings: QueueSettings,
 ): boolean {
   const queue = getFollowupQueue(key, settings);
+
+  // Deduplicate: skip if the same message is already queued.
+  if (isRunAlreadyQueued(run, queue)) {
+    return false;
+  }
+
   queue.lastEnqueuedAt = Date.now();
   queue.lastRun = run.run;
+
   const cap = queue.cap;
   if (cap > 0 && queue.items.length >= cap) {
     if (queue.dropPolicy === "new") {
@@ -374,6 +432,44 @@ function buildCollectPrompt(items: FollowupRun[], summary?: string): string {
   });
   return blocks.join("\n\n");
 }
+
+/**
+ * Checks if queued items have different routable originating channels.
+ *
+ * Returns true if messages come from different providers (e.g., Slack + Telegram),
+ * meaning they cannot be safely collected into one prompt without losing routing.
+ * Also returns true for a mix of routable and non-routable channels.
+ */
+function hasCrossProviderItems(items: FollowupRun[]): boolean {
+  const keys = new Set<string>();
+  let hasUnkeyed = false;
+
+  for (const item of items) {
+    const channel = item.originatingChannel;
+    const to = item.originatingTo;
+    const accountId = item.originatingAccountId;
+    const threadId = item.originatingThreadId;
+    if (!channel && !to && !accountId && typeof threadId !== "number") {
+      hasUnkeyed = true;
+      continue;
+    }
+    if (!isRoutableChannel(channel) || !to) {
+      return true;
+    }
+    keys.add(
+      [
+        channel,
+        to,
+        accountId || "",
+        typeof threadId === "number" ? String(threadId) : "",
+      ].join("|"),
+    );
+  }
+
+  if (keys.size === 0) return false;
+  if (hasUnkeyed) return true;
+  return keys.size > 1;
+}
 export function scheduleFollowupDrain(
   key: string,
   runFollowup: (run: FollowupRun) => Promise<void>,
@@ -383,18 +479,63 @@ export function scheduleFollowupDrain(
   queue.draining = true;
   void (async () => {
     try {
+      let forceIndividualCollect = false;
       while (queue.items.length > 0 || queue.droppedCount > 0) {
         await waitForQueueDebounce(queue);
         if (queue.mode === "collect") {
+          // Once the batch is mixed, never collect again within this drain.
+          // Prevents “collect after shift” collapsing different targets.
+          //
+          // Debug: `pnpm test src/auto-reply/reply/queue.collect-routing.test.ts`
+          if (forceIndividualCollect) {
+            const next = queue.items.shift();
+            if (!next) break;
+            await runFollowup(next);
+            continue;
+          }
+
+          // Check if messages span multiple providers.
+          // If so, process individually to preserve per-message routing.
+          const isCrossProvider = hasCrossProviderItems(queue.items);
+
+          if (isCrossProvider) {
+            forceIndividualCollect = true;
+            // Process one at a time to preserve per-message routing info.
+            const next = queue.items.shift();
+            if (!next) break;
+            await runFollowup(next);
+            continue;
+          }
+
+          // Same-provider messages can be safely collected.
           const items = queue.items.splice(0, queue.items.length);
           const summary = buildSummaryPrompt(queue);
           const run = items.at(-1)?.run ?? queue.lastRun;
           if (!run) break;
+
+          // Preserve originating channel from items when collecting same-provider.
+          const originatingChannel = items.find(
+            (i) => i.originatingChannel,
+          )?.originatingChannel;
+          const originatingTo = items.find(
+            (i) => i.originatingTo,
+          )?.originatingTo;
+          const originatingAccountId = items.find(
+            (i) => i.originatingAccountId,
+          )?.originatingAccountId;
+          const originatingThreadId = items.find(
+            (i) => typeof i.originatingThreadId === "number",
+          )?.originatingThreadId;
+
           const prompt = buildCollectPrompt(items, summary);
           await runFollowup({
             prompt,
             run,
             enqueuedAt: Date.now(),
+            originatingChannel,
+            originatingTo,
+            originatingAccountId,
+            originatingThreadId,
           });
           continue;
         }
@@ -445,7 +586,7 @@ export function resolveQueueSettings(params: {
   inlineOptions?: Partial<QueueSettings>;
 }): QueueSettings {
   const providerKey = params.provider?.trim().toLowerCase();
-  const queueCfg = params.cfg.routing?.queue;
+  const queueCfg = params.cfg.messages?.queue;
   const providerModeRaw =
     providerKey && queueCfg?.byProvider
       ? (queueCfg.byProvider as Record<string, string | undefined>)[providerKey]
@@ -479,4 +620,12 @@ export function resolveQueueSettings(params: {
       typeof capRaw === "number" ? Math.max(1, Math.floor(capRaw)) : undefined,
     dropPolicy: dropRaw,
   };
+}
+
+export function getFollowupQueueDepth(key: string): number {
+  const cleaned = key.trim();
+  if (!cleaned) return 0;
+  const queue = FOLLOWUP_QUEUES.get(cleaned);
+  if (!queue) return 0;
+  return queue.items.length;
 }

@@ -4,7 +4,9 @@ import process from "node:process";
 declare const __CLAWDBOT_VERSION__: string | undefined;
 
 const BUNDLED_VERSION =
-  typeof __CLAWDBOT_VERSION__ === "string" ? __CLAWDBOT_VERSION__ : "0.0.0";
+  (typeof __CLAWDBOT_VERSION__ === "string" && __CLAWDBOT_VERSION__) ||
+  process.env.CLAWDBOT_BUNDLED_VERSION ||
+  "0.0.0";
 
 function hasFlag(args: string[], flag: string): boolean {
   return args.includes(flag);
@@ -32,6 +34,20 @@ async function main() {
     process.exit(0);
   }
 
+  const { parseRelaySmokeTest, runRelaySmokeTest } = await import(
+    "./relay-smoke.js"
+  );
+  const smokeTest = parseRelaySmokeTest(args, process.env);
+  if (smokeTest) {
+    try {
+      await runRelaySmokeTest(smokeTest);
+      process.exit(0);
+    } catch (err) {
+      console.error(`Relay smoke test failed (${smokeTest}):`, err);
+      process.exit(1);
+    }
+  }
+
   await patchBunLongForProtobuf();
 
   const { loadDotEnv } = await import("../infra/dotenv.js");
@@ -45,21 +61,14 @@ async function main() {
 
   const { assertSupportedRuntime } = await import("../infra/runtime-guard.js");
   assertSupportedRuntime();
-  const { isUnhandledRejectionHandled } = await import(
+  const { installUnhandledRejectionHandler } = await import(
     "../infra/unhandled-rejections.js"
   );
 
   const { buildProgram } = await import("../cli/program.js");
   const program = buildProgram();
 
-  process.on("unhandledRejection", (reason, _promise) => {
-    if (isUnhandledRejectionHandled(reason)) return;
-    console.error(
-      "[clawdbot] Unhandled promise rejection:",
-      reason instanceof Error ? (reason.stack ?? reason.message) : reason,
-    );
-    process.exit(1);
-  });
+  installUnhandledRejectionHandler();
 
   process.on("uncaughtException", (error) => {
     console.error(

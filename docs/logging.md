@@ -1,110 +1,144 @@
 ---
-summary: "Logging surfaces, file logs, WS log styles, and console formatting"
+summary: "Logging overview: file logs, console output, CLI tailing, and the Control UI"
 read_when:
-  - Changing logging output or formats
-  - Debugging CLI or gateway output
+  - You need a beginner-friendly overview of logging
+  - You want to configure log levels or formats
+  - You are troubleshooting and need to find logs quickly
 ---
 
 # Logging
 
-Clawdbot has two log “surfaces”:
+Clawdbot logs in two places:
 
-- **Console output** (what you see in the terminal / Debug UI).
-- **File logs** (JSON lines) written by the internal logger.
+- **File logs** (JSON lines) written by the Gateway.
+- **Console output** shown in terminals and the Control UI.
 
-## File-based logger
+This page explains where logs live, how to read them, and how to configure log
+levels and formats.
 
-Clawdbot uses a file logger backed by `tslog` (`src/logging.ts`).
+## Where logs live
 
-- Default rolling log file is under `/tmp/clawdbot/` (one file per day): `clawdbot-YYYY-MM-DD.log`
-- The log file path and level can be configured via `~/.clawdbot/clawdbot.json`:
-  - `logging.file`
-  - `logging.level`
+By default, the Gateway writes a rolling log file under:
 
-The file format is one JSON object per line.
+`/tmp/clawdbot/clawdbot-YYYY-MM-DD.log`
 
-**Verbose vs. log levels**
+You can override this in `~/.clawdbot/clawdbot.json`:
 
-- **File logs** are controlled exclusively by `logging.level`.
-- `--verbose` only affects **console verbosity** (and WS log style); it does **not**
-  raise the file log level.
-- To capture verbose-only details in file logs, set `logging.level` to `debug` or
-  `trace`.
-
-## Console capture
-
-The CLI entrypoint enables console capture (`src/index.ts` calls `enableConsoleCapture()`).
-That means every `console.log/info/warn/error/debug/trace` is also written into the file logs,
-while still behaving normally on stdout/stderr.
-
-You can tune console verbosity independently via:
-
-- `logging.consoleLevel` (default `info`)
-- `logging.consoleStyle` (`pretty` | `compact` | `json`)
-
-## Tool summary redaction
-
-Verbose tool summaries (e.g. `🛠️ bash: ...`) can mask sensitive tokens before they hit the
-console stream. This is **tools-only** and does not alter file logs.
-
-- `logging.redactSensitive`: `off` | `tools` (default: `tools`)
-- `logging.redactPatterns`: array of regex strings (overrides defaults)
-  - Use raw regex strings (auto `gi`), or `/pattern/flags` if you need custom flags.
-  - Matches are masked by keeping the first 6 + last 4 chars (length >= 18), otherwise `***`.
-  - Defaults cover common key assignments, CLI flags, JSON fields, bearer headers, PEM blocks, and popular token prefixes.
-
-## Gateway WebSocket logs
-
-The gateway prints WebSocket protocol logs in two modes:
-
-- **Normal mode (no `--verbose`)**: only “interesting” RPC results are printed:
-  - errors (`ok=false`)
-  - slow calls (default threshold: `>= 50ms`)
-  - parse errors
-- **Verbose mode (`--verbose`)**: prints all WS request/response traffic.
-
-### WS log style
-
-`clawdbot gateway` supports a per-gateway style switch:
-
-- `--ws-log auto` (default): normal mode is optimized; verbose mode uses compact output
-- `--ws-log compact`: compact output (paired request/response) when verbose
-- `--ws-log full`: full per-frame output when verbose
-- `--compact`: alias for `--ws-log compact`
-
-Examples:
-
-```bash
-# optimized (only errors/slow)
-clawdbot gateway
-
-# show all WS traffic (paired)
-clawdbot gateway --verbose --ws-log compact
-
-# show all WS traffic (full meta)
-clawdbot gateway --verbose --ws-log full
+```json
+{
+  "logging": {
+    "file": "/path/to/clawdbot.log"
+  }
+}
 ```
 
-## Console formatting (subsystem logging)
+## How to read logs
 
-Clawdbot formats console logs via a small wrapper on top of the existing stack:
+### CLI: live tail (recommended)
 
-- **tslog** for structured file logs (`src/logging.ts`)
-- **chalk** for colors (`src/globals.ts`)
+Use the CLI to tail the gateway log file via RPC:
 
-The console formatter is **TTY-aware** and prints consistent, prefixed lines.
-Subsystem loggers are created via `createSubsystemLogger("gateway")`.
+```bash
+clawdbot logs --follow
+```
 
-Behavior:
+Output modes:
 
-- **Subsystem prefixes** on every line (e.g. `[gateway]`, `[canvas]`, `[tailscale]`)
-- **Subsystem colors** (stable per subsystem) plus level coloring
-- **Color when output is a TTY or the environment looks like a rich terminal** (`TERM`/`COLORTERM`/`TERM_PROGRAM`), respects `NO_COLOR`
-- **Shortened subsystem prefixes**: drops leading `gateway/` + `providers/`, keeps last 2 segments (e.g. `whatsapp/outbound`)
-- **Sub-loggers by subsystem** (auto prefix + structured field `{ subsystem }`)
-- **`logRaw()`** for QR/UX output (no prefix, no formatting)
-- **Console styles** (e.g. `pretty | compact | json`)
-- **Console log level** separate from file log level (file keeps full detail when `logging.level` is set to `debug`/`trace`)
-- **WhatsApp message bodies** are logged at `debug` (use `--verbose` to see them)
+- **TTY sessions**: pretty, colorized, structured log lines.
+- **Non-TTY sessions**: plain text.
+- `--json`: line-delimited JSON (one log event per line).
+- `--plain`: force plain text in TTY sessions.
+- `--no-color`: disable ANSI colors.
 
-This keeps existing file logs stable while making interactive output scannable.
+In JSON mode, the CLI emits `type`-tagged objects:
+
+- `meta`: stream metadata (file, cursor, size)
+- `log`: parsed log entry
+- `notice`: truncation / rotation hints
+- `raw`: unparsed log line
+
+If the Gateway is unreachable, the CLI prints a short hint to run:
+
+```bash
+clawdbot doctor
+```
+
+### Control UI (web)
+
+The Control UI’s **Logs** tab tails the same file using `logs.tail`.
+See [/web/control-ui](/web/control-ui) for how to open it.
+
+### Provider-only logs
+
+To filter provider activity (WhatsApp/Telegram/etc), use:
+
+```bash
+clawdbot providers logs --provider whatsapp
+```
+
+## Log formats
+
+### File logs (JSONL)
+
+Each line in the log file is a JSON object. The CLI and Control UI parse these
+entries to render structured output (time, level, subsystem, message).
+
+### Console output
+
+Console logs are **TTY-aware** and formatted for readability:
+
+- Subsystem prefixes (e.g. `gateway/providers/whatsapp`)
+- Level coloring (info/warn/error)
+- Optional compact or JSON mode
+
+Console formatting is controlled by `logging.consoleStyle`.
+
+## Configuring logging
+
+All logging configuration lives under `logging` in `~/.clawdbot/clawdbot.json`.
+
+```json
+{
+  "logging": {
+    "level": "info",
+    "file": "/tmp/clawdbot/clawdbot-YYYY-MM-DD.log",
+    "consoleLevel": "info",
+    "consoleStyle": "pretty",
+    "redactSensitive": "tools",
+    "redactPatterns": [
+      "sk-.*"
+    ]
+  }
+}
+```
+
+### Log levels
+
+- `logging.level`: **file logs** (JSONL) level.
+- `logging.consoleLevel`: **console** verbosity level.
+
+`--verbose` only affects console output; it does not change file log levels.
+
+### Console styles
+
+`logging.consoleStyle`:
+
+- `pretty`: human-friendly, colored, with timestamps.
+- `compact`: tighter output (best for long sessions).
+- `json`: JSON per line (for log processors).
+
+### Redaction
+
+Tool summaries can redact sensitive tokens before they hit the console:
+
+- `logging.redactSensitive`: `off` | `tools` (default: `tools`)
+- `logging.redactPatterns`: list of regex strings to override the default set
+
+Redaction affects **console output only** and does not alter file logs.
+
+## Troubleshooting tips
+
+- **Gateway not reachable?** Run `clawdbot doctor` first.
+- **Logs empty?** Check that the Gateway is running and writing to the file path
+  in `logging.file`.
+- **Need more detail?** Set `logging.level` to `debug` or `trace` and retry.

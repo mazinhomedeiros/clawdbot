@@ -2,6 +2,8 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
+import { resolveBrewPathDirs } from "./brew.js";
+
 type EnsureClawdbotPathOpts = {
   execPath?: string;
   cwd?: string;
@@ -55,7 +57,7 @@ function candidateBinDirs(opts: EnsureClawdbotPathOpts): string[] {
 
   const candidates: string[] = [];
 
-  // Bun bundled (macOS app): `clawdbot` lives in the Relay dir (process.execPath).
+  // Bundled macOS app: `clawdbot` lives in the Relay dir (process.execPath).
   try {
     const execDir = path.dirname(execPath);
     const siblingClawdbot = path.join(execDir, "clawdbot");
@@ -75,6 +77,8 @@ function candidateBinDirs(opts: EnsureClawdbotPathOpts): string[] {
   const miseShims = path.join(miseDataDir, "shims");
   if (isDirectory(miseShims)) candidates.push(miseShims);
 
+  candidates.push(...resolveBrewPathDirs({ homeDir }));
+
   // Common global install locations (macOS first).
   if (platform === "darwin") {
     candidates.push(path.join(homeDir, "Library", "pnpm"));
@@ -91,7 +95,7 @@ function candidateBinDirs(opts: EnsureClawdbotPathOpts): string[] {
 
 /**
  * Best-effort PATH bootstrap so skills that require the `clawdbot` CLI can run
- * under launchd/minimal environments (and inside the macOS bun bundle).
+ * under launchd/minimal environments (and inside the macOS app bundle).
  */
 export function ensureClawdbotCliOnPath(opts: EnsureClawdbotPathOpts = {}) {
   if (process.env.CLAWDBOT_PATH_BOOTSTRAPPED === "1") return;

@@ -1,5 +1,6 @@
 node_modules
 .env
+docker-compose.extra.yml
 dist
 *.bun-build
 pnpm-lock.yaml
@@ -50,3 +51,7 @@ apps/ios/*.dSYM.zip
 # provisioning profiles (local)
 apps/ios/*.mobileprovision
 .env
+
+# Local untracked files
+.local/
+.vscode/

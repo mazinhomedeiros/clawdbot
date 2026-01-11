@@ -1,8 +1,64 @@
+import { resolveAgentConfig } from "../../agents/agent-scope.js";
 import type { ClawdbotConfig } from "../../config/config.js";
 import type { MsgContext } from "../templating.js";
 
-export function buildMentionRegexes(cfg: ClawdbotConfig | undefined): RegExp[] {
-  const patterns = cfg?.routing?.groupChat?.mentionPatterns ?? [];
+function escapeRegExp(text: string): string {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function deriveMentionPatterns(identity?: { name?: string; emoji?: string }) {
+  const patterns: string[] = [];
+  const name = identity?.name?.trim();
+  if (name) {
+    const parts = name.split(/\s+/).filter(Boolean).map(escapeRegExp);
+    const re = parts.length ? parts.join(String.raw`\s+`) : escapeRegExp(name);
+    patterns.push(String.raw`\b@?${re}\b`);
+  }
+  const emoji = identity?.emoji?.trim();
+  if (emoji) {
+    patterns.push(escapeRegExp(emoji));
+  }
+  return patterns;
+}
+
+const BACKSPACE_CHAR = "\u0008";
+
+export const CURRENT_MESSAGE_MARKER = "[Current message - respond to this]";
+
+function normalizeMentionPattern(pattern: string): string {
+  if (!pattern.includes(BACKSPACE_CHAR)) return pattern;
+  return pattern.split(BACKSPACE_CHAR).join("\\b");
+}
+
+function normalizeMentionPatterns(patterns: string[]): string[] {
+  return patterns.map(normalizeMentionPattern);
+}
+
+function resolveMentionPatterns(
+  cfg: ClawdbotConfig | undefined,
+  agentId?: string,
+): string[] {
+  if (!cfg) return [];
+  const agentConfig = agentId ? resolveAgentConfig(cfg, agentId) : undefined;
+  const agentGroupChat = agentConfig?.groupChat;
+  if (agentGroupChat && Object.hasOwn(agentGroupChat, "mentionPatterns")) {
+    return agentGroupChat.mentionPatterns ?? [];
+  }
+  const globalGroupChat = cfg.messages?.groupChat;
+  if (globalGroupChat && Object.hasOwn(globalGroupChat, "mentionPatterns")) {
+    return globalGroupChat.mentionPatterns ?? [];
+  }
+  const derived = deriveMentionPatterns(agentConfig?.identity);
+  return derived.length > 0 ? derived : [];
+}
+
+export function buildMentionRegexes(
+  cfg: ClawdbotConfig | undefined,
+  agentId?: string,
+): RegExp[] {
+  const patterns = normalizeMentionPatterns(
+    resolveMentionPatterns(cfg, agentId),
+  );
   return patterns
     .map((pattern) => {
       try {
@@ -33,13 +89,18 @@ export function matchesMentionPatterns(
 export function stripStructuralPrefixes(text: string): string {
   // Ignore wrapper labels, timestamps, and sender prefixes so directive-only
   // detection still works in group batches that include history/context.
-  const marker = "[Current message - respond to this]";
-  const afterMarker = text.includes(marker)
-    ? text.slice(text.indexOf(marker) + marker.length)
+  const afterMarker = text.includes(CURRENT_MESSAGE_MARKER)
+    ? text
+        .slice(
+          text.indexOf(CURRENT_MESSAGE_MARKER) + CURRENT_MESSAGE_MARKER.length,
+        )
+        .trimStart()
     : text;
+
   return afterMarker
     .replace(/\[[^\]]+\]\s*/g, "")
     .replace(/^[ \t]*[A-Za-z0-9+()\-_. ]+:\s*/gm, "")
+    .replace(/\\n/g, " ")
     .replace(/\s+/g, " ")
     .trim();
 }
@@ -48,9 +109,12 @@ export function stripMentions(
   text: string,
   ctx: MsgContext,
   cfg: ClawdbotConfig | undefined,
+  agentId?: string,
 ): string {
   let result = text;
-  const patterns = cfg?.routing?.groupChat?.mentionPatterns ?? [];
+  const rawPatterns = resolveMentionPatterns(cfg, agentId);
+  const patterns = normalizeMentionPatterns(rawPatterns);
+
   for (const p of patterns) {
     try {
       const re = new RegExp(p, "gi");

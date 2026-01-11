@@ -169,7 +169,9 @@ export async function createWaSocket(
           const status = getStatusCode(lastDisconnect?.error);
           if (status === DisconnectReason.loggedOut) {
             console.error(
-              danger("WhatsApp session logged out. Run: clawdbot login"),
+              danger(
+                "WhatsApp session logged out. Run: clawdbot providers login",
+              ),
             );
           }
         }
@@ -403,7 +405,7 @@ export function readWebSelfId(authDir: string = resolveDefaultWebAuthDir()) {
     const raw = fsSync.readFileSync(credsPath, "utf-8");
     const parsed = JSON.parse(raw) as { me?: { id?: string } } | undefined;
     const jid = parsed?.me?.id ?? null;
-    const e164 = jid ? jidToE164(jid) : null;
+    const e164 = jid ? jidToE164(jid, { authDir }) : null;
     return { e164, jid } as const;
   } catch {
     return { e164: null, jid: null } as const;
@@ -454,7 +456,7 @@ export async function pickProvider(
   const hasWeb = await webAuthExists(authDir);
   if (!hasWeb) {
     throw new Error(
-      "No WhatsApp Web session found. Run `clawdbot login --verbose` to link.",
+      "No WhatsApp Web session found. Run `clawdbot providers login --verbose` to link.",
     );
   }
   return choice;
