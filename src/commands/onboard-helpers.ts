@@ -31,12 +31,12 @@ import type {
   ResetScope,
 } from "./onboard-types.js";
 
-export function guardCancel<T>(value: T, runtime: RuntimeEnv): T {
+export function guardCancel<T>(value: T | symbol, runtime: RuntimeEnv): T {
   if (isCancel(value)) {
     cancel(stylePromptTitle("Setup cancelled.") ?? "Setup cancelled.");
     runtime.exit(0);
   }
-  return value;
+  return value as T;
 }
 
 export function summarizeExistingConfig(config: ClawdbotConfig): string {
@@ -231,6 +231,28 @@ export async function openUrl(url: string): Promise<boolean> {
     // ignore; we still print the URL for manual open
     return false;
   }
+}
+
+export async function copyToClipboard(value: string): Promise<boolean> {
+  const attempts: Array<{ argv: string[] }> = [
+    { argv: ["pbcopy"] },
+    { argv: ["xclip", "-selection", "clipboard"] },
+    { argv: ["wl-copy"] },
+    { argv: ["clip.exe"] }, // WSL / Windows
+    { argv: ["powershell", "-NoProfile", "-Command", "Set-Clipboard"] },
+  ];
+  for (const attempt of attempts) {
+    try {
+      const result = await runCommandWithTimeout(attempt.argv, {
+        timeoutMs: 3_000,
+        input: value,
+      });
+      if (result.code === 0 && !result.killed) return true;
+    } catch {
+      // keep trying the next fallback
+    }
+  }
+  return false;
 }
 
 export async function ensureWorkspaceAndSessions(

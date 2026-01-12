@@ -1,3 +1,4 @@
+import { Buffer } from "node:buffer";
 import { randomUUID } from "node:crypto";
 import type { Server as HttpServer } from "node:http";
 import os from "node:os";
@@ -44,7 +45,7 @@ import {
 } from "../config/port-defaults.js";
 import {
   loadSessionStore,
-  resolveMainSessionKey,
+  resolveAgentMainSessionKey,
   resolveMainSessionKeyFromConfig,
   resolveStorePath,
 } from "../config/sessions.js";
@@ -118,6 +119,7 @@ import {
   normalizeProviderId,
   type ProviderId,
 } from "../providers/plugins/index.js";
+import { normalizeAgentId } from "../routing/session-key.js";
 import { defaultRuntime, type RuntimeEnv } from "../runtime.js";
 import {
   isGatewayCliClient,
@@ -379,6 +381,18 @@ let healthVersion = 1;
 let healthCache: HealthSummary | null = null;
 let healthRefresh: Promise<HealthSummary> | null = null;
 let broadcastHealthUpdate: ((snap: HealthSummary) => void) | null = null;
+
+const CLOSE_REASON_MAX_BYTES = 120;
+
+export function truncateCloseReason(
+  reason: string,
+  maxBytes = CLOSE_REASON_MAX_BYTES,
+): string {
+  if (!reason) return "invalid handshake";
+  const buf = Buffer.from(reason);
+  if (buf.length <= maxBytes) return reason;
+  return buf.subarray(0, maxBytes).toString();
+}
 
 function buildSnapshot(): Snapshot {
   const presence = listSystemPresence();
@@ -769,11 +783,36 @@ export async function startGatewayServer(
     const storePath = resolveCronStorePath(cfg.cron?.store);
     const cronEnabled =
       process.env.CLAWDBOT_SKIP_CRON !== "1" && cfg.cron?.enabled !== false;
+    const resolveCronAgent = (requested?: string | null) => {
+      const runtimeConfig = loadConfig();
+      const normalized =
+        typeof requested === "string" && requested.trim()
+          ? normalizeAgentId(requested)
+          : undefined;
+      const hasAgent =
+        normalized !== undefined &&
+        Array.isArray(runtimeConfig.agents?.list) &&
+        runtimeConfig.agents.list.some(
+          (entry) =>
+            entry &&
+            typeof entry.id === "string" &&
+            normalizeAgentId(entry.id) === normalized,
+        );
+      const agentId = hasAgent
+        ? normalized
+        : resolveDefaultAgentId(runtimeConfig);
+      return { agentId, cfg: runtimeConfig };
+    };
     const cron = new CronService({
       storePath,
       cronEnabled,
-      enqueueSystemEvent: (text) => {
-        enqueueSystemEvent(text, { sessionKey: resolveMainSessionKey(cfg) });
+      enqueueSystemEvent: (text, opts) => {
+        const { agentId, cfg: runtimeConfig } = resolveCronAgent(opts?.agentId);
+        const sessionKey = resolveAgentMainSessionKey({
+          cfg: runtimeConfig,
+          agentId,
+        });
+        enqueueSystemEvent(text, { sessionKey });
       },
       requestHeartbeatNow,
       runHeartbeatOnce: async (opts) => {
@@ -785,12 +824,13 @@ export async function startGatewayServer(
         });
       },
       runIsolatedAgentJob: async ({ job, message }) => {
-        const runtimeConfig = loadConfig();
+        const { agentId, cfg: runtimeConfig } = resolveCronAgent(job.agentId);
         return await runCronIsolatedAgentTurn({
           cfg: runtimeConfig,
           deps,
           job,
           message,
+          agentId,
           sessionKey: `cron:${job.id}`,
           lane: "cron",
         });
@@ -1339,13 +1379,13 @@ export async function startGatewayServer(
       }
     };
 
-    const close = () => {
+    const close = (code = 1000, reason?: string) => {
       if (closed) return;
       closed = true;
       clearTimeout(handshakeTimer);
       if (client) clients.delete(client);
       try {
-        socket.close(1000);
+        socket.close(code, reason);
       } catch {
         /* ignore */
       }
@@ -1357,6 +1397,15 @@ export async function startGatewayServer(
       );
       close();
     });
+    const isNoisySwiftPmHelperClose = (
+      userAgent: string | undefined,
+      remote: string | undefined,
+    ) =>
+      Boolean(
+        userAgent?.toLowerCase().includes("swiftpm-testing-helper") &&
+          isLoopbackAddress(remote),
+      );
+
     socket.once("close", (code, reason) => {
       const durationMs = Date.now() - openedAt;
       const closeContext = {
@@ -1373,8 +1422,11 @@ export async function startGatewayServer(
         ...closeMeta,
       };
       if (!client) {
-        logWsControl.warn(
-          `closed before connect conn=${connId} remote=${remoteAddr ?? "?"} code=${code ?? "n/a"} reason=${reason?.toString() || "n/a"}`,
+        const logFn = isNoisySwiftPmHelperClose(requestUserAgent, remoteAddr)
+          ? logWsControl.debug
+          : logWsControl.warn;
+        logFn(
+          `closed before connect conn=${connId} remote=${remoteAddr ?? "?"} fwd=${forwardedFor ?? "n/a"} origin=${requestOrigin ?? "n/a"} host=${requestHost ?? "n/a"} ua=${requestUserAgent ?? "n/a"} code=${code ?? "n/a"} reason=${reason?.toString() || "n/a"}`,
           closeContext,
         );
       }
@@ -1456,43 +1508,45 @@ export async function startGatewayServer(
         if (!client) {
           // Handshake must be a normal request:
           // { type:"req", method:"connect", params: ConnectParams }.
+          const isRequestFrame = validateRequestFrame(parsed);
           if (
-            !validateRequestFrame(parsed) ||
+            !isRequestFrame ||
             (parsed as RequestFrame).method !== "connect" ||
             !validateConnectParams((parsed as RequestFrame).params)
           ) {
-            if (validateRequestFrame(parsed)) {
-              const req = parsed as RequestFrame;
-              send({
-                type: "res",
-                id: req.id,
-                ok: false,
-                error: errorShape(
-                  ErrorCodes.INVALID_REQUEST,
-                  req.method === "connect"
-                    ? `invalid connect params: ${formatValidationErrors(validateConnectParams.errors)}`
-                    : "invalid handshake: first request must be connect",
-                ),
-              });
-            } else {
-              logWsControl.warn(
-                `invalid handshake conn=${connId} remote=${remoteAddr ?? "?"}`,
-              );
-            }
-            handshakeState = "failed";
-            const handshakeError = validateRequestFrame(parsed)
+            const handshakeError = isRequestFrame
               ? (parsed as RequestFrame).method === "connect"
                 ? `invalid connect params: ${formatValidationErrors(validateConnectParams.errors)}`
                 : "invalid handshake: first request must be connect"
               : "invalid request frame";
+            handshakeState = "failed";
             setCloseCause("invalid-handshake", {
               frameType,
               frameMethod,
               frameId,
               handshakeError,
             });
-            socket.close(1008, "invalid handshake");
-            close();
+            if (isRequestFrame) {
+              const req = parsed as RequestFrame;
+              send({
+                type: "res",
+                id: req.id,
+                ok: false,
+                error: errorShape(ErrorCodes.INVALID_REQUEST, handshakeError),
+              });
+            } else {
+              logWsControl.warn(
+                `invalid handshake conn=${connId} remote=${remoteAddr ?? "?"} fwd=${forwardedFor ?? "n/a"} origin=${requestOrigin ?? "n/a"} host=${requestHost ?? "n/a"} ua=${requestUserAgent ?? "n/a"}`,
+              );
+            }
+            const closeReason = truncateCloseReason(
+              handshakeError || "invalid handshake",
+            );
+            if (isRequestFrame) {
+              queueMicrotask(() => close(1008, closeReason));
+            } else {
+              close(1008, closeReason);
+            }
             return;
           }
 
@@ -1532,8 +1586,7 @@ export async function startGatewayServer(
                 },
               ),
             });
-            socket.close(1002, "protocol mismatch");
-            close();
+            close(1002, "protocol mismatch");
             return;
           }
 
@@ -1568,15 +1621,16 @@ export async function startGatewayServer(
               ok: false,
               error: errorShape(ErrorCodes.INVALID_REQUEST, "unauthorized"),
             });
-            socket.close(1008, "unauthorized");
-            close();
+            close(1008, "unauthorized");
             return;
           }
           const authMethod = authResult.method ?? "none";
 
           const shouldTrackPresence = !isGatewayCliClient(connectParams.client);
+          const clientId = connectParams.client.id;
+          const instanceId = connectParams.client.instanceId;
           const presenceKey = shouldTrackPresence
-            ? connectParams.client.instanceId || connId
+            ? (instanceId ?? connId)
             : undefined;
 
           logWs("in", "connect", {
@@ -1585,7 +1639,7 @@ export async function startGatewayServer(
             clientDisplayName: connectParams.client.displayName,
             version: connectParams.client.version,
             mode: connectParams.client.mode,
-            instanceId: connectParams.client.instanceId,
+            clientId,
             platform: connectParams.client.platform,
             auth: authMethod,
           });
@@ -1608,7 +1662,7 @@ export async function startGatewayServer(
               deviceFamily: connectParams.client.deviceFamily,
               modelIdentifier: connectParams.client.modelIdentifier,
               mode: connectParams.client.mode,
-              instanceId: connectParams.client.instanceId,
+              instanceId,
               reason: "connect",
             });
             presenceVersion += 1;

@@ -89,6 +89,8 @@ clawdbot gateway --port 18789
 
 Now message the assistant number from your allowlisted phone.
 
+When onboarding finishes, we auto-open the dashboard with your gateway token and print the tokenized link. To reopen later: `clawdbot dashboard`.
+
 ## Give the agent a workspace (AGENTS)
 
 Clawd reads operating instructions and “memory” from its workspace directory.
@@ -102,6 +104,7 @@ clawdbot setup
 ```
 
 Full workspace layout + backup guide: [Agent workspace](/concepts/agent-workspace)
+Memory workflow: [Memory](/concepts/memory)
 
 Optional: choose a different workspace with `agents.defaults.workspace` (supports `~`).
 

@@ -103,12 +103,13 @@ CLAWDBOT_CONFIG_PATH=~/.clawdbot/b.json CLAWDBOT_STATE_DIR=~/.clawdbot-b clawdbo
 ```
 
 ## Protocol (operator view)
+- Full docs: [Gateway protocol](/gateway/protocol) and [Bridge protocol](/gateway/bridge-protocol).
 - Mandatory first frame from client: `req {type:"req", id, method:"connect", params:{minProtocol,maxProtocol,client:{id,displayName?,version,platform,deviceFamily?,modelIdentifier?,mode,instanceId?}, caps, auth?, locale?, userAgent? } }`.
 - Gateway replies `res {type:"res", id, ok:true, payload:hello-ok }` (or `ok:false` with an error, then closes).
 - After handshake:
   - Requests: `{type:"req", id, method, params}` → `{type:"res", id, ok, payload|error}`
   - Events: `{type:"event", event, payload, seq?, stateVersion?}`
-- Structured presence entries: `{host, ip, version, platform?, deviceFamily?, modelIdentifier?, mode, lastInputSeconds?, ts, reason?, tags?[], instanceId? }`.
+- Structured presence entries: `{host, ip, version, platform?, deviceFamily?, modelIdentifier?, mode, lastInputSeconds?, ts, reason?, tags?[], instanceId? }` (for WS clients, `instanceId` comes from `connect.client.instanceId`).
 - `agent` responses are two-stage: first `res` ack `{runId,status:"accepted"}`, then a final `res` `{runId,status:"ok"|"error",summary}` after the run finishes; streamed output arrives as `event:"agent"`.
 
 ## Methods (initial set)
@@ -123,7 +124,7 @@ CLAWDBOT_CONFIG_PATH=~/.clawdbot/b.json CLAWDBOT_STATE_DIR=~/.clawdbot-b clawdbo
 - `node.invoke` — invoke a command on a node (e.g. `canvas.*`, `camera.*`).
 - `node.pair.*` — pairing lifecycle (`request`, `list`, `approve`, `reject`, `verify`).
 
-See also: [Presence](/concepts/presence) for how presence is produced/deduped and why `instanceId` matters.
+See also: [Presence](/concepts/presence) for how presence is produced/deduped and why a stable `client.instanceId` matters.
 
 ## Events
 - `agent` — streamed tool/output events from the agent run (seq-tagged).

@@ -72,6 +72,8 @@ import {
 } from "./pairing-store.js";
 import { resolveTelegramVoiceSend } from "./voice.js";
 
+const TELEGRAM_GENERAL_TOPIC_ID = 1;
+
 const PARSE_ERR_RE =
   /can't parse entities|parse entities|find end of the entity/i;
 
@@ -426,10 +428,16 @@ export function createTelegramBot(opts: TelegramBotOptions) {
 
     const sendTyping = async () => {
       try {
+        // In forums, the General topic has no message_thread_id in updates,
+        // but sendChatAction requires one to show typing.
+        const typingThreadId =
+          isForum && messageThreadId == null
+            ? TELEGRAM_GENERAL_TOPIC_ID
+            : messageThreadId;
         await bot.api.sendChatAction(
           chatId,
           "typing",
-          buildTelegramThreadParams(messageThreadId),
+          buildTelegramThreadParams(typingThreadId),
         );
       } catch (err) {
         logVerbose(
@@ -1211,7 +1219,7 @@ export function createTelegramBot(opts: TelegramBotOptions) {
           }
         }
         // Group policy filtering: controls how group messages are handled
-        // - "open" (default): groups bypass allowFrom, only mention-gating applies
+        // - "open": groups bypass allowFrom, only mention-gating applies
         // - "disabled": block all group messages entirely
         // - "allowlist": only allow group messages from senders in groupAllowFrom/allowFrom
         const groupPolicy = telegramCfg.groupPolicy ?? "open";

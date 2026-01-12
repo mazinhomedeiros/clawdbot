@@ -11,10 +11,19 @@ import {
   queueEmbeddedPiMessage,
   runEmbeddedPiAgent,
 } from "../../agents/pi-embedded.js";
+import {
+  isCompactionFailureError,
+  isContextOverflowError,
+} from "../../agents/pi-embedded-helpers.js";
+import {
+  resolveSandboxConfigForAgent,
+  resolveSandboxRuntimeStatus,
+} from "../../agents/sandbox.js";
 import { hasNonzeroUsage, type NormalizedUsage } from "../../agents/usage.js";
 import type { ClawdbotConfig } from "../../config/config.js";
 import {
   loadSessionStore,
+  resolveAgentIdFromSessionKey,
   resolveSessionTranscriptPath,
   type SessionEntry,
   saveSessionStore,
@@ -48,6 +57,11 @@ import {
 } from "./block-reply-pipeline.js";
 import { resolveBlockStreamingCoalescing } from "./block-streaming.js";
 import { createFollowupRunner } from "./followup-runner.js";
+import {
+  resolveMemoryFlushContextWindowTokens,
+  resolveMemoryFlushSettings,
+  shouldRunMemoryFlush,
+} from "./memory-flush.js";
 import {
   enqueueFollowupRun,
   type FollowupRun,
@@ -231,6 +245,10 @@ export async function runReplyAgent(params: {
     typingMode,
   } = params;
 
+  let activeSessionEntry = sessionEntry;
+  const activeSessionStore = sessionStore;
+  let activeIsNewSession = isNewSession;
+
   const isHeartbeat = opts?.isHeartbeat === true;
   const typingSignals = createTypingSignaler({
     typing,
@@ -303,11 +321,11 @@ export async function runReplyAgent(params: {
       followupRun.prompt,
     );
     if (steered && !shouldFollowup) {
-      if (sessionEntry && sessionStore && sessionKey) {
-        sessionEntry.updatedAt = Date.now();
-        sessionStore[sessionKey] = sessionEntry;
+      if (activeSessionEntry && activeSessionStore && sessionKey) {
+        activeSessionEntry.updatedAt = Date.now();
+        activeSessionStore[sessionKey] = activeSessionEntry;
         if (storePath) {
-          await saveSessionStore(storePath, sessionStore);
+          await saveSessionStore(storePath, activeSessionStore);
         }
       }
       typing.cleanup();
@@ -317,111 +335,63 @@ export async function runReplyAgent(params: {
 
   if (isActive && (shouldFollowup || resolvedQueue.mode === "steer")) {
     enqueueFollowupRun(queueKey, followupRun, resolvedQueue);
-    if (sessionEntry && sessionStore && sessionKey) {
-      sessionEntry.updatedAt = Date.now();
-      sessionStore[sessionKey] = sessionEntry;
+    if (activeSessionEntry && activeSessionStore && sessionKey) {
+      activeSessionEntry.updatedAt = Date.now();
+      activeSessionStore[sessionKey] = activeSessionEntry;
       if (storePath) {
-        await saveSessionStore(storePath, sessionStore);
+        await saveSessionStore(storePath, activeSessionStore);
       }
     }
     typing.cleanup();
     return undefined;
   }
 
-  const runFollowupTurn = createFollowupRunner({
-    opts,
-    typing,
-    typingMode,
-    sessionEntry,
-    sessionStore,
-    sessionKey,
-    storePath,
-    defaultModel,
-    agentCfgContextTokens,
-  });
-
-  const finalizeWithFollowup = <T>(value: T): T => {
-    scheduleFollowupDrain(queueKey, runFollowupTurn);
-    return value;
-  };
-
-  let didLogHeartbeatStrip = false;
-  let autoCompactionCompleted = false;
-  let responseUsageLine: string | undefined;
-  try {
-    const runId = crypto.randomUUID();
+  const memoryFlushSettings = resolveMemoryFlushSettings(cfg);
+  const memoryFlushWritable = (() => {
+    if (!sessionKey) return true;
+    const runtime = resolveSandboxRuntimeStatus({ cfg, sessionKey });
+    if (!runtime.sandboxed) return true;
+    const sandboxCfg = resolveSandboxConfigForAgent(cfg, runtime.agentId);
+    return sandboxCfg.workspaceAccess === "rw";
+  })();
+  const shouldFlushMemory =
+    memoryFlushSettings &&
+    memoryFlushWritable &&
+    !isHeartbeat &&
+    !isCliProvider(followupRun.run.provider, cfg) &&
+    shouldRunMemoryFlush({
+      entry:
+        activeSessionEntry ??
+        (sessionKey ? activeSessionStore?.[sessionKey] : undefined),
+      contextWindowTokens: resolveMemoryFlushContextWindowTokens({
+        modelId: followupRun.run.model ?? defaultModel,
+        agentCfgContextTokens,
+      }),
+      reserveTokensFloor: memoryFlushSettings.reserveTokensFloor,
+      softThresholdTokens: memoryFlushSettings.softThresholdTokens,
+    });
+  if (shouldFlushMemory) {
+    const flushRunId = crypto.randomUUID();
     if (sessionKey) {
-      registerAgentRunContext(runId, {
+      registerAgentRunContext(flushRunId, {
         sessionKey,
         verboseLevel: resolvedVerboseLevel,
       });
     }
-    let runResult: Awaited<ReturnType<typeof runEmbeddedPiAgent>>;
-    let fallbackProvider = followupRun.run.provider;
-    let fallbackModel = followupRun.run.model;
+    let memoryCompactionCompleted = false;
+    const flushSystemPrompt = [
+      followupRun.run.extraSystemPrompt,
+      memoryFlushSettings.systemPrompt,
+    ]
+      .filter(Boolean)
+      .join("\n\n");
     try {
-      const allowPartialStream = !(
-        followupRun.run.reasoningLevel === "stream" && opts?.onReasoningStream
-      );
-      const fallbackResult = await runWithModelFallback({
+      await runWithModelFallback({
         cfg: followupRun.run.config,
         provider: followupRun.run.provider,
         model: followupRun.run.model,
-        run: (provider, model) => {
-          if (isCliProvider(provider, followupRun.run.config)) {
-            const startedAt = Date.now();
-            emitAgentEvent({
-              runId,
-              stream: "lifecycle",
-              data: {
-                phase: "start",
-                startedAt,
-              },
-            });
-            const cliSessionId = getCliSessionId(sessionEntry, provider);
-            return runCliAgent({
-              sessionId: followupRun.run.sessionId,
-              sessionKey,
-              sessionFile: followupRun.run.sessionFile,
-              workspaceDir: followupRun.run.workspaceDir,
-              config: followupRun.run.config,
-              prompt: commandBody,
-              provider,
-              model,
-              thinkLevel: followupRun.run.thinkLevel,
-              timeoutMs: followupRun.run.timeoutMs,
-              runId,
-              extraSystemPrompt: followupRun.run.extraSystemPrompt,
-              ownerNumbers: followupRun.run.ownerNumbers,
-              cliSessionId,
-            })
-              .then((result) => {
-                emitAgentEvent({
-                  runId,
-                  stream: "lifecycle",
-                  data: {
-                    phase: "end",
-                    startedAt,
-                    endedAt: Date.now(),
-                  },
-                });
-                return result;
-              })
-              .catch((err) => {
-                emitAgentEvent({
-                  runId,
-                  stream: "lifecycle",
-                  data: {
-                    phase: "error",
-                    startedAt,
-                    endedAt: Date.now(),
-                    error: err instanceof Error ? err.message : String(err),
-                  },
-                });
-                throw err;
-              });
-          }
-          return runEmbeddedPiAgent({
+        run: (provider, model) =>
+          runEmbeddedPiAgent({
             sessionId: followupRun.run.sessionId,
             sessionKey,
             messageProvider:
@@ -438,8 +408,8 @@ export async function runReplyAgent(params: {
             agentDir: followupRun.run.agentDir,
             config: followupRun.run.config,
             skillsSnapshot: followupRun.run.skillsSnapshot,
-            prompt: commandBody,
-            extraSystemPrompt: followupRun.run.extraSystemPrompt,
+            prompt: memoryFlushSettings.prompt,
+            extraSystemPrompt: flushSystemPrompt,
             ownerNumbers: followupRun.run.ownerNumbers,
             enforceFinalTag: followupRun.run.enforceFinalTag,
             provider,
@@ -450,251 +420,495 @@ export async function runReplyAgent(params: {
             reasoningLevel: followupRun.run.reasoningLevel,
             bashElevated: followupRun.run.bashElevated,
             timeoutMs: followupRun.run.timeoutMs,
-            runId,
-            blockReplyBreak: resolvedBlockStreamingBreak,
-            blockReplyChunking,
-            onPartialReply:
-              opts?.onPartialReply && allowPartialStream
-                ? async (payload) => {
-                    let text = payload.text;
-                    if (!isHeartbeat && text?.includes("HEARTBEAT_OK")) {
-                      const stripped = stripHeartbeatToken(text, {
-                        mode: "message",
-                      });
-                      if (stripped.didStrip && !didLogHeartbeatStrip) {
-                        didLogHeartbeatStrip = true;
-                        logVerbose(
-                          "Stripped stray HEARTBEAT_OK token from reply",
-                        );
-                      }
-                      if (
-                        stripped.shouldSkip &&
-                        (payload.mediaUrls?.length ?? 0) === 0
-                      ) {
-                        return;
-                      }
-                      text = stripped.text;
-                    }
-                    if (isSilentReplyText(text, SILENT_REPLY_TOKEN)) return;
-                    await typingSignals.signalTextDelta(text);
-                    await opts.onPartialReply?.({
-                      text,
-                      mediaUrls: payload.mediaUrls,
-                    });
-                  }
-                : undefined,
-            onReasoningStream:
-              typingSignals.shouldStartOnReasoning || opts?.onReasoningStream
-                ? async (payload) => {
-                    await typingSignals.signalReasoningDelta();
-                    await opts?.onReasoningStream?.({
-                      text: payload.text,
-                      mediaUrls: payload.mediaUrls,
-                    });
-                  }
-                : undefined,
+            runId: flushRunId,
             onAgentEvent: (evt) => {
-              // Trigger typing when tools start executing
-              if (evt.stream === "tool") {
-                const phase =
-                  typeof evt.data.phase === "string" ? evt.data.phase : "";
-                if (phase === "start") {
-                  void typingSignals.signalToolStart();
-                }
-              }
-              // Track auto-compaction completion
               if (evt.stream === "compaction") {
                 const phase =
                   typeof evt.data.phase === "string" ? evt.data.phase : "";
                 const willRetry = Boolean(evt.data.willRetry);
                 if (phase === "end" && !willRetry) {
-                  autoCompactionCompleted = true;
+                  memoryCompactionCompleted = true;
                 }
               }
             },
-            onBlockReply:
-              blockStreamingEnabled && opts?.onBlockReply
-                ? async (payload) => {
-                    let text = payload.text;
-                    if (!isHeartbeat && text?.includes("HEARTBEAT_OK")) {
-                      const stripped = stripHeartbeatToken(text, {
-                        mode: "message",
-                      });
-                      if (stripped.didStrip && !didLogHeartbeatStrip) {
-                        didLogHeartbeatStrip = true;
-                        logVerbose(
-                          "Stripped stray HEARTBEAT_OK token from reply",
-                        );
+          }),
+      });
+      let memoryFlushCompactionCount =
+        activeSessionEntry?.compactionCount ??
+        (sessionKey ? activeSessionStore?.[sessionKey]?.compactionCount : 0) ??
+        0;
+      if (memoryCompactionCompleted) {
+        const nextCount = await incrementCompactionCount({
+          sessionEntry: activeSessionEntry,
+          sessionStore: activeSessionStore,
+          sessionKey,
+          storePath,
+        });
+        if (typeof nextCount === "number") {
+          memoryFlushCompactionCount = nextCount;
+        }
+      }
+      if (storePath && sessionKey) {
+        try {
+          const updatedEntry = await updateSessionStoreEntry({
+            storePath,
+            sessionKey,
+            update: async () => ({
+              memoryFlushAt: Date.now(),
+              memoryFlushCompactionCount,
+            }),
+          });
+          if (updatedEntry) {
+            activeSessionEntry = updatedEntry;
+          }
+        } catch (err) {
+          logVerbose(`failed to persist memory flush metadata: ${String(err)}`);
+        }
+      }
+    } catch (err) {
+      logVerbose(`memory flush run failed: ${String(err)}`);
+    }
+  }
+
+  const runFollowupTurn = createFollowupRunner({
+    opts,
+    typing,
+    typingMode,
+    sessionEntry: activeSessionEntry,
+    sessionStore: activeSessionStore,
+    sessionKey,
+    storePath,
+    defaultModel,
+    agentCfgContextTokens,
+  });
+
+  const finalizeWithFollowup = <T>(value: T): T => {
+    scheduleFollowupDrain(queueKey, runFollowupTurn);
+    return value;
+  };
+
+  let didLogHeartbeatStrip = false;
+  let autoCompactionCompleted = false;
+  let responseUsageLine: string | undefined;
+  const resetSessionAfterCompactionFailure = async (
+    reason: string,
+  ): Promise<boolean> => {
+    if (!sessionKey || !activeSessionStore || !storePath) return false;
+    const nextSessionId = crypto.randomUUID();
+    const nextEntry: SessionEntry = {
+      ...(activeSessionStore[sessionKey] ?? activeSessionEntry),
+      sessionId: nextSessionId,
+      updatedAt: Date.now(),
+      systemSent: false,
+      abortedLastRun: false,
+    };
+    const agentId = resolveAgentIdFromSessionKey(sessionKey);
+    const topicId =
+      typeof sessionCtx.MessageThreadId === "number"
+        ? sessionCtx.MessageThreadId
+        : undefined;
+    const nextSessionFile = resolveSessionTranscriptPath(
+      nextSessionId,
+      agentId,
+      topicId,
+    );
+    nextEntry.sessionFile = nextSessionFile;
+    activeSessionStore[sessionKey] = nextEntry;
+    try {
+      await saveSessionStore(storePath, activeSessionStore);
+    } catch (err) {
+      defaultRuntime.error(
+        `Failed to persist session reset after compaction failure (${sessionKey}): ${String(err)}`,
+      );
+    }
+    followupRun.run.sessionId = nextSessionId;
+    followupRun.run.sessionFile = nextSessionFile;
+    activeSessionEntry = nextEntry;
+    activeIsNewSession = true;
+    defaultRuntime.error(
+      `Auto-compaction failed (${reason}). Restarting session ${sessionKey} -> ${nextSessionId} and retrying.`,
+    );
+    return true;
+  };
+  try {
+    const runId = crypto.randomUUID();
+    if (sessionKey) {
+      registerAgentRunContext(runId, {
+        sessionKey,
+        verboseLevel: resolvedVerboseLevel,
+      });
+    }
+    let runResult: Awaited<ReturnType<typeof runEmbeddedPiAgent>>;
+    let fallbackProvider = followupRun.run.provider;
+    let fallbackModel = followupRun.run.model;
+    let didResetAfterCompactionFailure = false;
+    while (true) {
+      try {
+        const allowPartialStream = !(
+          followupRun.run.reasoningLevel === "stream" && opts?.onReasoningStream
+        );
+        const fallbackResult = await runWithModelFallback({
+          cfg: followupRun.run.config,
+          provider: followupRun.run.provider,
+          model: followupRun.run.model,
+          run: (provider, model) => {
+            if (isCliProvider(provider, followupRun.run.config)) {
+              const startedAt = Date.now();
+              emitAgentEvent({
+                runId,
+                stream: "lifecycle",
+                data: {
+                  phase: "start",
+                  startedAt,
+                },
+              });
+              const cliSessionId = getCliSessionId(
+                activeSessionEntry,
+                provider,
+              );
+              return runCliAgent({
+                sessionId: followupRun.run.sessionId,
+                sessionKey,
+                sessionFile: followupRun.run.sessionFile,
+                workspaceDir: followupRun.run.workspaceDir,
+                config: followupRun.run.config,
+                prompt: commandBody,
+                provider,
+                model,
+                thinkLevel: followupRun.run.thinkLevel,
+                timeoutMs: followupRun.run.timeoutMs,
+                runId,
+                extraSystemPrompt: followupRun.run.extraSystemPrompt,
+                ownerNumbers: followupRun.run.ownerNumbers,
+                cliSessionId,
+              })
+                .then((result) => {
+                  emitAgentEvent({
+                    runId,
+                    stream: "lifecycle",
+                    data: {
+                      phase: "end",
+                      startedAt,
+                      endedAt: Date.now(),
+                    },
+                  });
+                  return result;
+                })
+                .catch((err) => {
+                  emitAgentEvent({
+                    runId,
+                    stream: "lifecycle",
+                    data: {
+                      phase: "error",
+                      startedAt,
+                      endedAt: Date.now(),
+                      error: err instanceof Error ? err.message : String(err),
+                    },
+                  });
+                  throw err;
+                });
+            }
+            return runEmbeddedPiAgent({
+              sessionId: followupRun.run.sessionId,
+              sessionKey,
+              messageProvider:
+                sessionCtx.Provider?.trim().toLowerCase() || undefined,
+              agentAccountId: sessionCtx.AccountId,
+              // Provider threading context for tool auto-injection
+              ...buildThreadingToolContext({
+                sessionCtx,
+                config: followupRun.run.config,
+                hasRepliedRef: opts?.hasRepliedRef,
+              }),
+              sessionFile: followupRun.run.sessionFile,
+              workspaceDir: followupRun.run.workspaceDir,
+              agentDir: followupRun.run.agentDir,
+              config: followupRun.run.config,
+              skillsSnapshot: followupRun.run.skillsSnapshot,
+              prompt: commandBody,
+              extraSystemPrompt: followupRun.run.extraSystemPrompt,
+              ownerNumbers: followupRun.run.ownerNumbers,
+              enforceFinalTag: followupRun.run.enforceFinalTag,
+              provider,
+              model,
+              authProfileId: followupRun.run.authProfileId,
+              thinkLevel: followupRun.run.thinkLevel,
+              verboseLevel: followupRun.run.verboseLevel,
+              reasoningLevel: followupRun.run.reasoningLevel,
+              bashElevated: followupRun.run.bashElevated,
+              timeoutMs: followupRun.run.timeoutMs,
+              runId,
+              blockReplyBreak: resolvedBlockStreamingBreak,
+              blockReplyChunking,
+              onPartialReply:
+                opts?.onPartialReply && allowPartialStream
+                  ? async (payload) => {
+                      let text = payload.text;
+                      if (!isHeartbeat && text?.includes("HEARTBEAT_OK")) {
+                        const stripped = stripHeartbeatToken(text, {
+                          mode: "message",
+                        });
+                        if (stripped.didStrip && !didLogHeartbeatStrip) {
+                          didLogHeartbeatStrip = true;
+                          logVerbose(
+                            "Stripped stray HEARTBEAT_OK token from reply",
+                          );
+                        }
+                        if (
+                          stripped.shouldSkip &&
+                          (payload.mediaUrls?.length ?? 0) === 0
+                        ) {
+                          return;
+                        }
+                        text = stripped.text;
                       }
-                      const hasMedia = (payload.mediaUrls?.length ?? 0) > 0;
-                      if (stripped.shouldSkip && !hasMedia) return;
-                      text = stripped.text;
-                    }
-                    const taggedPayload = applyReplyTagsToPayload(
-                      {
+                      if (isSilentReplyText(text, SILENT_REPLY_TOKEN)) return;
+                      await typingSignals.signalTextDelta(text);
+                      await opts.onPartialReply?.({
                         text,
                         mediaUrls: payload.mediaUrls,
-                        mediaUrl: payload.mediaUrls?.[0],
-                      },
-                      sessionCtx.MessageSid,
-                    );
-                    // Let through payloads with audioAsVoice flag even if empty (need to track it)
-                    if (
-                      !isRenderablePayload(taggedPayload) &&
-                      !payload.audioAsVoice
-                    )
-                      return;
-                    const parsed = parseReplyDirectives(
-                      taggedPayload.text ?? "",
-                      {
-                        currentMessageId: sessionCtx.MessageSid,
-                        silentToken: SILENT_REPLY_TOKEN,
-                      },
-                    );
-                    const cleaned = parsed.text || undefined;
-                    const hasMedia =
-                      Boolean(taggedPayload.mediaUrl) ||
-                      (taggedPayload.mediaUrls?.length ?? 0) > 0;
-                    // Skip empty payloads unless they have audioAsVoice flag (need to track it)
-                    if (
-                      !cleaned &&
-                      !hasMedia &&
-                      !payload.audioAsVoice &&
-                      !parsed.audioAsVoice
-                    )
-                      return;
-                    if (parsed.isSilent && !hasMedia) return;
+                      });
+                    }
+                  : undefined,
+              onReasoningStream:
+                typingSignals.shouldStartOnReasoning || opts?.onReasoningStream
+                  ? async (payload) => {
+                      await typingSignals.signalReasoningDelta();
+                      await opts?.onReasoningStream?.({
+                        text: payload.text,
+                        mediaUrls: payload.mediaUrls,
+                      });
+                    }
+                  : undefined,
+              onAgentEvent: (evt) => {
+                // Trigger typing when tools start executing
+                if (evt.stream === "tool") {
+                  const phase =
+                    typeof evt.data.phase === "string" ? evt.data.phase : "";
+                  if (phase === "start") {
+                    void typingSignals.signalToolStart();
+                  }
+                }
+                // Track auto-compaction completion
+                if (evt.stream === "compaction") {
+                  const phase =
+                    typeof evt.data.phase === "string" ? evt.data.phase : "";
+                  const willRetry = Boolean(evt.data.willRetry);
+                  if (phase === "end" && !willRetry) {
+                    autoCompactionCompleted = true;
+                  }
+                }
+              },
+              onBlockReply:
+                blockStreamingEnabled && opts?.onBlockReply
+                  ? async (payload) => {
+                      let text = payload.text;
+                      if (!isHeartbeat && text?.includes("HEARTBEAT_OK")) {
+                        const stripped = stripHeartbeatToken(text, {
+                          mode: "message",
+                        });
+                        if (stripped.didStrip && !didLogHeartbeatStrip) {
+                          didLogHeartbeatStrip = true;
+                          logVerbose(
+                            "Stripped stray HEARTBEAT_OK token from reply",
+                          );
+                        }
+                        const hasMedia = (payload.mediaUrls?.length ?? 0) > 0;
+                        if (stripped.shouldSkip && !hasMedia) return;
+                        text = stripped.text;
+                      }
+                      const taggedPayload = applyReplyTagsToPayload(
+                        {
+                          text,
+                          mediaUrls: payload.mediaUrls,
+                          mediaUrl: payload.mediaUrls?.[0],
+                        },
+                        sessionCtx.MessageSid,
+                      );
+                      // Let through payloads with audioAsVoice flag even if empty (need to track it)
+                      if (
+                        !isRenderablePayload(taggedPayload) &&
+                        !payload.audioAsVoice
+                      )
+                        return;
+                      const parsed = parseReplyDirectives(
+                        taggedPayload.text ?? "",
+                        {
+                          currentMessageId: sessionCtx.MessageSid,
+                          silentToken: SILENT_REPLY_TOKEN,
+                        },
+                      );
+                      const cleaned = parsed.text || undefined;
+                      const hasMedia =
+                        Boolean(taggedPayload.mediaUrl) ||
+                        (taggedPayload.mediaUrls?.length ?? 0) > 0;
+                      // Skip empty payloads unless they have audioAsVoice flag (need to track it)
+                      if (
+                        !cleaned &&
+                        !hasMedia &&
+                        !payload.audioAsVoice &&
+                        !parsed.audioAsVoice
+                      )
+                        return;
+                      if (parsed.isSilent && !hasMedia) return;
 
-                    const blockPayload: ReplyPayload = applyReplyToMode({
-                      ...taggedPayload,
-                      text: cleaned,
-                      audioAsVoice: Boolean(
-                        parsed.audioAsVoice || payload.audioAsVoice,
-                      ),
-                      replyToId: taggedPayload.replyToId ?? parsed.replyToId,
-                      replyToTag: taggedPayload.replyToTag || parsed.replyToTag,
-                      replyToCurrent:
-                        taggedPayload.replyToCurrent || parsed.replyToCurrent,
-                    });
+                      const blockPayload: ReplyPayload = applyReplyToMode({
+                        ...taggedPayload,
+                        text: cleaned,
+                        audioAsVoice: Boolean(
+                          parsed.audioAsVoice || payload.audioAsVoice,
+                        ),
+                        replyToId: taggedPayload.replyToId ?? parsed.replyToId,
+                        replyToTag:
+                          taggedPayload.replyToTag || parsed.replyToTag,
+                        replyToCurrent:
+                          taggedPayload.replyToCurrent || parsed.replyToCurrent,
+                      });
 
-                    void typingSignals
-                      .signalTextDelta(cleaned ?? taggedPayload.text)
+                      void typingSignals
+                        .signalTextDelta(cleaned ?? taggedPayload.text)
+                        .catch((err) => {
+                          logVerbose(
+                            `block reply typing signal failed: ${String(err)}`,
+                          );
+                        });
+
+                      blockReplyPipeline?.enqueue(blockPayload);
+                    }
+                  : undefined,
+              onBlockReplyFlush:
+                blockStreamingEnabled && blockReplyPipeline
+                  ? async () => {
+                      await blockReplyPipeline.flush({ force: true });
+                    }
+                  : undefined,
+              shouldEmitToolResult,
+              onToolResult: opts?.onToolResult
+                ? (payload) => {
+                    // `subscribeEmbeddedPiSession` may invoke tool callbacks without awaiting them.
+                    // If a tool callback starts typing after the run finalized, we can end up with
+                    // a typing loop that never sees a matching markRunComplete(). Track and drain.
+                    const task = (async () => {
+                      let text = payload.text;
+                      if (!isHeartbeat && text?.includes("HEARTBEAT_OK")) {
+                        const stripped = stripHeartbeatToken(text, {
+                          mode: "message",
+                        });
+                        if (stripped.didStrip && !didLogHeartbeatStrip) {
+                          didLogHeartbeatStrip = true;
+                          logVerbose(
+                            "Stripped stray HEARTBEAT_OK token from reply",
+                          );
+                        }
+                        if (
+                          stripped.shouldSkip &&
+                          (payload.mediaUrls?.length ?? 0) === 0
+                        ) {
+                          return;
+                        }
+                        text = stripped.text;
+                      }
+                      await typingSignals.signalTextDelta(text);
+                      await opts.onToolResult?.({
+                        text,
+                        mediaUrls: payload.mediaUrls,
+                      });
+                    })()
                       .catch((err) => {
                         logVerbose(
-                          `block reply typing signal failed: ${String(err)}`,
+                          `tool result delivery failed: ${String(err)}`,
                         );
+                      })
+                      .finally(() => {
+                        pendingToolTasks.delete(task);
                       });
-
-                    blockReplyPipeline?.enqueue(blockPayload);
+                    pendingToolTasks.add(task);
                   }
                 : undefined,
-            shouldEmitToolResult,
-            onToolResult: opts?.onToolResult
-              ? (payload) => {
-                  // `subscribeEmbeddedPiSession` may invoke tool callbacks without awaiting them.
-                  // If a tool callback starts typing after the run finalized, we can end up with
-                  // a typing loop that never sees a matching markRunComplete(). Track and drain.
-                  const task = (async () => {
-                    let text = payload.text;
-                    if (!isHeartbeat && text?.includes("HEARTBEAT_OK")) {
-                      const stripped = stripHeartbeatToken(text, {
-                        mode: "message",
-                      });
-                      if (stripped.didStrip && !didLogHeartbeatStrip) {
-                        didLogHeartbeatStrip = true;
-                        logVerbose(
-                          "Stripped stray HEARTBEAT_OK token from reply",
-                        );
-                      }
-                      if (
-                        stripped.shouldSkip &&
-                        (payload.mediaUrls?.length ?? 0) === 0
-                      ) {
-                        return;
-                      }
-                      text = stripped.text;
-                    }
-                    await typingSignals.signalTextDelta(text);
-                    await opts.onToolResult?.({
-                      text,
-                      mediaUrls: payload.mediaUrls,
-                    });
-                  })()
-                    .catch((err) => {
-                      logVerbose(`tool result delivery failed: ${String(err)}`);
-                    })
-                    .finally(() => {
-                      pendingToolTasks.delete(task);
-                    });
-                  pendingToolTasks.add(task);
-                }
-              : undefined,
-          });
-        },
-      });
-      runResult = fallbackResult.result;
-      fallbackProvider = fallbackResult.provider;
-      fallbackModel = fallbackResult.model;
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      const isContextOverflow =
-        /context.*overflow|too large|context window/i.test(message);
-      const isSessionCorruption =
-        /function call turn comes immediately after/i.test(message);
+            });
+          },
+        });
+        runResult = fallbackResult.result;
+        fallbackProvider = fallbackResult.provider;
+        fallbackModel = fallbackResult.model;
+        break;
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        const isContextOverflow =
+          isContextOverflowError(message) ||
+          /context.*overflow|too large|context window/i.test(message);
+        const isCompactionFailure = isCompactionFailureError(message);
+        const isSessionCorruption =
+          /function call turn comes immediately after/i.test(message);
 
-      // Auto-recover from Gemini session corruption by resetting the session
-      if (isSessionCorruption && sessionKey && sessionStore && storePath) {
-        const corruptedSessionId = sessionEntry?.sessionId;
-        defaultRuntime.error(
-          `Session history corrupted (Gemini function call ordering). Resetting session: ${sessionKey}`,
-        );
-
-        try {
-          // Delete transcript file if it exists
-          if (corruptedSessionId) {
-            const transcriptPath =
-              resolveSessionTranscriptPath(corruptedSessionId);
-            try {
-              fs.unlinkSync(transcriptPath);
-            } catch {
-              // Ignore if file doesn't exist
-            }
-          }
-
-          // Remove session entry from store
-          delete sessionStore[sessionKey];
-          await saveSessionStore(storePath, sessionStore);
-        } catch (cleanupErr) {
-          defaultRuntime.error(
-            `Failed to reset corrupted session ${sessionKey}: ${String(cleanupErr)}`,
-          );
+        if (
+          isCompactionFailure &&
+          !didResetAfterCompactionFailure &&
+          (await resetSessionAfterCompactionFailure(message))
+        ) {
+          didResetAfterCompactionFailure = true;
+          continue;
         }
 
+        // Auto-recover from Gemini session corruption by resetting the session
+        if (
+          isSessionCorruption &&
+          sessionKey &&
+          activeSessionStore &&
+          storePath
+        ) {
+          const corruptedSessionId = activeSessionEntry?.sessionId;
+          defaultRuntime.error(
+            `Session history corrupted (Gemini function call ordering). Resetting session: ${sessionKey}`,
+          );
+
+          try {
+            // Delete transcript file if it exists
+            if (corruptedSessionId) {
+              const transcriptPath =
+                resolveSessionTranscriptPath(corruptedSessionId);
+              try {
+                fs.unlinkSync(transcriptPath);
+              } catch {
+                // Ignore if file doesn't exist
+              }
+            }
+
+            // Remove session entry from store
+            delete activeSessionStore[sessionKey];
+            await saveSessionStore(storePath, activeSessionStore);
+          } catch (cleanupErr) {
+            defaultRuntime.error(
+              `Failed to reset corrupted session ${sessionKey}: ${String(cleanupErr)}`,
+            );
+          }
+
+          return finalizeWithFollowup({
+            text: "⚠️ Session history was corrupted. I've reset the conversation - please try again!",
+          });
+        }
+
+        defaultRuntime.error(`Embedded agent failed before reply: ${message}`);
         return finalizeWithFollowup({
-          text: "⚠️ Session history was corrupted. I've reset the conversation - please try again!",
+          text: isContextOverflow
+            ? "⚠️ Context overflow - conversation too long. Starting fresh might help!"
+            : `⚠️ Agent failed before reply: ${message}. Check gateway logs for details.`,
         });
       }
-
-      defaultRuntime.error(`Embedded agent failed before reply: ${message}`);
-      return finalizeWithFollowup({
-        text: isContextOverflow
-          ? "⚠️ Context overflow - conversation too long. Starting fresh might help!"
-          : `⚠️ Agent failed before reply: ${message}. Check gateway logs for details.`,
-      });
     }
 
     if (
       shouldInjectGroupIntro &&
-      sessionEntry &&
-      sessionStore &&
+      activeSessionEntry &&
+      activeSessionStore &&
       sessionKey &&
-      sessionEntry.groupActivationNeedsSystemIntro
+      activeSessionEntry.groupActivationNeedsSystemIntro
     ) {
-      sessionEntry.groupActivationNeedsSystemIntro = false;
-      sessionEntry.updatedAt = Date.now();
-      sessionStore[sessionKey] = sessionEntry;
+      activeSessionEntry.groupActivationNeedsSystemIntro = false;
+      activeSessionEntry.updatedAt = Date.now();
+      activeSessionStore[sessionKey] = activeSessionEntry;
       if (storePath) {
-        await saveSessionStore(storePath, sessionStore);
+        await saveSessionStore(storePath, activeSessionStore);
       }
     }
 
@@ -814,7 +1028,7 @@ export async function runReplyAgent(params: {
     const contextTokensUsed =
       agentCfgContextTokens ??
       lookupContextTokens(modelUsed) ??
-      sessionEntry?.contextTokens ??
+      activeSessionEntry?.contextTokens ??
       DEFAULT_CONTEXT_TOKENS;
 
     if (storePath && sessionKey) {
@@ -884,9 +1098,9 @@ export async function runReplyAgent(params: {
     }
 
     const responseUsageEnabled =
-      (sessionEntry?.responseUsage ??
+      (activeSessionEntry?.responseUsage ??
         (sessionKey
-          ? sessionStore?.[sessionKey]?.responseUsage
+          ? activeSessionStore?.[sessionKey]?.responseUsage
           : undefined)) === "on";
     if (responseUsageEnabled && hasNonzeroUsage(usage)) {
       const authMode = resolveModelAuthMode(providerUsed, cfg);
@@ -910,8 +1124,8 @@ export async function runReplyAgent(params: {
     let finalPayloads = replyPayloads;
     if (autoCompactionCompleted) {
       const count = await incrementCompactionCount({
-        sessionEntry,
-        sessionStore,
+        sessionEntry: activeSessionEntry,
+        sessionStore: activeSessionStore,
         sessionKey,
         storePath,
       });
@@ -923,7 +1137,7 @@ export async function runReplyAgent(params: {
         ];
       }
     }
-    if (resolvedVerboseLevel === "on" && isNewSession) {
+    if (resolvedVerboseLevel === "on" && activeIsNewSession) {
       finalPayloads = [
         { text: `🧭 New session: ${followupRun.run.sessionId}` },
         ...finalPayloads,

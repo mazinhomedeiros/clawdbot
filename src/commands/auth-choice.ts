@@ -9,7 +9,6 @@ import {
   CODEX_CLI_PROFILE_ID,
   ensureAuthProfileStore,
   listProfilesForProvider,
-  resolveAuthProfileOrder,
   upsertAuthProfile,
 } from "../agents/auth-profiles.js";
 import { DEFAULT_MODEL, DEFAULT_PROVIDER } from "../agents/defaults.js";
@@ -21,6 +20,7 @@ import { loadModelCatalog } from "../agents/model-catalog.js";
 import { resolveConfiguredModelRef } from "../agents/model-selection.js";
 import type { ClawdbotConfig } from "../config/config.js";
 import { upsertSharedEnvVar } from "../infra/env-file.js";
+import { githubCopilotLoginCommand } from "../providers/github-copilot-auth.js";
 import type { RuntimeEnv } from "../runtime.js";
 import type { WizardPrompter } from "../wizard/prompts.js";
 import {
@@ -45,16 +45,12 @@ import {
   applyMinimaxProviderConfig,
   applyOpencodeZenConfig,
   applyOpencodeZenProviderConfig,
-  applyOpenrouterConfig,
-  applyOpenrouterProviderConfig,
   applyZaiConfig,
   MINIMAX_HOSTED_MODEL_REF,
-  OPENROUTER_DEFAULT_MODEL_REF,
   setAnthropicApiKey,
   setGeminiApiKey,
   setMinimaxApiKey,
   setOpencodeZenApiKey,
-  setOpenrouterApiKey,
   setZaiApiKey,
   writeOAuthCredentials,
   ZAI_DEFAULT_MODEL_REF,
@@ -371,77 +367,6 @@ export async function applyAuthChoice(params: {
       `Saved OPENAI_API_KEY to ${result.path} for launchd compatibility.`,
       "OpenAI API key",
     );
-  } else if (params.authChoice === "openrouter-api-key") {
-    const store = ensureAuthProfileStore(params.agentDir, {
-      allowKeychainPrompt: false,
-    });
-    const profileOrder = resolveAuthProfileOrder({
-      cfg: nextConfig,
-      store,
-      provider: "openrouter",
-    });
-    const existingProfileId = profileOrder.find((profileId) =>
-      Boolean(store.profiles[profileId]),
-    );
-    const existingCred = existingProfileId
-      ? store.profiles[existingProfileId]
-      : undefined;
-    let profileId = "openrouter:default";
-    let mode: "api_key" | "oauth" | "token" = "api_key";
-    let hasCredential = false;
-
-    if (existingProfileId && existingCred?.type) {
-      profileId = existingProfileId;
-      mode =
-        existingCred.type === "oauth"
-          ? "oauth"
-          : existingCred.type === "token"
-            ? "token"
-            : "api_key";
-      hasCredential = true;
-    }
-
-    if (!hasCredential) {
-      const envKey = resolveEnvApiKey("openrouter");
-      if (envKey) {
-        const useExisting = await params.prompter.confirm({
-          message: `Use existing OPENROUTER_API_KEY (${envKey.source})?`,
-          initialValue: true,
-        });
-        if (useExisting) {
-          await setOpenrouterApiKey(envKey.apiKey, params.agentDir);
-          hasCredential = true;
-        }
-      }
-    }
-
-    if (!hasCredential) {
-      const key = await params.prompter.text({
-        message: "Enter OpenRouter API key",
-        validate: (value) => (value?.trim() ? undefined : "Required"),
-      });
-      await setOpenrouterApiKey(String(key).trim(), params.agentDir);
-      hasCredential = true;
-    }
-
-    if (hasCredential) {
-      nextConfig = applyAuthProfileConfig(nextConfig, {
-        profileId,
-        provider: "openrouter",
-        mode,
-      });
-    }
-    if (params.setDefaultModel) {
-      nextConfig = applyOpenrouterConfig(nextConfig);
-      await params.prompter.note(
-        `Default model set to ${OPENROUTER_DEFAULT_MODEL_REF}`,
-        "Model configured",
-      );
-    } else {
-      nextConfig = applyOpenrouterProviderConfig(nextConfig);
-      agentModelOverride = OPENROUTER_DEFAULT_MODEL_REF;
-      await noteAgentModel(OPENROUTER_DEFAULT_MODEL_REF);
-    }
   } else if (params.authChoice === "openai-codex") {
     const isRemote = isRemoteEnvironment();
     await params.prompter.note(
@@ -771,6 +696,61 @@ export async function applyAuthChoice(params: {
       agentModelOverride = "minimax/MiniMax-M2.1";
       await noteAgentModel("minimax/MiniMax-M2.1");
     }
+  } else if (params.authChoice === "github-copilot") {
+    await params.prompter.note(
+      [
+        "This will open a GitHub device login to authorize Copilot.",
+        "Requires an active GitHub Copilot subscription.",
+      ].join("\n"),
+      "GitHub Copilot",
+    );
+
+    if (!process.stdin.isTTY) {
+      await params.prompter.note(
+        "GitHub Copilot login requires an interactive TTY.",
+        "GitHub Copilot",
+      );
+      return { config: nextConfig, agentModelOverride };
+    }
+
+    try {
+      await githubCopilotLoginCommand({ yes: true }, params.runtime);
+    } catch (err) {
+      await params.prompter.note(
+        `GitHub Copilot login failed: ${String(err)}`,
+        "GitHub Copilot",
+      );
+      return { config: nextConfig, agentModelOverride };
+    }
+
+    nextConfig = applyAuthProfileConfig(nextConfig, {
+      profileId: "github-copilot:github",
+      provider: "github-copilot",
+      mode: "token",
+    });
+
+    if (params.setDefaultModel) {
+      const model = "github-copilot/gpt-4o";
+      nextConfig = {
+        ...nextConfig,
+        agents: {
+          ...nextConfig.agents,
+          defaults: {
+            ...nextConfig.agents?.defaults,
+            model: {
+              ...(typeof nextConfig.agents?.defaults?.model === "object"
+                ? nextConfig.agents.defaults.model
+                : undefined),
+              primary: model,
+            },
+          },
+        },
+      };
+      await params.prompter.note(
+        `Default model set to ${model}`,
+        "Model configured",
+      );
+    }
   } else if (params.authChoice === "opencode-zen") {
     await params.prompter.note(
       [
@@ -821,12 +801,8 @@ export function resolvePreferredProviderForAuthChoice(
       return "openai-codex";
     case "openai-api-key":
       return "openai";
-    case "openrouter-api-key":
-      return "openrouter";
     case "gemini-api-key":
       return "google";
-    case "zai-api-key":
-      return "zai";
     case "antigravity":
       return "google-antigravity";
     case "minimax-cloud":
@@ -836,6 +812,8 @@ export function resolvePreferredProviderForAuthChoice(
       return "lmstudio";
     case "opencode-zen":
       return "opencode";
+    case "github-copilot":
+      return "github-copilot";
     default:
       return undefined;
   }

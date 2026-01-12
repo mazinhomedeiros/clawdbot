@@ -103,7 +103,11 @@
     },
     {
       "source": "/bash",
-      "destination": "/tools/bash"
+      "destination": "/tools/exec"
+    },
+    {
+      "source": "/tools/bash",
+      "destination": "/tools/exec"
     },
     {
       "source": "/bonjour",
@@ -575,6 +579,8 @@
       {
         "group": "Install & Updates",
         "pages": [
+          "install/index",
+          "install/installer",
           "install/updating",
           "install/ansible",
           "install/nix",
@@ -602,6 +608,7 @@
           "token-use",
           "concepts/oauth",
           "concepts/agent-workspace",
+          "concepts/memory",
           "concepts/multi-agent",
           "concepts/compaction",
           "concepts/session",
@@ -629,6 +636,8 @@
         "group": "Gateway & Ops",
         "pages": [
           "gateway",
+          "gateway/protocol",
+          "gateway/bridge-protocol",
           "gateway/pairing",
           "gateway/gateway-lock",
           "environment",
@@ -694,7 +703,8 @@
         "pages": [
           "tools",
           "plugin",
-          "tools/bash",
+          "tools/exec",
+          "tools/apply-patch",
           "tools/elevated",
           "tools/browser",
           "tools/browser-linux-troubleshooting",

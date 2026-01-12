@@ -83,6 +83,10 @@ pnpm clawdbot onboard
 
 The wizard can also build UI assets automatically. After onboarding, you typically run the Gateway on port **18789**.
 
+### How do I open the dashboard after onboarding?
+
+The wizard now opens your browser with a tokenized dashboard URL right after onboarding and also prints the full link (with token) in the summary. Keep that tab open; if it didn’t launch, copy/paste the printed URL on the same machine. Tokens stay local to your host—nothing is fetched from the browser.
+
 ### What runtime do I need?
 
 Node **>= 22** is required. `pnpm` is recommended; `bun` is optional.
@@ -91,7 +95,7 @@ Node **>= 22** is required. `pnpm` is recommended; `bun` is optional.
 
 `clawdbot onboard` is the recommended setup path. In **local mode** it walks you through:
 
-- **Model/auth setup** (Anthropic OAuth recommended, OpenAI Codex OAuth supported, API keys optional, LM Studio local models supported)
+- **Model/auth setup** (Anthropic **setup-token** recommended for Claude subscriptions, OpenAI Codex OAuth supported, API keys optional, LM Studio local models supported)
 - **Workspace** location + bootstrap files
 - **Gateway settings** (bind/port/auth/tailscale)
 - **Providers** (WhatsApp, Telegram, Discord, Signal, iMessage)
@@ -104,13 +108,46 @@ It also warns if your configured model is unknown or missing auth.
 
 The wizard can run `claude setup-token` on the gateway host (or you run it yourself), then stores the token as an auth profile for the **anthropic** provider. That profile is used for model calls the same way an API key or OAuth profile would be. If you already ran `claude setup-token`, pick **Anthropic token (paste setup-token)** and paste it. More detail: [OAuth](/concepts/oauth).
 
+### Do you support Claude subscription auth (Claude Code OAuth)?
+
+Yes. Clawdbot can **reuse Claude Code CLI credentials** (OAuth) and also supports **setup-token**. If you have a Claude subscription, we recommend **setup-token** on the gateway host for the most reliable long‑running setup (requires Claude Pro/Max + the `claude` CLI). OAuth reuse is supported, but avoid logging in separately via Clawdbot and Claude Code to prevent token conflicts. See [Anthropic](/providers/anthropic) and [OAuth](/concepts/oauth).
+
+### Is AWS Bedrock supported?
+
+Not currently. Clawdbot doesn’t ship a Bedrock provider today. If you must use Bedrock, the common workaround is an OpenAI‑compatible proxy in front of Bedrock, then point Clawdbot at that endpoint. See [Model providers](/providers/models) and [Model providers (full list)](/concepts/model-providers).
+
 ### How does Codex auth work?
 
 Clawdbot supports **OpenAI Code (Codex)** via OAuth or by reusing your Codex CLI login (`~/.codex/auth.json`). The wizard can import the CLI login or run the OAuth flow and will set the default model to `openai-codex/gpt-5.2` when appropriate. See [Model providers](/concepts/model-providers) and [Wizard](/start/wizard).
 
+### Is a local model OK for casual chats?
+
+Usually no. Clawdbot needs large context + strong safety; small cards truncate and leak. If you must, run the **largest** MiniMax M2.1 build you can locally (LM Studio) and see [/gateway/local-models](/gateway/local-models). Smaller/quantized models increase prompt-injection risk — see [Security](/gateway/security).
+
 ### Can I use Bun?
 
 Bun is supported for faster TypeScript execution, but **WhatsApp requires Node** in this ecosystem. The wizard lets you pick the runtime; choose **Node** if you use WhatsApp.
+
+### Can multiple people use one WhatsApp number with different Clawdbots?
+
+Yes, via **multi‑agent routing**. Bind each sender’s WhatsApp **DM** (peer `kind: "dm"`, sender E.164 like `+15551234567`) to a different `agentId`, so each person gets their own workspace and session store. Replies still come from the **same WhatsApp account**, and DM access control (`whatsapp.dmPolicy` / `whatsapp.allowFrom`) is global per WhatsApp account. See [Multi-Agent Routing](/concepts/multi-agent) and [WhatsApp](/providers/whatsapp).
+
+### Can I run a "fast chat" agent and an "Opus for coding" agent?
+
+Yes. Use multi‑agent routing: give each agent its own default model, then bind inbound routes (provider account or specific peers) to each agent. Example config lives in [Multi-Agent Routing](/concepts/multi-agent). See also [Models](/concepts/models) and [Configuration](/gateway/configuration).
+
+### Does Homebrew work on Linux?
+
+Yes. Homebrew supports Linux (Linuxbrew). Quick setup:
+
+```bash
+/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+echo 'eval "$(/home/linuxbrew/.linuxbrew/bin/brew shellenv)"' >> ~/.profile
+eval "$(/home/linuxbrew/.linuxbrew/bin/brew shellenv)"
+brew install <formula>
+```
+
+If you run Clawdbot via systemd, ensure the service PATH includes `/home/linuxbrew/.linuxbrew/bin` (or your brew prefix) so `brew`-installed tools resolve in non‑login shells.
 
 ### Can I switch between npm and git installs later?
 
@@ -137,9 +174,50 @@ clawdbot daemon restart
 
 Doctor detects a gateway service entrypoint mismatch and offers to rewrite the service config to match the current install (use `--repair` in automation).
 
+### How do I customize skills without keeping the repo dirty?
+
+Use managed overrides instead of editing the repo copy. Put your changes in `~/.clawdbot/skills/<name>/SKILL.md` (or add a folder via `skills.load.extraDirs` in `~/.clawdbot/clawdbot.json`). Precedence is `<workspace>/skills` > `~/.clawdbot/skills` > bundled, so managed overrides win without touching git. Only upstream-worthy edits should live in the repo and go out as PRs.
+
+### How do I install skills on Linux?
+
+Use **ClawdHub** (CLI) or drop skills into your workspace. The macOS Skills UI isn’t available on Linux.
+
+Install the ClawdHub CLI (pick one package manager):
+
+```bash
+npm i -g clawdhub
+```
+
+```bash
+pnpm add -g clawdhub
+```
+
+```bash
+bun add -g clawdhub
+```
+
+Install skills:
+
+```bash
+clawdhub install <skill-slug>
+clawdhub update --all
+```
+
+ClawdHub installs into `./skills` under your current directory; Clawdbot treats that as `<workspace>/skills` on the next session. For shared skills across agents, place them in `~/.clawdbot/skills/<name>/SKILL.md`. Some skills expect binaries installed via Homebrew; on Linux that means Linuxbrew (see the Homebrew Linux FAQ entry above). See [Skills](/tools/skills) and [ClawdHub](/tools/clawdhub).
+
 ### Is there a dedicated sandboxing doc?
 
 Yes. See [Sandboxing](/gateway/sandboxing). For Docker-specific setup (full gateway in Docker or sandbox images), see [Docker](/install/docker).
+
+### How does memory work?
+
+Clawdbot memory is just Markdown files in the agent workspace:
+- Daily notes in `memory/YYYY-MM-DD.md`
+- Curated long-term notes in `MEMORY.md` (main/private sessions only)
+
+Clawdbot also runs a **silent pre-compaction memory flush** to remind the model
+to write durable notes before auto-compaction. This only runs when the workspace
+is writable (read-only sandboxes skip it). See [Memory](/concepts/memory).
 
 ## Where things live on disk
 
@@ -180,8 +258,10 @@ Example (repo as default cwd):
 
 ```json5
 {
-  agent: {
-    workspace: "~/Projects/my-repo"
+  agents: {
+    defaults: {
+      workspace: "~/Projects/my-repo"
+    }
   }
 }
 ```
@@ -235,6 +315,35 @@ The Gateway watches the config and supports hot‑reload:
 - `gateway.reload.mode: "hybrid"` (default): hot‑apply safe changes, restart for critical ones
 - `hot`, `restart`, `off` are also supported
 
+### How do I run a central Gateway with specialized workers across devices?
+
+The common pattern is **one Gateway** (e.g. Raspberry Pi) plus **nodes** and **agents**:
+
+- **Gateway (central):** owns providers (Signal/WhatsApp), routing, and sessions.
+- **Nodes (devices):** Macs/iOS/Android connect as peripherals and expose local tools (`system.run`, `canvas`, `camera`).
+- **Agents (workers):** separate brains/workspaces for special roles (e.g. “Hetzner ops”, “Personal data”).
+- **Sub‑agents:** spawn background work from a main agent when you want parallelism.
+- **TUI:** connect to the Gateway and switch agents/sessions.
+
+Docs: [Nodes](/nodes), [Remote access](/gateway/remote), [Multi-Agent Routing](/concepts/multi-agent), [Sub-agents](/tools/subagents), [TUI](/tui).
+
+### Can the Clawdbot browser run headless?
+
+Yes. It’s a config option:
+
+```json5
+{
+  browser: { headless: true },
+  agents: {
+    defaults: {
+      sandbox: { browser: { headless: true } }
+    }
+  }
+}
+```
+
+Default is `false` (headful). Headless is more likely to trigger anti‑bot checks on some sites. See [Browser](/tools/browser).
+
 ## Remote gateways + nodes
 
 ### How do commands propagate between Telegram, the gateway, and nodes?
@@ -261,7 +370,7 @@ Yes. `config.apply` validates + writes the full config and restarts the Gateway 
 
 ```json5
 {
-  agent: { workspace: "~/clawd" },
+  agents: { defaults: { workspace: "~/clawd" } },
   whatsapp: { allowFrom: ["+15555550123"] }
 }
 ```
@@ -347,7 +456,7 @@ Notes:
 ### Do I need to add a “bot account” to a WhatsApp group?
 
 No. Clawdbot runs on **your own account**, so if you’re in the group, Clawdbot can see it.
-By default, anyone in that group can **mention** the bot to trigger a reply.
+By default, group replies are blocked until you allow senders (`groupPolicy: "allowlist"`).
 
 If you want only **you** to be able to trigger group replies:
 
@@ -400,6 +509,12 @@ Use the `/model` command as a standalone message:
 
 You can list available models with `/model`, `/model list`, or `/model status`.
 
+`/model` (and `/model list`) shows a compact, numbered picker. Select by number:
+
+```
+/model 3
+```
+
 You can also force a specific auth profile for the provider (per session):
 
 ```
@@ -408,6 +523,7 @@ You can also force a specific auth profile for the provider (per session):
 ```
 
 Tip: `/model status` shows which agent is active, which `auth-profiles.json` file is being used, and which auth profile will be tried next.
+It also shows the configured provider endpoint (`baseUrl`) and API mode (`api`) when available.
 
 ### Why do I see “Model … is not allowed” and then no reply?
 
@@ -440,12 +556,14 @@ Aliases come from `agents.defaults.models.<modelId>.alias`. Example:
 
 ```json5
 {
-  agent: {
-    model: { primary: "anthropic/claude-opus-4-5" },
-    models: {
-      "anthropic/claude-opus-4-5": { alias: "opus" },
-      "anthropic/claude-sonnet-4-5": { alias: "sonnet" },
-      "anthropic/claude-haiku-4-5": { alias: "haiku" }
+  agents: {
+    defaults: {
+      model: { primary: "anthropic/claude-opus-4-5" },
+      models: {
+        "anthropic/claude-opus-4-5": { alias: "opus" },
+        "anthropic/claude-sonnet-4-5": { alias: "sonnet" },
+        "anthropic/claude-haiku-4-5": { alias: "haiku" }
+      }
     }
   }
 }
@@ -459,9 +577,11 @@ OpenRouter (pay‑per‑token; many models):
 
 ```json5
 {
-  agent: {
-    model: { primary: "openrouter/anthropic/claude-sonnet-4-5" },
-    models: { "openrouter/anthropic/claude-sonnet-4-5": {} }
+  agents: {
+    defaults: {
+      model: { primary: "openrouter/anthropic/claude-sonnet-4-5" },
+      models: { "openrouter/anthropic/claude-sonnet-4-5": {} }
+    }
   },
   env: { OPENROUTER_API_KEY: "sk-or-..." }
 }
@@ -471,9 +591,11 @@ Z.AI (GLM models):
 
 ```json5
 {
-  agent: {
-    model: { primary: "zai/glm-4.7" },
-    models: { "zai/glm-4.7": {} }
+  agents: {
+    defaults: {
+      model: { primary: "zai/glm-4.7" },
+      models: { "zai/glm-4.7": {} }
+    }
   },
   env: { ZAI_API_KEY: "..." }
 }
@@ -642,6 +764,8 @@ Facts (from code):
 - The UI can import `?token=...` (and/or `?password=...`) once, then strips it from the URL.
 
 Fix:
+- Fastest: `clawdbot dashboard` (prints + copies tokenized link, tries to open; shows SSH hint if headless).
+- If remote, tunnel first: `ssh -N -L 18789:127.0.0.1:18789 user@host` then open `http://127.0.0.1:18789/?token=...`.
 - Set `gateway.auth.token` (or `CLAWDBOT_GATEWAY_TOKEN`) on the gateway host.
 - In the Control UI settings, paste the same token (or refresh with a one-time `?token=...` link).
 
@@ -734,6 +858,24 @@ Treat inbound DMs as untrusted input. Defaults are designed to reduce risk:
 
 Run `clawdbot doctor` to surface risky DM policies.
 
+### WhatsApp: will it message my contacts? How does pairing work?
+
+No. Default WhatsApp DM policy is **pairing**. Unknown senders only get a pairing code and their message is **not processed**. Clawdbot only replies to chats it receives or to explicit sends you trigger.
+
+Approve pairing with:
+
+```bash
+clawdbot pairing approve whatsapp <code>
+```
+
+List pending requests:
+
+```bash
+clawdbot pairing list whatsapp
+```
+
+Wizard phone number prompt: it’s used to set your **allowlist/owner** so your own DMs are permitted. It’s not used for auto-sending. If you run on your personal WhatsApp number, use that number and enable `whatsapp.selfChatMode`.
+
 ## Chat commands, aborting tasks, and “it won’t stop”
 
 ### How do I stop/cancel a running task?
@@ -750,13 +892,15 @@ exit
 
 These are abort triggers (not slash commands).
 
-For background processes (from the bash tool), you can ask the agent to run:
+For background processes (from the exec tool), you can ask the agent to run:
 
 ```
 process action:kill sessionId:XXX
 ```
 
-Slash commands only run when the **entire** message is the command (must start with `/`). Inline text like `hello /status` is ignored.
+Slash commands overview: see [Slash commands](/tools/slash-commands).
+
+Most commands must be sent as a **standalone** message that starts with `/`, but a few shortcuts (like `/status`) also work inline for allowlisted senders.
 
 ### Why does it feel like the bot “ignores” rapid‑fire messages?
 

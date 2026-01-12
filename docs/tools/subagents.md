@@ -20,6 +20,7 @@ Primary goals:
 Use `sessions_spawn`:
 - Starts a sub-agent run (`deliver: false`, global lane: `subagent`)
 - Then runs an announce step and posts the announce reply to the requester chat provider
+- Default model: inherits the caller unless you set `agents.defaults.subagents.model` (or per-agent `agents.list[].subagents.model`); an explicit `sessions_spawn.model` still wins.
 
 Tool params:
 - `task` (required)
@@ -80,7 +81,7 @@ Override via config:
         // deny wins
         deny: ["gateway", "cron"],
         // if allow is set, it becomes allow-only (deny still wins)
-        // allow: ["read", "bash", "process"]
+        // allow: ["read", "exec", "process"]
       }
     }
   }

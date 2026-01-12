@@ -52,7 +52,7 @@ describe("stripHeartbeatToken", () => {
   });
 
   it("keeps heartbeat replies when remaining content exceeds threshold", () => {
-    const long = "A".repeat(31);
+    const long = "A".repeat(400);
     expect(
       stripHeartbeatToken(`${long} ${HEARTBEAT_TOKEN}`, { mode: "heartbeat" }),
     ).toEqual({
@@ -88,6 +88,38 @@ describe("stripHeartbeatToken", () => {
       shouldSkip: false,
       text: `hello ${HEARTBEAT_TOKEN} there`,
       didStrip: false,
+    });
+  });
+
+  it("strips HTML-wrapped heartbeat tokens", () => {
+    expect(
+      stripHeartbeatToken(`<b>${HEARTBEAT_TOKEN}</b>`, { mode: "heartbeat" }),
+    ).toEqual({
+      shouldSkip: true,
+      text: "",
+      didStrip: true,
+    });
+  });
+
+  it("strips markdown-wrapped heartbeat tokens", () => {
+    expect(
+      stripHeartbeatToken(`**${HEARTBEAT_TOKEN}**`, { mode: "heartbeat" }),
+    ).toEqual({
+      shouldSkip: true,
+      text: "",
+      didStrip: true,
+    });
+  });
+
+  it("removes markup-wrapped token and keeps trailing content", () => {
+    expect(
+      stripHeartbeatToken(`<code>${HEARTBEAT_TOKEN}</code> all good`, {
+        mode: "message",
+      }),
+    ).toEqual({
+      shouldSkip: false,
+      text: "all good",
+      didStrip: true,
     });
   });
 });

@@ -25,7 +25,11 @@ import {
 import { resolveGatewayLaunchAgentLabel } from "../daemon/constants.js";
 import { readLastGatewayErrorLine } from "../daemon/diagnostics.js";
 import { resolveGatewayProgramArguments } from "../daemon/program-args.js";
-import { resolvePreferredNodePath } from "../daemon/runtime-paths.js";
+import {
+  renderSystemNodeWarning,
+  resolvePreferredNodePath,
+  resolveSystemNodeInfo,
+} from "../daemon/runtime-paths.js";
 import { resolveGatewayService } from "../daemon/service.js";
 import { buildServiceEnvironment } from "../daemon/service-env.js";
 import { buildGatewayConnectionDetails, callGateway } from "../gateway/call.js";
@@ -133,28 +137,8 @@ function noteOpencodeProviderOverrides(cfg: ClawdbotConfig) {
   note(lines.join("\n"), "OpenCode Zen");
 }
 
-const MAC_APP_BUNDLE_ID = "com.clawdbot.mac";
-const MAC_ATTACH_EXISTING_ONLY_KEY = "clawdbot.gateway.attachExistingOnly";
-
 function resolveHomeDir(): string {
   return process.env.HOME ?? os.homedir();
-}
-
-async function readMacAttachExistingOnly(): Promise<boolean | null> {
-  const result = await runCommandWithTimeout(
-    [
-      "/usr/bin/defaults",
-      "read",
-      MAC_APP_BUNDLE_ID,
-      MAC_ATTACH_EXISTING_ONLY_KEY,
-    ],
-    { timeoutMs: 2000 },
-  ).catch(() => null);
-  if (!result || result.code !== 0) return null;
-  const raw = result.stdout.trim().toLowerCase();
-  if (["1", "true", "yes"].includes(raw)) return true;
-  if (["0", "false", "no"].includes(raw)) return false;
-  return null;
 }
 
 async function noteMacLaunchAgentOverrides() {
@@ -165,17 +149,12 @@ async function noteMacLaunchAgentOverrides() {
     "disable-launchagent",
   );
   const hasMarker = fs.existsSync(markerPath);
-  const attachOnly = await readMacAttachExistingOnly();
-  if (!hasMarker && attachOnly !== true) return;
+  if (!hasMarker) return;
 
   const lines = [
-    hasMarker ? `- LaunchAgent writes are disabled via ${markerPath}.` : null,
-    attachOnly === true
-      ? `- macOS app is set to Attach-only (${MAC_APP_BUNDLE_ID}:${MAC_ATTACH_EXISTING_ONLY_KEY}=true).`
-      : null,
+    `- LaunchAgent writes are disabled via ${markerPath}.`,
     "- To restore default behavior:",
     `  rm ${markerPath}`,
-    `  defaults write ${MAC_APP_BUNDLE_ID} ${MAC_ATTACH_EXISTING_ONLY_KEY} -bool NO`,
   ].filter((line): line is string => Boolean(line));
   note(lines.join("\n"), "Gateway (macOS)");
 }
@@ -521,6 +500,27 @@ export async function doctorCommand(
       debug: () => {},
     },
   });
+  if (pluginRegistry.plugins.length > 0) {
+    const loaded = pluginRegistry.plugins.filter((p) => p.status === "loaded");
+    const disabled = pluginRegistry.plugins.filter(
+      (p) => p.status === "disabled",
+    );
+    const errored = pluginRegistry.plugins.filter((p) => p.status === "error");
+
+    const lines = [
+      `Loaded: ${loaded.length}`,
+      `Disabled: ${disabled.length}`,
+      `Errors: ${errored.length}`,
+      errored.length > 0
+        ? `- ${errored
+            .slice(0, 10)
+            .map((p) => p.id)
+            .join("\n- ")}${errored.length > 10 ? "\n- ..." : ""}`
+        : null,
+    ].filter((line): line is string => Boolean(line));
+
+    note(lines.join("\n"), "Plugins");
+  }
   if (pluginRegistry.diagnostics.length > 0) {
     const lines = pluginRegistry.diagnostics.map((diag) => {
       const prefix = diag.level.toUpperCase();
@@ -625,6 +625,16 @@ export async function doctorCommand(
               runtime: daemonRuntime,
               nodePath,
             });
+          if (daemonRuntime === "node") {
+            const systemNode = await resolveSystemNodeInfo({
+              env: process.env,
+            });
+            const warning = renderSystemNodeWarning(
+              systemNode,
+              programArguments[0],
+            );
+            if (warning) note(warning, "Gateway runtime");
+          }
           const environment = buildServiceEnvironment({
             env: process.env,
             port,

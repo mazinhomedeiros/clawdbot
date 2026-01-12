@@ -70,6 +70,10 @@ clawdbot [--dev] [--profile <name>] <command>
     enable
     disable
     doctor
+  memory
+    status
+    index
+    search
   message
   agent
   agents
@@ -182,11 +186,19 @@ Manage extensions and their config:
 
 - `clawdbot plugins list` — discover plugins (use `--json` for machine output).
 - `clawdbot plugins info <id>` — show details for a plugin.
-- `clawdbot plugins install <path>` — add a plugin path to `plugins.load.paths`.
+- `clawdbot plugins install <path|.tgz|npm-spec>` — install a plugin (or add a plugin path to `plugins.load.paths`).
 - `clawdbot plugins enable <id>` / `disable <id>` — toggle `plugins.entries.<id>.enabled`.
 - `clawdbot plugins doctor` — report plugin load errors.
 
 Most plugin changes require a gateway restart. See [/plugin](/plugin).
+
+## Memory
+
+Vector search over `MEMORY.md` + `memory/*.md`:
+
+- `clawdbot memory status` — show index stats.
+- `clawdbot memory index` — reindex memory files.
+- `clawdbot memory search "<query>"` — semantic search over memory.
 
 ## Chat slash commands
 
@@ -221,13 +233,15 @@ Options:
 - `--non-interactive`
 - `--mode <local|remote>`
 - `--flow <quickstart|advanced>`
-- `--auth-choice <setup-token|claude-cli|token|openai-codex|openai-api-key|codex-cli|antigravity|gemini-api-key|zai-api-key|apiKey|minimax-cloud|minimax-api|minimax|opencode-zen|skip>`
+- `--auth-choice <setup-token|claude-cli|token|openai-codex|openai-api-key|openrouter-api-key|moonshot-api-key|codex-cli|antigravity|gemini-api-key|zai-api-key|apiKey|minimax-api|opencode-zen|skip>`
 - `--token-provider <id>` (non-interactive; used with `--auth-choice token`)
 - `--token <token>` (non-interactive; used with `--auth-choice token`)
 - `--token-profile-id <id>` (non-interactive; default: `<provider>:manual`)
 - `--token-expires-in <duration>` (non-interactive; e.g. `365d`, `12h`)
 - `--anthropic-api-key <key>`
 - `--openai-api-key <key>`
+- `--openrouter-api-key <key>`
+- `--moonshot-api-key <key>`
 - `--gemini-api-key <key>`
 - `--zai-api-key <key>`
 - `--minimax-api-key <key>`
@@ -744,7 +758,7 @@ Manage:
 
 Inspect:
 - `browser screenshot [targetId] [--full-page] [--ref <ref>] [--element <selector>] [--type png|jpeg]`
-- `browser snapshot [--format aria|ai] [--target-id <id>] [--limit <n>] [--out <path>]`
+- `browser snapshot [--format aria|ai] [--target-id <id>] [--limit <n>] [--interactive] [--compact] [--depth <n>] [--selector <sel>] [--out <path>]`
 
 Actions:
 - `browser navigate <url> [--target-id <id>]`

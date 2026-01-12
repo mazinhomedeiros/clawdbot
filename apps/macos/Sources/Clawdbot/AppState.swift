@@ -182,14 +182,6 @@ final class AppState {
         }
     }
 
-    var attachExistingGatewayOnly: Bool {
-        didSet {
-            self.ifNotPreview {
-                UserDefaults.standard.set(self.attachExistingGatewayOnly, forKey: attachExistingGatewayOnlyKey)
-            }
-        }
-    }
-
     var remoteTarget: String {
         didSet {
             self.ifNotPreview { UserDefaults.standard.set(self.remoteTarget, forKey: remoteTargetKey) }
@@ -212,7 +204,7 @@ final class AppState {
     private var earBoostTask: Task<Void, Never>?
 
     init(preview: Bool = false) {
-        self.isPreview = preview
+        self.isPreview = preview || ProcessInfo.processInfo.isRunningTests
         let onboardingSeen = UserDefaults.standard.bool(forKey: "clawdbot.onboardingSeen")
         self.isPaused = UserDefaults.standard.bool(forKey: pauseDefaultsKey)
         self.launchAtLogin = false
@@ -302,8 +294,6 @@ final class AppState {
         self.canvasEnabled = UserDefaults.standard.object(forKey: canvasEnabledKey) as? Bool ?? true
         self.peekabooBridgeEnabled = UserDefaults.standard
             .object(forKey: peekabooBridgeEnabledKey) as? Bool ?? true
-        self.attachExistingGatewayOnly = UserDefaults.standard.bool(forKey: attachExistingGatewayOnlyKey)
-
         if !self.isPreview {
             Task.detached(priority: .utility) { [weak self] in
                 let current = await LaunchAgentManager.status()
@@ -604,7 +594,6 @@ extension AppState {
         state.remoteIdentity = "~/.ssh/id_ed25519"
         state.remoteProjectRoot = "~/Projects/clawdbot"
         state.remoteCliPath = ""
-        state.attachExistingGatewayOnly = false
         return state
     }
 }
@@ -622,10 +611,6 @@ enum AppStateStore {
 
     static var canvasEnabled: Bool {
         UserDefaults.standard.object(forKey: canvasEnabledKey) as? Bool ?? true
-    }
-
-    static var attachExistingGatewayOnly: Bool {
-        UserDefaults.standard.bool(forKey: attachExistingGatewayOnlyKey)
     }
 }
 

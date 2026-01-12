@@ -98,8 +98,9 @@ export async function sanitizeSessionMessagesImages(
   const sanitizedIds = options?.sanitizeToolCallIds
     ? sanitizeToolCallIdsForCloudCodeAssist(messages)
     : messages;
+  const base = sanitizedIds;
   const out: AgentMessage[] = [];
-  for (const msg of sanitizedIds) {
+  for (const msg of base) {
     if (!msg || typeof msg !== "object") {
       out.push(msg);
       continue;
@@ -183,7 +184,11 @@ export async function sanitizeSessionMessagesImages(
 const GOOGLE_TURN_ORDER_BOOTSTRAP_TEXT = "(session bootstrap)";
 
 export function isGoogleModelApi(api?: string | null): boolean {
-  return api === "google-gemini-cli" || api === "google-generative-ai";
+  return (
+    api === "google-gemini-cli" ||
+    api === "google-generative-ai" ||
+    api === "google-antigravity"
+  );
 }
 
 export function sanitizeGoogleTurnOrdering(
@@ -244,7 +249,21 @@ export function isContextOverflowError(errorMessage?: string): boolean {
     lower.includes("request exceeds the maximum size") ||
     lower.includes("context length exceeded") ||
     lower.includes("maximum context length") ||
+    lower.includes("prompt is too long") ||
+    lower.includes("context overflow") ||
     (lower.includes("413") && lower.includes("too large"))
+  );
+}
+
+export function isCompactionFailureError(errorMessage?: string): boolean {
+  if (!errorMessage) return false;
+  if (!isContextOverflowError(errorMessage)) return false;
+  const lower = errorMessage.toLowerCase();
+  return (
+    lower.includes("summarization failed") ||
+    lower.includes("auto-compaction") ||
+    lower.includes("compaction failed") ||
+    lower.includes("compaction")
   );
 }
 

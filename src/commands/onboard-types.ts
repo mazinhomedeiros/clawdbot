@@ -11,6 +11,7 @@ export type AuthChoice =
   | "openai-codex"
   | "openai-api-key"
   | "openrouter-api-key"
+  | "moonshot-api-key"
   | "codex-cli"
   | "antigravity"
   | "apiKey"
@@ -19,7 +20,9 @@ export type AuthChoice =
   | "minimax-cloud"
   | "minimax"
   | "minimax-api"
+  | "minimax-api-lightning"
   | "opencode-zen"
+  | "github-copilot"
   | "skip";
 export type GatewayAuthChoice = "off" | "token" | "password";
 export type ResetScope = "config" | "config+creds+sessions" | "full";
@@ -46,6 +49,7 @@ export type OnboardOptions = {
   anthropicApiKey?: string;
   openaiApiKey?: string;
   openrouterApiKey?: string;
+  moonshotApiKey?: string;
   geminiApiKey?: string;
   zaiApiKey?: string;
   minimaxApiKey?: string;

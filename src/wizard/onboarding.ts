@@ -7,7 +7,7 @@ import {
   resolvePreferredProviderForAuthChoice,
   warnIfModelConfigLooksOff,
 } from "../commands/auth-choice.js";
-import { buildAuthChoiceOptions } from "../commands/auth-choice-options.js";
+import { promptAuthChoiceGrouped } from "../commands/auth-choice-prompt.js";
 import {
   DEFAULT_GATEWAY_DAEMON_RUNTIME,
   GATEWAY_DAEMON_RUNTIME_OPTIONS,
@@ -37,7 +37,6 @@ import { setupProviders } from "../commands/onboard-providers.js";
 import { promptRemoteGatewayConfig } from "../commands/onboard-remote.js";
 import { setupSkills } from "../commands/onboard-skills.js";
 import type {
-  AuthChoice,
   GatewayAuthChoice,
   OnboardMode,
   OnboardOptions,
@@ -54,7 +53,11 @@ import {
 } from "../config/config.js";
 import { resolveGatewayLaunchAgentLabel } from "../daemon/constants.js";
 import { resolveGatewayProgramArguments } from "../daemon/program-args.js";
-import { resolvePreferredNodePath } from "../daemon/runtime-paths.js";
+import {
+  renderSystemNodeWarning,
+  resolvePreferredNodePath,
+  resolveSystemNodeInfo,
+} from "../daemon/runtime-paths.js";
 import { resolveGatewayService } from "../daemon/service.js";
 import { buildServiceEnvironment } from "../daemon/service-env.js";
 import { isSystemdUserServiceAvailable } from "../daemon/systemd.js";
@@ -333,14 +336,12 @@ export async function runOnboardingWizard(
   const authChoiceFromPrompt = opts.authChoice === undefined;
   const authChoice =
     opts.authChoice ??
-    ((await prompter.select({
-      message: "Model/auth choice",
-      options: buildAuthChoiceOptions({
-        store: authStore,
-        includeSkip: true,
-        includeClaudeCliIfMissing: true,
-      }),
-    })) as AuthChoice);
+    (await promptAuthChoiceGrouped({
+      prompter,
+      store: authStore,
+      includeSkip: true,
+      includeClaudeCliIfMissing: true,
+    }));
 
   const authResult = await applyAuthChoice({
     authChoice,
@@ -675,6 +676,14 @@ export async function runOnboardingWizard(
           runtime: daemonRuntime,
           nodePath,
         });
+      if (daemonRuntime === "node") {
+        const systemNode = await resolveSystemNodeInfo({ env: process.env });
+        const warning = renderSystemNodeWarning(
+          systemNode,
+          programArguments[0],
+        );
+        if (warning) await prompter.note(warning, "Gateway runtime");
+      }
       const environment = buildServiceEnvironment({
         env: process.env,
         port,
@@ -726,10 +735,13 @@ export async function runOnboardingWizard(
     "Optional apps",
   );
 
+  const controlUiBasePath =
+    nextConfig.gateway?.controlUi?.basePath ??
+    baseConfig.gateway?.controlUi?.basePath;
   const links = resolveControlUiLinks({
     bind,
     port,
-    basePath: baseConfig.gateway?.controlUi?.basePath,
+    basePath: controlUiBasePath,
   });
   const tokenParam =
     authMode === "token" && gatewayToken
@@ -739,7 +751,7 @@ export async function runOnboardingWizard(
   const gatewayProbe = await probeGatewayReachable({
     url: links.wsUrl,
     token: authMode === "token" ? gatewayToken : undefined,
-    password: authMode === "password" ? baseConfig.gateway?.auth?.password : "",
+    password: authMode === "password" ? nextConfig.gateway?.auth?.password : "",
   });
   const gatewayStatusLine = gatewayProbe.ok
     ? "Gateway: reachable"
@@ -784,6 +796,8 @@ export async function runOnboardingWizard(
           token: authMode === "token" ? gatewayToken : undefined,
           password:
             authMode === "password" ? baseConfig.gateway?.auth?.password : "",
+          // Safety: onboarding TUI should not auto-deliver to lastProvider/lastTo.
+          deliver: false,
           message: "Wake up, my friend!",
         });
       }
@@ -793,29 +807,16 @@ export async function runOnboardingWizard(
         await prompter.note(
           formatControlUiSshHint({
             port,
-            basePath: baseConfig.gateway?.controlUi?.basePath,
+            basePath: controlUiBasePath,
             token: authMode === "token" ? gatewayToken : undefined,
           }),
           "Open Control UI",
         );
       } else {
-        const wantsOpen = await prompter.confirm({
-          message: "Open Control UI now?",
-          initialValue: true,
-        });
-        if (wantsOpen) {
-          const opened = await openUrl(`${links.httpUrl}${tokenParam}`);
-          if (!opened) {
-            await prompter.note(
-              formatControlUiSshHint({
-                port,
-                basePath: baseConfig.gateway?.controlUi?.basePath,
-                token: authMode === "token" ? gatewayToken : undefined,
-              }),
-              "Open Control UI",
-            );
-          }
-        }
+        await prompter.note(
+          "Opening Control UI automatically after onboarding (no extra prompts).",
+          "Open Control UI",
+        );
       }
     }
   } else if (opts.skipUi) {
@@ -835,5 +836,46 @@ export async function runOnboardingWizard(
     "Security",
   );
 
-  await prompter.outro("Onboarding complete.");
+  const shouldOpenControlUi =
+    !opts.skipUi && authMode === "token" && Boolean(gatewayToken);
+  let controlUiOpened = false;
+  let controlUiOpenHint: string | undefined;
+  if (shouldOpenControlUi) {
+    const browserSupport = await detectBrowserOpenSupport();
+    if (browserSupport.ok) {
+      controlUiOpened = await openUrl(authedUrl);
+      if (!controlUiOpened) {
+        controlUiOpenHint = formatControlUiSshHint({
+          port,
+          basePath: controlUiBasePath,
+          token: gatewayToken,
+        });
+      }
+    } else {
+      controlUiOpenHint = formatControlUiSshHint({
+        port,
+        basePath: controlUiBasePath,
+        token: gatewayToken,
+      });
+    }
+
+    await prompter.note(
+      [
+        `Dashboard link (with token): ${authedUrl}`,
+        controlUiOpened
+          ? "Opened in your browser. Keep that tab to control Clawdbot."
+          : "Copy/paste this URL in a browser on this machine to control Clawdbot.",
+        controlUiOpenHint,
+      ]
+        .filter(Boolean)
+        .join("\n"),
+      "Dashboard ready",
+    );
+  }
+
+  await prompter.outro(
+    controlUiOpened
+      ? "Onboarding complete. Dashboard opened with your token; keep that tab to control Clawdbot."
+      : "Onboarding complete. Use the tokenized dashboard link above to control Clawdbot.",
+  );
 }

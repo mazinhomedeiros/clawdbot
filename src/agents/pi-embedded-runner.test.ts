@@ -7,6 +7,7 @@ import { Type } from "@sinclair/typebox";
 import { describe, expect, it, vi } from "vitest";
 import type { ClawdbotConfig } from "../config/config.js";
 import { resolveSessionAgentIds } from "./agent-scope.js";
+import { ensureClawdbotModelsJson } from "./models-config.js";
 import {
   applyGoogleTurnOrderingFix,
   buildEmbeddedSandboxInfo,
@@ -17,6 +18,100 @@ import {
   splitSdkTools,
 } from "./pi-embedded-runner.js";
 import type { SandboxContext } from "./sandbox.js";
+
+vi.mock("@mariozechner/pi-ai", async () => {
+  const actual = await vi.importActual<typeof import("@mariozechner/pi-ai")>(
+    "@mariozechner/pi-ai",
+  );
+  return {
+    ...actual,
+    streamSimple: (model: { api: string; provider: string; id: string }) => {
+      if (model.id === "mock-error") {
+        throw new Error("boom");
+      }
+      const stream = new actual.AssistantMessageEventStream();
+      queueMicrotask(() => {
+        stream.push({
+          type: "done",
+          reason: "stop",
+          message: {
+            role: "assistant",
+            content: [{ type: "text", text: "ok" }],
+            stopReason: "stop",
+            api: model.api,
+            provider: model.provider,
+            model: model.id,
+            usage: {
+              input: 1,
+              output: 1,
+              cacheRead: 0,
+              cacheWrite: 0,
+              totalTokens: 2,
+              cost: {
+                input: 0,
+                output: 0,
+                cacheRead: 0,
+                cacheWrite: 0,
+                total: 0,
+              },
+            },
+            timestamp: Date.now(),
+          },
+        });
+      });
+      return stream;
+    },
+  };
+});
+
+const makeOpenAiConfig = (modelIds: string[]) =>
+  ({
+    models: {
+      providers: {
+        openai: {
+          api: "openai-responses",
+          apiKey: "sk-test",
+          baseUrl: "https://example.com",
+          models: modelIds.map((id) => ({
+            id,
+            name: `Mock ${id}`,
+            reasoning: false,
+            input: ["text"],
+            cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+            contextWindow: 16_000,
+            maxTokens: 2048,
+          })),
+        },
+      },
+    },
+  }) satisfies ClawdbotConfig;
+
+const ensureModels = (cfg: ClawdbotConfig, agentDir: string) =>
+  ensureClawdbotModelsJson(cfg, agentDir);
+
+const textFromContent = (content: unknown) => {
+  if (typeof content === "string") return content;
+  if (Array.isArray(content) && content[0]?.type === "text") {
+    return (content[0] as { text?: string }).text;
+  }
+  return undefined;
+};
+
+const readSessionMessages = async (sessionFile: string) => {
+  const raw = await fs.readFile(sessionFile, "utf-8");
+  return raw
+    .split(/\r?\n/)
+    .filter(Boolean)
+    .map(
+      (line) =>
+        JSON.parse(line) as {
+          type?: string;
+          message?: { role?: string; content?: unknown };
+        },
+    )
+    .filter((entry) => entry.type === "message")
+    .map((entry) => entry.message as { role?: string; content?: unknown });
+};
 
 describe("buildEmbeddedSandboxInfo", () => {
   it("returns undefined when sandbox is missing", () => {
@@ -44,7 +139,7 @@ describe("buildEmbeddedSandboxInfo", () => {
         env: { LANG: "C.UTF-8" },
       },
       tools: {
-        allow: ["bash"],
+        allow: ["exec"],
         deny: ["browser"],
       },
       browserAllowHostControl: true,
@@ -87,7 +182,7 @@ describe("buildEmbeddedSandboxInfo", () => {
         env: { LANG: "C.UTF-8" },
       },
       tools: {
-        allow: ["bash"],
+        allow: ["exec"],
         deny: ["browser"],
       },
       browserAllowHostControl: false,
@@ -171,7 +266,7 @@ function createStubTool(name: string): AgentTool {
 describe("splitSdkTools", () => {
   const tools = [
     createStubTool("read"),
-    createStubTool("bash"),
+    createStubTool("exec"),
     createStubTool("edit"),
     createStubTool("write"),
     createStubTool("browser"),
@@ -185,7 +280,7 @@ describe("splitSdkTools", () => {
     expect(builtInTools).toEqual([]);
     expect(customTools.map((tool) => tool.name)).toEqual([
       "read",
-      "bash",
+      "exec",
       "edit",
       "write",
       "browser",
@@ -200,7 +295,7 @@ describe("splitSdkTools", () => {
     expect(builtInTools).toEqual([]);
     expect(customTools.map((tool) => tool.name)).toEqual([
       "read",
-      "bash",
+      "exec",
       "edit",
       "write",
       "browser",
@@ -226,7 +321,7 @@ describe("applyGoogleTurnOrderingFix", () => {
       {
         role: "assistant",
         content: [
-          { type: "toolCall", id: "call_1", name: "bash", arguments: {} },
+          { type: "toolCall", id: "call_1", name: "exec", arguments: {} },
         ],
       },
     ] satisfies AgentMessage[];
@@ -360,7 +455,7 @@ describe("limitHistoryTurns", () => {
       { role: "user", content: [{ type: "text", text: "first" }] },
       {
         role: "assistant",
-        content: [{ type: "toolCall", id: "1", name: "bash", arguments: {} }],
+        content: [{ type: "toolCall", id: "1", name: "exec", arguments: {} }],
       },
       { role: "user", content: [{ type: "text", text: "second" }] },
       { role: "assistant", content: [{ type: "text", text: "response" }] },
@@ -569,12 +664,12 @@ describe("runEmbeddedPiAgent", () => {
       models: {
         providers: {
           minimax: {
-            baseUrl: "https://api.minimax.io/v1",
-            api: "openai-completions",
+            baseUrl: "https://api.minimax.io/anthropic",
+            api: "anthropic-messages",
             apiKey: "sk-minimax-test",
             models: [
               {
-                id: "minimax-m2.1",
+                id: "MiniMax-M2.1",
                 name: "MiniMax M2.1",
                 reasoning: false,
                 input: ["text"],
@@ -606,5 +701,225 @@ describe("runEmbeddedPiAgent", () => {
     await expect(
       fs.stat(path.join(agentDir, "models.json")),
     ).resolves.toBeTruthy();
+  });
+
+  it(
+    "persists the first user message before assistant output",
+    { timeout: 15_000 },
+    async () => {
+      const agentDir = await fs.mkdtemp(
+        path.join(os.tmpdir(), "clawdbot-agent-"),
+      );
+      const workspaceDir = await fs.mkdtemp(
+        path.join(os.tmpdir(), "clawdbot-workspace-"),
+      );
+      const sessionFile = path.join(workspaceDir, "session.jsonl");
+
+      const cfg = makeOpenAiConfig(["mock-1"]);
+      await ensureModels(cfg, agentDir);
+
+      await runEmbeddedPiAgent({
+        sessionId: "session:test",
+        sessionKey: "agent:main:main",
+        sessionFile,
+        workspaceDir,
+        config: cfg,
+        prompt: "hello",
+        provider: "openai",
+        model: "mock-1",
+        timeoutMs: 5_000,
+        agentDir,
+      });
+
+      const messages = await readSessionMessages(sessionFile);
+      const firstUserIndex = messages.findIndex(
+        (message) =>
+          message?.role === "user" &&
+          textFromContent(message.content) === "hello",
+      );
+      const firstAssistantIndex = messages.findIndex(
+        (message) => message?.role === "assistant",
+      );
+      expect(firstUserIndex).toBeGreaterThanOrEqual(0);
+      if (firstAssistantIndex !== -1) {
+        expect(firstUserIndex).toBeLessThan(firstAssistantIndex);
+      }
+    },
+  );
+
+  it("persists the user message when prompt fails before assistant output", async () => {
+    const agentDir = await fs.mkdtemp(
+      path.join(os.tmpdir(), "clawdbot-agent-"),
+    );
+    const workspaceDir = await fs.mkdtemp(
+      path.join(os.tmpdir(), "clawdbot-workspace-"),
+    );
+    const sessionFile = path.join(workspaceDir, "session.jsonl");
+
+    const cfg = makeOpenAiConfig(["mock-error"]);
+    await ensureModels(cfg, agentDir);
+
+    const result = await runEmbeddedPiAgent({
+      sessionId: "session:test",
+      sessionKey: "agent:main:main",
+      sessionFile,
+      workspaceDir,
+      config: cfg,
+      prompt: "boom",
+      provider: "openai",
+      model: "mock-error",
+      timeoutMs: 5_000,
+      agentDir,
+    });
+    expect(result.payloads[0]?.isError).toBe(true);
+
+    const messages = await readSessionMessages(sessionFile);
+    const userIndex = messages.findIndex(
+      (message) =>
+        message?.role === "user" && textFromContent(message.content) === "boom",
+    );
+    expect(userIndex).toBeGreaterThanOrEqual(0);
+  });
+
+  it("appends new user + assistant after existing transcript entries", async () => {
+    const agentDir = await fs.mkdtemp(
+      path.join(os.tmpdir(), "clawdbot-agent-"),
+    );
+    const workspaceDir = await fs.mkdtemp(
+      path.join(os.tmpdir(), "clawdbot-workspace-"),
+    );
+    const sessionFile = path.join(workspaceDir, "session.jsonl");
+
+    const sessionManager = SessionManager.open(sessionFile);
+    sessionManager.appendMessage({
+      role: "user",
+      content: [{ type: "text", text: "seed user" }],
+    });
+    sessionManager.appendMessage({
+      role: "assistant",
+      content: [{ type: "text", text: "seed assistant" }],
+      stopReason: "stop",
+      api: "openai-responses",
+      provider: "openai",
+      model: "mock-1",
+      usage: {
+        input: 1,
+        output: 1,
+        cacheRead: 0,
+        cacheWrite: 0,
+        totalTokens: 2,
+        cost: {
+          input: 0,
+          output: 0,
+          cacheRead: 0,
+          cacheWrite: 0,
+          total: 0,
+        },
+      },
+      timestamp: Date.now(),
+    });
+
+    const cfg = makeOpenAiConfig(["mock-1"]);
+    await ensureModels(cfg, agentDir);
+
+    await runEmbeddedPiAgent({
+      sessionId: "session:test",
+      sessionKey: "agent:main:main",
+      sessionFile,
+      workspaceDir,
+      config: cfg,
+      prompt: "hello",
+      provider: "openai",
+      model: "mock-1",
+      timeoutMs: 5_000,
+      agentDir,
+    });
+
+    const messages = await readSessionMessages(sessionFile);
+    const seedUserIndex = messages.findIndex(
+      (message) =>
+        message?.role === "user" &&
+        textFromContent(message.content) === "seed user",
+    );
+    const seedAssistantIndex = messages.findIndex(
+      (message) =>
+        message?.role === "assistant" &&
+        textFromContent(message.content) === "seed assistant",
+    );
+    const newUserIndex = messages.findIndex(
+      (message) =>
+        message?.role === "user" &&
+        textFromContent(message.content) === "hello",
+    );
+    const newAssistantIndex = messages.findIndex(
+      (message, index) => index > newUserIndex && message?.role === "assistant",
+    );
+    expect(seedUserIndex).toBeGreaterThanOrEqual(0);
+    expect(seedAssistantIndex).toBeGreaterThan(seedUserIndex);
+    expect(newUserIndex).toBeGreaterThan(seedAssistantIndex);
+    expect(newAssistantIndex).toBeGreaterThan(newUserIndex);
+  });
+
+  it("persists multi-turn user/assistant ordering across runs", async () => {
+    const agentDir = await fs.mkdtemp(
+      path.join(os.tmpdir(), "clawdbot-agent-"),
+    );
+    const workspaceDir = await fs.mkdtemp(
+      path.join(os.tmpdir(), "clawdbot-workspace-"),
+    );
+    const sessionFile = path.join(workspaceDir, "session.jsonl");
+
+    const cfg = makeOpenAiConfig(["mock-1"]);
+    await ensureModels(cfg, agentDir);
+
+    await runEmbeddedPiAgent({
+      sessionId: "session:test",
+      sessionKey: "agent:main:main",
+      sessionFile,
+      workspaceDir,
+      config: cfg,
+      prompt: "first",
+      provider: "openai",
+      model: "mock-1",
+      timeoutMs: 5_000,
+      agentDir,
+    });
+
+    await runEmbeddedPiAgent({
+      sessionId: "session:test",
+      sessionKey: "agent:main:main",
+      sessionFile,
+      workspaceDir,
+      config: cfg,
+      prompt: "second",
+      provider: "openai",
+      model: "mock-1",
+      timeoutMs: 5_000,
+      agentDir,
+    });
+
+    const messages = await readSessionMessages(sessionFile);
+    const firstUserIndex = messages.findIndex(
+      (message) =>
+        message?.role === "user" &&
+        textFromContent(message.content) === "first",
+    );
+    const firstAssistantIndex = messages.findIndex(
+      (message, index) =>
+        index > firstUserIndex && message?.role === "assistant",
+    );
+    const secondUserIndex = messages.findIndex(
+      (message) =>
+        message?.role === "user" &&
+        textFromContent(message.content) === "second",
+    );
+    const secondAssistantIndex = messages.findIndex(
+      (message, index) =>
+        index > secondUserIndex && message?.role === "assistant",
+    );
+    expect(firstUserIndex).toBeGreaterThanOrEqual(0);
+    expect(firstAssistantIndex).toBeGreaterThan(firstUserIndex);
+    expect(secondUserIndex).toBeGreaterThan(firstAssistantIndex);
+    expect(secondAssistantIndex).toBeGreaterThan(secondUserIndex);
   });
 });
