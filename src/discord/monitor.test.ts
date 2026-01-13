@@ -7,11 +7,13 @@ import {
   isDiscordGroupAllowedByPolicy,
   normalizeDiscordAllowList,
   normalizeDiscordSlug,
+  registerDiscordListener,
   resolveDiscordChannelConfig,
   resolveDiscordGuildEntry,
   resolveDiscordReplyTarget,
   resolveDiscordShouldRequireMention,
   resolveGroupDmAllow,
+  sanitizeDiscordThreadName,
   shouldEmitDiscordReactionNotification,
 } from "./monitor.js";
 
@@ -32,6 +34,18 @@ const makeEntries = (
   }
   return out;
 };
+
+describe("registerDiscordListener", () => {
+  class FakeListener {}
+
+  it("dedupes listeners by constructor", () => {
+    const listeners: object[] = [];
+
+    expect(registerDiscordListener(listeners, new FakeListener())).toBe(true);
+    expect(registerDiscordListener(listeners, new FakeListener())).toBe(false);
+    expect(listeners).toHaveLength(1);
+  });
+});
 
 describe("discord allowlist helpers", () => {
   it("normalizes slugs", () => {
@@ -323,6 +337,21 @@ describe("discord reply target selection", () => {
         hasReplied: true,
       }),
     ).toBe("123");
+  });
+});
+
+describe("discord autoThread name sanitization", () => {
+  it("strips mentions and collapses whitespace", () => {
+    const name = sanitizeDiscordThreadName(
+      "  <@123>  <@&456> <#789>  Help   here  ",
+      "msg-1",
+    );
+    expect(name).toBe("Help here");
+  });
+
+  it("falls back to thread + id when empty after cleaning", () => {
+    const name = sanitizeDiscordThreadName("   <@123>", "abc");
+    expect(name).toBe("Thread abc");
   });
 });
 

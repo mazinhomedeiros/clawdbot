@@ -9,7 +9,7 @@ import {
 import type { ClawdbotConfig } from "../config/config.js";
 import { detectMime } from "../media/mime.js";
 import { isSubagentSessionKey } from "../routing/session-key.js";
-import { resolveGatewayMessageProvider } from "../utils/message-provider.js";
+import { resolveGatewayMessageChannel } from "../utils/message-channel.js";
 import {
   resolveAgentConfig,
   resolveAgentIdFromSessionKey,
@@ -21,13 +21,18 @@ import {
   type ExecToolDefaults,
   type ProcessToolDefaults,
 } from "./bash-tools.js";
+import { listChannelAgentTools } from "./channel-tools.js";
 import { createClawdbotTools } from "./clawdbot-tools.js";
 import type { ModelAuthMode } from "./model-auth.js";
-import { listProviderAgentTools } from "./provider-tools.js";
 import type { SandboxContext, SandboxToolPolicy } from "./sandbox.js";
 import { assertSandboxPath } from "./sandbox-paths.js";
 import { cleanSchemaForGemini } from "./schema/clean-for-gemini.js";
 import { sanitizeToolResultImages } from "./tool-images.js";
+import {
+  expandToolGroups,
+  normalizeToolName,
+  resolveToolProfilePolicy,
+} from "./tool-policy.js";
 
 // NOTE(steipete): Upstream read now does file-magic MIME detection; we keep the wrapper
 // to normalize payloads and sanitize oversized images before they hit providers.
@@ -291,21 +296,6 @@ function cleanToolSchemaForGemini(schema: Record<string, unknown>): unknown {
   return cleanSchemaForGemini(schema);
 }
 
-const TOOL_NAME_ALIASES: Record<string, string> = {
-  bash: "exec",
-  "apply-patch": "apply_patch",
-};
-
-function normalizeToolName(name: string) {
-  const normalized = name.trim().toLowerCase();
-  return TOOL_NAME_ALIASES[normalized] ?? normalized;
-}
-
-function normalizeToolNames(list?: string[]) {
-  if (!list) return [];
-  return list.map(normalizeToolName).filter(Boolean);
-}
-
 function isOpenAIProvider(provider?: string) {
   const normalized = provider?.trim().toLowerCase();
   return normalized === "openai" || normalized === "openai-codex";
@@ -357,8 +347,8 @@ function isToolAllowedByPolicyName(
   policy?: SandboxToolPolicy,
 ): boolean {
   if (!policy) return true;
-  const deny = new Set(normalizeToolNames(policy.deny));
-  const allowRaw = normalizeToolNames(policy.allow);
+  const deny = new Set(expandToolGroups(policy.deny));
+  const allowRaw = expandToolGroups(policy.allow);
   const allow = allowRaw.length > 0 ? new Set(allowRaw) : null;
   const normalized = normalizeToolName(name);
   if (deny.has(normalized)) return false;
@@ -391,11 +381,15 @@ function resolveEffectiveToolPolicy(params: {
       : undefined;
   const agentTools = agentConfig?.tools;
   const hasAgentToolPolicy =
-    Array.isArray(agentTools?.allow) || Array.isArray(agentTools?.deny);
+    Array.isArray(agentTools?.allow) ||
+    Array.isArray(agentTools?.deny) ||
+    typeof agentTools?.profile === "string";
   const globalTools = params.config?.tools;
+  const profile = agentTools?.profile ?? globalTools?.profile;
   return {
     agentId,
     policy: hasAgentToolPolicy ? agentTools : globalTools,
+    profile,
   };
 }
 
@@ -429,6 +423,102 @@ function wrapSandboxPathGuard(tool: AnyAgentTool, root: string): AnyAgentTool {
   };
 }
 
+type RequiredParamGroup = {
+  keys: readonly string[];
+  allowEmpty?: boolean;
+  label?: string;
+};
+
+const CLAUDE_PARAM_GROUPS = {
+  read: [{ keys: ["path", "file_path"], label: "path (path or file_path)" }],
+  write: [{ keys: ["path", "file_path"], label: "path (path or file_path)" }],
+  edit: [
+    { keys: ["path", "file_path"], label: "path (path or file_path)" },
+    {
+      keys: ["oldText", "old_string"],
+      label: "oldText (oldText or old_string)",
+    },
+    {
+      keys: ["newText", "new_string"],
+      label: "newText (newText or new_string)",
+    },
+  ],
+} as const;
+
+function patchToolSchemaForClaudeCompatibility(
+  tool: AnyAgentTool,
+): AnyAgentTool {
+  const schema =
+    tool.parameters && typeof tool.parameters === "object"
+      ? (tool.parameters as Record<string, unknown>)
+      : undefined;
+
+  if (!schema || !schema.properties || typeof schema.properties !== "object") {
+    return tool;
+  }
+
+  const properties = { ...(schema.properties as Record<string, unknown>) };
+  const required = Array.isArray(schema.required)
+    ? schema.required.filter((key): key is string => typeof key === "string")
+    : [];
+  let changed = false;
+
+  const aliasPairs: Array<{ original: string; alias: string }> = [
+    { original: "path", alias: "file_path" },
+    { original: "oldText", alias: "old_string" },
+    { original: "newText", alias: "new_string" },
+  ];
+
+  for (const { original, alias } of aliasPairs) {
+    if (!(original in properties)) continue;
+    if (!(alias in properties)) {
+      properties[alias] = properties[original];
+      changed = true;
+    }
+    const idx = required.indexOf(original);
+    if (idx !== -1) {
+      required.splice(idx, 1);
+      changed = true;
+    }
+  }
+
+  if (!changed) return tool;
+
+  return {
+    ...tool,
+    parameters: {
+      ...schema,
+      properties,
+      ...(required.length > 0 ? { required } : {}),
+    },
+  };
+}
+
+function assertRequiredParams(
+  record: Record<string, unknown> | undefined,
+  groups: readonly RequiredParamGroup[],
+  toolName: string,
+): void {
+  if (!record || typeof record !== "object") {
+    throw new Error(`Missing parameters for ${toolName}`);
+  }
+
+  for (const group of groups) {
+    const satisfied = group.keys.some((key) => {
+      if (!(key in record)) return false;
+      const value = record[key];
+      if (typeof value !== "string") return false;
+      if (group.allowEmpty) return true;
+      return value.trim().length > 0;
+    });
+
+    if (!satisfied) {
+      const label = group.label ?? group.keys.join(" or ");
+      throw new Error(`Missing required parameter: ${label}`);
+    }
+  }
+}
+
 function createSandboxedReadTool(root: string) {
   const base = createReadTool(root);
   return wrapSandboxPathGuard(createClawdbotReadTool(base), root);
@@ -436,13 +526,20 @@ function createSandboxedReadTool(root: string) {
 
 function createSandboxedWriteTool(root: string) {
   const base = createWriteTool(root);
-  return wrapSandboxPathGuard(wrapToolParamNormalization(base), root);
+  return wrapSandboxPathGuard(
+    wrapToolParamNormalization(base, CLAUDE_PARAM_GROUPS.write),
+    root,
+  );
 }
 
 function createSandboxedEditTool(root: string) {
   const base = createEditTool(root);
-  return wrapSandboxPathGuard(wrapToolParamNormalization(base), root);
+  return wrapSandboxPathGuard(
+    wrapToolParamNormalization(base, CLAUDE_PARAM_GROUPS.edit),
+    root,
+  );
 }
+
 // Normalize tool parameters from Claude Code conventions to pi-coding-agent conventions.
 // Claude Code uses file_path/old_string/new_string while pi-coding-agent uses path/oldText/newText.
 // This prevents models trained on Claude Code from getting stuck in tool-call loops.
@@ -471,26 +568,44 @@ function normalizeToolParams(
 }
 
 // Generic wrapper to normalize parameters for any tool
-function wrapToolParamNormalization(tool: AnyAgentTool): AnyAgentTool {
+function wrapToolParamNormalization(
+  tool: AnyAgentTool,
+  requiredParamGroups?: readonly RequiredParamGroup[],
+): AnyAgentTool {
+  const patched = patchToolSchemaForClaudeCompatibility(tool);
   return {
-    ...tool,
+    ...patched,
     execute: async (toolCallId, params, signal, onUpdate) => {
       const normalized = normalizeToolParams(params);
+      const record =
+        normalized ??
+        (params && typeof params === "object"
+          ? (params as Record<string, unknown>)
+          : undefined);
+      if (requiredParamGroups?.length) {
+        assertRequiredParams(record, requiredParamGroups, tool.name);
+      }
       return tool.execute(toolCallId, normalized ?? params, signal, onUpdate);
     },
   };
 }
 function createClawdbotReadTool(base: AnyAgentTool): AnyAgentTool {
+  const patched = patchToolSchemaForClaudeCompatibility(base);
   return {
-    ...base,
+    ...patched,
     execute: async (toolCallId, params, signal) => {
       const normalized = normalizeToolParams(params);
+      const record =
+        normalized ??
+        (params && typeof params === "object"
+          ? (params as Record<string, unknown>)
+          : undefined);
+      assertRequiredParams(record, CLAUDE_PARAM_GROUPS.read, base.name);
       const result = (await base.execute(
         toolCallId,
         normalized ?? params,
         signal,
       )) as AgentToolResult<unknown>;
-      const record = normalized ?? (params as Record<string, unknown>);
       const filePath =
         typeof record?.path === "string" ? String(record.path) : "<unknown>";
       const normalizedResult = await normalizeReadImageResult(result, filePath);
@@ -501,6 +616,10 @@ function createClawdbotReadTool(base: AnyAgentTool): AnyAgentTool {
 
 export const __testing = {
   cleanToolSchemaForGemini,
+  normalizeToolParams,
+  patchToolSchemaForClaudeCompatibility,
+  wrapToolParamNormalization,
+  assertRequiredParams,
 } as const;
 
 function throwAbortError(): never {
@@ -578,10 +697,15 @@ export function createClawdbotCodingTools(options?: {
 }): AnyAgentTool[] {
   const execToolName = "exec";
   const sandbox = options?.sandbox?.enabled ? options.sandbox : undefined;
-  const { agentId, policy: effectiveToolsPolicy } = resolveEffectiveToolPolicy({
+  const {
+    agentId,
+    policy: effectiveToolsPolicy,
+    profile,
+  } = resolveEffectiveToolPolicy({
     config: options?.config,
     sessionKey: options?.sessionKey,
   });
+  const profilePolicy = resolveToolProfilePolicy(profile);
   const scopeKey =
     options?.exec?.scopeKey ?? (agentId ? `agent:${agentId}` : undefined);
   const subagentPolicy =
@@ -589,6 +713,7 @@ export function createClawdbotCodingTools(options?: {
       ? resolveSubagentToolPolicy(options.config)
       : undefined;
   const allowBackground = isToolAllowedByPolicies("process", [
+    profilePolicy,
     effectiveToolsPolicy,
     sandbox?.tools,
     subagentPolicy,
@@ -618,12 +743,22 @@ export function createClawdbotCodingTools(options?: {
     if (tool.name === "write") {
       if (sandboxRoot) return [];
       // Wrap with param normalization for Claude Code compatibility
-      return [wrapToolParamNormalization(createWriteTool(workspaceRoot))];
+      return [
+        wrapToolParamNormalization(
+          createWriteTool(workspaceRoot),
+          CLAUDE_PARAM_GROUPS.write,
+        ),
+      ];
     }
     if (tool.name === "edit") {
       if (sandboxRoot) return [];
       // Wrap with param normalization for Claude Code compatibility
-      return [wrapToolParamNormalization(createEditTool(workspaceRoot))];
+      return [
+        wrapToolParamNormalization(
+          createEditTool(workspaceRoot),
+          CLAUDE_PARAM_GROUPS.edit,
+        ),
+      ];
     }
     return [tool as AnyAgentTool];
   });
@@ -672,8 +807,8 @@ export function createClawdbotCodingTools(options?: {
     execTool as unknown as AnyAgentTool,
     bashTool,
     processTool as unknown as AnyAgentTool,
-    // Provider docking: include provider-defined agent tools (login, etc.).
-    ...listProviderAgentTools({ cfg: options?.config }),
+    // Channel docking: include channel-defined agent tools (login, etc.).
+    ...listChannelAgentTools({ cfg: options?.config }),
     ...createClawdbotTools({
       browserControlUrl: sandbox?.browser?.controlUrl,
       allowHostBrowserControl: sandbox ? sandbox.browserAllowHostControl : true,
@@ -681,7 +816,7 @@ export function createClawdbotCodingTools(options?: {
       allowedControlHosts: sandbox?.browserAllowedControlHosts,
       allowedControlPorts: sandbox?.browserAllowedControlPorts,
       agentSessionKey: options?.sessionKey,
-      agentProvider: resolveGatewayMessageProvider(options?.messageProvider),
+      agentChannel: resolveGatewayMessageChannel(options?.messageProvider),
       agentAccountId: options?.agentAccountId,
       agentDir: options?.agentDir,
       sandboxRoot,
@@ -694,12 +829,15 @@ export function createClawdbotCodingTools(options?: {
       hasRepliedRef: options?.hasRepliedRef,
     }),
   ];
-  const toolsFiltered = effectiveToolsPolicy
-    ? filterToolsByPolicy(tools, effectiveToolsPolicy)
+  const toolsFiltered = profilePolicy
+    ? filterToolsByPolicy(tools, profilePolicy)
     : tools;
-  const sandboxed = sandbox
-    ? filterToolsByPolicy(toolsFiltered, sandbox.tools)
+  const policyFiltered = effectiveToolsPolicy
+    ? filterToolsByPolicy(toolsFiltered, effectiveToolsPolicy)
     : toolsFiltered;
+  const sandboxed = sandbox
+    ? filterToolsByPolicy(policyFiltered, sandbox.tools)
+    : policyFiltered;
   const subagentFiltered = subagentPolicy
     ? filterToolsByPolicy(sandboxed, subagentPolicy)
     : sandboxed;

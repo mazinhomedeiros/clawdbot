@@ -1,7 +1,8 @@
 import type { Command } from "commander";
+import { CHANNEL_IDS } from "../channels/registry.js";
+import { parseAbsoluteTimeMs } from "../cron/parse.js";
 import type { CronJob, CronSchedule } from "../cron/types.js";
 import { danger } from "../globals.js";
-import { PROVIDER_IDS } from "../providers/registry.js";
 import { normalizeAgentId } from "../routing/session-key.js";
 import { defaultRuntime } from "../runtime.js";
 import { formatDocsLink } from "../terminal/links.js";
@@ -9,7 +10,7 @@ import { colorize, isRich, theme } from "../terminal/theme.js";
 import type { GatewayRpcOpts } from "./gateway-rpc.js";
 import { addGatewayClientOptions, callGatewayFromCli } from "./gateway-rpc.js";
 
-const CRON_PROVIDER_OPTIONS = ["last", ...PROVIDER_IDS].join("|");
+const CRON_CHANNEL_OPTIONS = ["last", ...CHANNEL_IDS].join("|");
 
 async function warnIfCronSchedulerDisabled(opts: GatewayRpcOpts) {
   try {
@@ -57,10 +58,8 @@ function parseDurationMs(input: string): number | null {
 function parseAtMs(input: string): number | null {
   const raw = input.trim();
   if (!raw) return null;
-  const asNum = Number(raw);
-  if (Number.isFinite(asNum) && asNum > 0) return Math.floor(asNum);
-  const parsed = Date.parse(raw);
-  if (Number.isFinite(parsed)) return parsed;
+  const absolute = parseAbsoluteTimeMs(raw);
+  if (absolute) return absolute;
   const dur = parseDurationMs(raw);
   if (dur) return Date.now() + dur;
   return null;
@@ -294,6 +293,11 @@ export function registerCronCli(program: Command) {
       .requiredOption("--name <name>", "Job name")
       .option("--description <text>", "Optional description")
       .option("--disabled", "Create job disabled", false)
+      .option(
+        "--delete-after-run",
+        "Delete one-shot job after it succeeds",
+        false,
+      )
       .option("--agent <id>", "Agent id for this job")
       .option("--session <target>", "Session target (main|isolated)", "main")
       .option(
@@ -318,8 +322,8 @@ export function registerCronCli(program: Command) {
       .option("--timeout-seconds <n>", "Timeout seconds for agent jobs")
       .option("--deliver", "Deliver agent output", false)
       .option(
-        "--provider <provider>",
-        `Delivery provider (${CRON_PROVIDER_OPTIONS})`,
+        "--channel <channel>",
+        `Delivery channel (${CRON_CHANNEL_OPTIONS})`,
         "last",
       )
       .option(
@@ -428,8 +432,7 @@ export function registerCronCli(program: Command) {
                   ? timeoutSeconds
                   : undefined,
               deliver: Boolean(opts.deliver),
-              provider:
-                typeof opts.provider === "string" ? opts.provider : "last",
+              channel: typeof opts.channel === "string" ? opts.channel : "last",
               to:
                 typeof opts.to === "string" && opts.to.trim()
                   ? opts.to.trim()
@@ -468,6 +471,7 @@ export function registerCronCli(program: Command) {
             name,
             description,
             enabled: !opts.disabled,
+            deleteAfterRun: Boolean(opts.deleteAfterRun),
             agentId,
             schedule,
             sessionTarget,
@@ -578,6 +582,12 @@ export function registerCronCli(program: Command) {
       .option("--description <text>", "Set description")
       .option("--enable", "Enable job", false)
       .option("--disable", "Disable job", false)
+      .option(
+        "--delete-after-run",
+        "Delete one-shot job after it succeeds",
+        false,
+      )
+      .option("--keep-after-run", "Keep one-shot job after it succeeds", false)
       .option("--session <target>", "Session target (main|isolated)")
       .option("--agent <id>", "Set agent id")
       .option("--clear-agent", "Unset agent and use default", false)
@@ -593,8 +603,8 @@ export function registerCronCli(program: Command) {
       .option("--timeout-seconds <n>", "Timeout seconds for agent jobs")
       .option("--deliver", "Deliver agent output", false)
       .option(
-        "--provider <provider>",
-        `Delivery provider (${CRON_PROVIDER_OPTIONS})`,
+        "--channel <channel>",
+        `Delivery channel (${CRON_CHANNEL_OPTIONS})`,
       )
       .option(
         "--to <dest>",
@@ -630,6 +640,13 @@ export function registerCronCli(program: Command) {
             throw new Error("Choose --enable or --disable, not both");
           if (opts.enable) patch.enabled = true;
           if (opts.disable) patch.enabled = false;
+          if (opts.deleteAfterRun && opts.keepAfterRun) {
+            throw new Error(
+              "Choose --delete-after-run or --keep-after-run, not both",
+            );
+          }
+          if (opts.deleteAfterRun) patch.deleteAfterRun = true;
+          if (opts.keepAfterRun) patch.deleteAfterRun = false;
           if (typeof opts.session === "string")
             patch.sessionTarget = opts.session;
           if (typeof opts.wake === "string") patch.wakeMode = opts.wake;
@@ -699,8 +716,8 @@ export function registerCronCli(program: Command) {
                   ? timeoutSeconds
                   : undefined,
               deliver: Boolean(opts.deliver),
-              provider:
-                typeof opts.provider === "string" ? opts.provider : undefined,
+              channel:
+                typeof opts.channel === "string" ? opts.channel : undefined,
               to: typeof opts.to === "string" ? opts.to : undefined,
               bestEffortDeliver: Boolean(opts.bestEffortDeliver),
             };

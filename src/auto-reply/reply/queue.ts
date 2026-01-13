@@ -25,6 +25,7 @@ export type QueueSettings = {
   cap?: number;
   dropPolicy?: QueueDropPolicy;
 };
+export type QueueDedupeMode = "message-id" | "prompt" | "none";
 export type FollowupRun = {
   prompt: string;
   /** Provider message ID, when available (for deduplication). */
@@ -345,6 +346,7 @@ function getFollowupQueue(
 function isRunAlreadyQueued(
   run: FollowupRun,
   queue: FollowupQueueState,
+  allowPromptFallback = false,
 ): boolean {
   const hasSameRouting = (item: FollowupRun) =>
     item.originatingChannel === run.originatingChannel &&
@@ -358,6 +360,7 @@ function isRunAlreadyQueued(
       (item) => item.messageId?.trim() === messageId && hasSameRouting(item),
     );
   }
+  if (!allowPromptFallback) return false;
   return queue.items.some(
     (item) => item.prompt === run.prompt && hasSameRouting(item),
   );
@@ -367,12 +370,18 @@ export function enqueueFollowupRun(
   key: string,
   run: FollowupRun,
   settings: QueueSettings,
+  dedupeMode: QueueDedupeMode = "message-id",
 ): boolean {
   const queue = getFollowupQueue(key, settings);
 
   // Deduplicate: skip if the same message is already queued.
-  if (isRunAlreadyQueued(run, queue)) {
-    return false;
+  if (dedupeMode !== "none") {
+    if (dedupeMode === "message-id" && isRunAlreadyQueued(run, queue)) {
+      return false;
+    }
+    if (dedupeMode === "prompt" && isRunAlreadyQueued(run, queue, true)) {
+      return false;
+    }
   }
 
   queue.lastEnqueuedAt = Date.now();
@@ -436,11 +445,11 @@ function buildCollectPrompt(items: FollowupRun[], summary?: string): string {
 /**
  * Checks if queued items have different routable originating channels.
  *
- * Returns true if messages come from different providers (e.g., Slack + Telegram),
+ * Returns true if messages come from different channels (e.g., Slack + Telegram),
  * meaning they cannot be safely collected into one prompt without losing routing.
  * Also returns true for a mix of routable and non-routable channels.
  */
-function hasCrossProviderItems(items: FollowupRun[]): boolean {
+function hasCrossChannelItems(items: FollowupRun[]): boolean {
   const keys = new Set<string>();
   let hasUnkeyed = false;
 
@@ -494,11 +503,11 @@ export function scheduleFollowupDrain(
             continue;
           }
 
-          // Check if messages span multiple providers.
+          // Check if messages span multiple channels.
           // If so, process individually to preserve per-message routing.
-          const isCrossProvider = hasCrossProviderItems(queue.items);
+          const isCrossChannel = hasCrossChannelItems(queue.items);
 
-          if (isCrossProvider) {
+          if (isCrossChannel) {
             forceIndividualCollect = true;
             // Process one at a time to preserve per-message routing info.
             const next = queue.items.shift();
@@ -507,13 +516,13 @@ export function scheduleFollowupDrain(
             continue;
           }
 
-          // Same-provider messages can be safely collected.
+          // Same-channel messages can be safely collected.
           const items = queue.items.splice(0, queue.items.length);
           const summary = buildSummaryPrompt(queue);
           const run = items.at(-1)?.run ?? queue.lastRun;
           if (!run) break;
 
-          // Preserve originating channel from items when collecting same-provider.
+          // Preserve originating channel from items when collecting same-channel.
           const originatingChannel = items.find(
             (i) => i.originatingChannel,
           )?.originatingChannel;
@@ -568,28 +577,28 @@ export function scheduleFollowupDrain(
     }
   })();
 }
-function defaultQueueModeForProvider(_provider?: string): QueueMode {
+function defaultQueueModeForChannel(_channel?: string): QueueMode {
   return "collect";
 }
 export function resolveQueueSettings(params: {
   cfg: ClawdbotConfig;
-  provider?: string;
+  channel?: string;
   sessionEntry?: SessionEntry;
   inlineMode?: QueueMode;
   inlineOptions?: Partial<QueueSettings>;
 }): QueueSettings {
-  const providerKey = params.provider?.trim().toLowerCase();
+  const channelKey = params.channel?.trim().toLowerCase();
   const queueCfg = params.cfg.messages?.queue;
   const providerModeRaw =
-    providerKey && queueCfg?.byProvider
-      ? (queueCfg.byProvider as Record<string, string | undefined>)[providerKey]
+    channelKey && queueCfg?.byChannel
+      ? (queueCfg.byChannel as Record<string, string | undefined>)[channelKey]
       : undefined;
   const resolvedMode =
     params.inlineMode ??
     normalizeQueueMode(params.sessionEntry?.queueMode) ??
     normalizeQueueMode(providerModeRaw) ??
     normalizeQueueMode(queueCfg?.mode) ??
-    defaultQueueModeForProvider(providerKey);
+    defaultQueueModeForChannel(channelKey);
   const debounceRaw =
     params.inlineOptions?.debounceMs ??
     params.sessionEntry?.queueDebounceMs ??

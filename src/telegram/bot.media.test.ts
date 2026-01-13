@@ -10,11 +10,15 @@ const sendChatActionSpy = vi.fn();
 type ApiStub = {
   config: { use: (arg: unknown) => void };
   sendChatAction: typeof sendChatActionSpy;
+  setMyCommands: (
+    commands: Array<{ command: string; description: string }>,
+  ) => Promise<void>;
 };
 
 const apiStub: ApiStub = {
   config: { use: useSpy },
   sendChatAction: sendChatActionSpy,
+  setMyCommands: vi.fn(async () => undefined),
 };
 
 beforeEach(() => {
@@ -26,6 +30,7 @@ vi.mock("grammy", () => ({
     api = apiStub;
     use = middlewareUseSpy;
     on = onSpy;
+    command = vi.fn();
     stop = stopSpy;
     constructor(public token: string) {}
   },
@@ -59,7 +64,9 @@ vi.mock("../config/config.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../config/config.js")>();
   return {
     ...actual,
-    loadConfig: () => ({ telegram: { dmPolicy: "open", allowFrom: ["*"] } }),
+    loadConfig: () => ({
+      channels: { telegram: { dmPolicy: "open", allowFrom: ["*"] } },
+    }),
   };
 });
 

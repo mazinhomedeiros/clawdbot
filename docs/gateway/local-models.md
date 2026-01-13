@@ -55,6 +55,58 @@ Best current local stack. Load MiniMax M2.1 in LM Studio, enable the local serve
 - Adjust `contextWindow`/`maxTokens` if your LM Studio build differs.
 - For WhatsApp, stick to Responses API so only final text is sent.
 
+Keep hosted models configured even when running local; use `models.mode: "merge"` so fallbacks stay available.
+
+### Hybrid config: hosted primary, local fallback
+
+```json5
+{
+  agents: {
+    defaults: {
+      model: {
+        primary: "anthropic/claude-sonnet-4-5",
+        fallbacks: ["lmstudio/minimax-m2.1-gs32", "anthropic/claude-opus-4-5"]
+      },
+      models: {
+        "anthropic/claude-sonnet-4-5": { alias: "Sonnet" },
+        "lmstudio/minimax-m2.1-gs32": { alias: "MiniMax Local" },
+        "anthropic/claude-opus-4-5": { alias: "Opus" }
+      }
+    }
+  },
+  models: {
+    mode: "merge",
+    providers: {
+      lmstudio: {
+        baseUrl: "http://127.0.0.1:1234/v1",
+        apiKey: "lmstudio",
+        api: "openai-responses",
+        models: [
+          {
+            id: "minimax-m2.1-gs32",
+            name: "MiniMax M2.1 GS32",
+            reasoning: false,
+            input: ["text"],
+            cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+            contextWindow: 196608,
+            maxTokens: 8192
+          }
+        ]
+      }
+    }
+  }
+}
+```
+
+### Local-first with hosted safety net
+
+Swap the primary and fallback order; keep the same providers block and `models.mode: "merge"` so you can fall back to Sonnet or Opus when the local box is down.
+
+### Regional hosting / data routing
+
+- Hosted MiniMax/Kimi/GLM variants also exist on OpenRouter with region-pinned endpoints (e.g., US-hosted). Pick the regional variant there to keep traffic in your chosen jurisdiction while still using `models.mode: "merge"` for Anthropic/OpenAI fallbacks.
+- Local-only remains the strongest privacy path; hosted regional routing is the middle ground when you need provider features but want control over data flow.
+
 ## Other OpenAI-compatible local proxies
 
 vLLM, LiteLLM, OAI-proxy, or custom gateways work if they expose an OpenAI-style `/v1` endpoint. Replace the provider block above with your endpoint and model ID:

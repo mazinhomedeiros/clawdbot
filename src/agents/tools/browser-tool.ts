@@ -20,7 +20,9 @@ import {
   browserScreenshotAction,
 } from "../../browser/client-actions.js";
 import { resolveBrowserConfig } from "../../browser/config.js";
+import { DEFAULT_AI_SNAPSHOT_MAX_CHARS } from "../../browser/constants.js";
 import { loadConfig } from "../../config/config.js";
+import { optionalStringEnum, stringEnum } from "../schema/typebox.js";
 import {
   type AnyAgentTool,
   imageResultFromFile,
@@ -42,18 +44,35 @@ const BROWSER_ACT_KINDS = [
   "close",
 ] as const;
 
-type BrowserActKind = (typeof BROWSER_ACT_KINDS)[number];
+const BROWSER_TOOL_ACTIONS = [
+  "status",
+  "start",
+  "stop",
+  "tabs",
+  "open",
+  "focus",
+  "close",
+  "snapshot",
+  "screenshot",
+  "navigate",
+  "console",
+  "pdf",
+  "upload",
+  "dialog",
+  "act",
+] as const;
 
-const DEFAULT_AI_SNAPSHOT_MAX_CHARS = 80_000;
+const BROWSER_TARGETS = ["sandbox", "host", "custom"] as const;
+
+const BROWSER_SNAPSHOT_FORMATS = ["aria", "ai"] as const;
+
+const BROWSER_IMAGE_TYPES = ["png", "jpeg"] as const;
 
 // NOTE: Using a flattened object schema instead of Type.Union([Type.Object(...), ...])
 // because Claude API on Vertex AI rejects nested anyOf schemas as invalid JSON Schema.
 // The discriminator (kind) determines which properties are relevant; runtime validates.
 const BrowserActSchema = Type.Object({
-  kind: Type.Unsafe<BrowserActKind>({
-    type: "string",
-    enum: [...BROWSER_ACT_KINDS],
-  }),
+  kind: stringEnum(BROWSER_ACT_KINDS),
   // Common fields
   targetId: Type.Optional(Type.String()),
   ref: Type.Optional(Type.String()),
@@ -90,37 +109,15 @@ const BrowserActSchema = Type.Object({
 // A root-level `Type.Union([...])` compiles to `{ anyOf: [...] }` (no `type`),
 // which OpenAI rejects ("Invalid schema ... type: None"). Keep this schema an object.
 const BrowserToolSchema = Type.Object({
-  action: Type.Union([
-    Type.Literal("status"),
-    Type.Literal("start"),
-    Type.Literal("stop"),
-    Type.Literal("tabs"),
-    Type.Literal("open"),
-    Type.Literal("focus"),
-    Type.Literal("close"),
-    Type.Literal("snapshot"),
-    Type.Literal("screenshot"),
-    Type.Literal("navigate"),
-    Type.Literal("console"),
-    Type.Literal("pdf"),
-    Type.Literal("upload"),
-    Type.Literal("dialog"),
-    Type.Literal("act"),
-  ]),
-  target: Type.Optional(
-    Type.Union([
-      Type.Literal("sandbox"),
-      Type.Literal("host"),
-      Type.Literal("custom"),
-    ]),
-  ),
+  action: stringEnum(BROWSER_TOOL_ACTIONS),
+  target: optionalStringEnum(BROWSER_TARGETS),
   profile: Type.Optional(Type.String()),
   controlUrl: Type.Optional(Type.String()),
   targetUrl: Type.Optional(Type.String()),
   targetId: Type.Optional(Type.String()),
   limit: Type.Optional(Type.Number()),
   maxChars: Type.Optional(Type.Number()),
-  format: Type.Optional(Type.Union([Type.Literal("aria"), Type.Literal("ai")])),
+  format: optionalStringEnum(BROWSER_SNAPSHOT_FORMATS),
   interactive: Type.Optional(Type.Boolean()),
   compact: Type.Optional(Type.Boolean()),
   depth: Type.Optional(Type.Number()),
@@ -129,7 +126,7 @@ const BrowserToolSchema = Type.Object({
   fullPage: Type.Optional(Type.Boolean()),
   ref: Type.Optional(Type.String()),
   element: Type.Optional(Type.String()),
-  type: Type.Optional(Type.Union([Type.Literal("png"), Type.Literal("jpeg")])),
+  type: optionalStringEnum(BROWSER_IMAGE_TYPES),
   level: Type.Optional(Type.String()),
   paths: Type.Optional(Type.Array(Type.String())),
   inputRef: Type.Optional(Type.String()),
@@ -323,6 +320,7 @@ export function createBrowserTool(opts?: {
             params.format === "ai" || params.format === "aria"
               ? (params.format as "ai" | "aria")
               : "ai";
+          const hasMaxChars = Object.hasOwn(params, "maxChars");
           const targetId =
             typeof params.targetId === "string"
               ? params.targetId.trim()
@@ -339,7 +337,9 @@ export function createBrowserTool(opts?: {
               : undefined;
           const resolvedMaxChars =
             format === "ai"
-              ? (maxChars ?? DEFAULT_AI_SNAPSHOT_MAX_CHARS)
+              ? hasMaxChars
+                ? maxChars
+                : DEFAULT_AI_SNAPSHOT_MAX_CHARS
               : undefined;
           const interactive =
             typeof params.interactive === "boolean"
@@ -361,7 +361,9 @@ export function createBrowserTool(opts?: {
             format,
             targetId,
             limit,
-            ...(resolvedMaxChars ? { maxChars: resolvedMaxChars } : {}),
+            ...(typeof resolvedMaxChars === "number"
+              ? { maxChars: resolvedMaxChars }
+              : {}),
             interactive,
             compact,
             depth,

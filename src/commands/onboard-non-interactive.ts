@@ -41,6 +41,7 @@ import {
   applyMoonshotConfig,
   applyOpencodeZenConfig,
   applyOpenrouterConfig,
+  applySyntheticConfig,
   applyZaiConfig,
   setAnthropicApiKey,
   setGeminiApiKey,
@@ -48,6 +49,7 @@ import {
   setMoonshotApiKey,
   setOpencodeZenApiKey,
   setOpenrouterApiKey,
+  setSyntheticApiKey,
   setZaiApiKey,
 } from "./onboard-auth.js";
 import {
@@ -128,6 +130,13 @@ export async function runNonInteractiveOnboarding(
   runtime: RuntimeEnv = defaultRuntime,
 ) {
   const snapshot = await readConfigFileSnapshot();
+  if (snapshot.exists && !snapshot.valid) {
+    runtime.error(
+      "Config invalid. Run `clawdbot doctor` to repair it, then re-run onboarding.",
+    );
+    runtime.exit(1);
+    return;
+  }
   const baseConfig: ClawdbotConfig = snapshot.valid ? snapshot.config : {};
   const mode = opts.mode ?? "local";
   if (mode !== "local" && mode !== "remote") {
@@ -309,6 +318,25 @@ export async function runNonInteractiveOnboarding(
       mode: "api_key",
     });
     nextConfig = applyMoonshotConfig(nextConfig);
+  } else if (authChoice === "synthetic-api-key") {
+    const resolved = await resolveNonInteractiveApiKey({
+      provider: "synthetic",
+      cfg: baseConfig,
+      flagValue: opts.syntheticApiKey,
+      flagName: "--synthetic-api-key",
+      envVar: "SYNTHETIC_API_KEY",
+      runtime,
+    });
+    if (!resolved) return;
+    if (resolved.source !== "profile") {
+      await setSyntheticApiKey(resolved.key);
+    }
+    nextConfig = applyAuthProfileConfig(nextConfig, {
+      profileId: "synthetic:default",
+      provider: "synthetic",
+      mode: "api_key",
+    });
+    nextConfig = applySyntheticConfig(nextConfig);
   } else if (
     authChoice === "minimax-cloud" ||
     authChoice === "minimax-api" ||
@@ -391,6 +419,7 @@ export async function runNonInteractiveOnboarding(
   } else if (
     authChoice === "token" ||
     authChoice === "oauth" ||
+    authChoice === "chutes" ||
     authChoice === "openai-codex" ||
     authChoice === "antigravity"
   ) {

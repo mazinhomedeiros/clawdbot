@@ -167,7 +167,7 @@ describe("runCronIsolatedAgentTurn", () => {
             kind: "agentTurn",
             message: "do it",
             deliver: false,
-            provider: "last",
+            channel: "last",
           }),
           agentId: "ops",
         },
@@ -460,7 +460,7 @@ describe("runCronIsolatedAgentTurn", () => {
           kind: "agentTurn",
           message: "do it",
           deliver: true,
-          provider: "whatsapp",
+          channel: "whatsapp",
           bestEffortDeliver: false,
         }),
         message: "do it",
@@ -500,7 +500,7 @@ describe("runCronIsolatedAgentTurn", () => {
           kind: "agentTurn",
           message: "do it",
           deliver: true,
-          provider: "whatsapp",
+          channel: "whatsapp",
           bestEffortDeliver: true,
         }),
         message: "do it",
@@ -514,7 +514,7 @@ describe("runCronIsolatedAgentTurn", () => {
     });
   });
 
-  it("delivers telegram via provider send", async () => {
+  it("delivers telegram via channel send", async () => {
     await withTempHome(async (home) => {
       const storePath = await writeSessionStore(home);
       const deps: CliDeps = {
@@ -539,13 +539,15 @@ describe("runCronIsolatedAgentTurn", () => {
       process.env.TELEGRAM_BOT_TOKEN = "";
       try {
         const res = await runCronIsolatedAgentTurn({
-          cfg: makeCfg(home, storePath, { telegram: { botToken: "t-1" } }),
+          cfg: makeCfg(home, storePath, {
+            channels: { telegram: { botToken: "t-1" } },
+          }),
           deps,
           job: makeJob({
             kind: "agentTurn",
             message: "do it",
             deliver: true,
-            provider: "telegram",
+            channel: "telegram",
             to: "123",
           }),
           message: "do it",
@@ -569,7 +571,7 @@ describe("runCronIsolatedAgentTurn", () => {
     });
   });
 
-  it("delivers telegram topic targets via provider send", async () => {
+  it("delivers telegram topic targets via channel send", async () => {
     await withTempHome(async (home) => {
       const storePath = await writeSessionStore(home);
       const deps: CliDeps = {
@@ -597,7 +599,7 @@ describe("runCronIsolatedAgentTurn", () => {
           kind: "agentTurn",
           message: "do it",
           deliver: true,
-          provider: "telegram",
+          channel: "telegram",
           to: "telegram:group:-1001234567890:topic:321",
         }),
         message: "do it",
@@ -614,7 +616,7 @@ describe("runCronIsolatedAgentTurn", () => {
     });
   });
 
-  it("delivers telegram shorthand topic suffixes via provider send", async () => {
+  it("delivers telegram shorthand topic suffixes via channel send", async () => {
     await withTempHome(async (home) => {
       const storePath = await writeSessionStore(home);
       const deps: CliDeps = {
@@ -642,7 +644,7 @@ describe("runCronIsolatedAgentTurn", () => {
           kind: "agentTurn",
           message: "do it",
           deliver: true,
-          provider: "telegram",
+          channel: "telegram",
           to: "-1001234567890:321",
         }),
         message: "do it",
@@ -687,7 +689,7 @@ describe("runCronIsolatedAgentTurn", () => {
           kind: "agentTurn",
           message: "do it",
           deliver: true,
-          provider: "discord",
+          channel: "discord",
           to: "channel:1122",
         }),
         message: "do it",
@@ -732,7 +734,7 @@ describe("runCronIsolatedAgentTurn", () => {
           kind: "agentTurn",
           message: "do it",
           deliver: true,
-          provider: "telegram",
+          channel: "telegram",
           to: "123",
         }),
         message: "do it",
@@ -770,13 +772,15 @@ describe("runCronIsolatedAgentTurn", () => {
       });
 
       const res = await runCronIsolatedAgentTurn({
-        cfg: makeCfg(home, storePath, { whatsapp: { allowFrom: ["+1234"] } }),
+        cfg: makeCfg(home, storePath, {
+          channels: { whatsapp: { allowFrom: ["+1234"] } },
+        }),
         deps,
         job: makeJob({
           kind: "agentTurn",
           message: "do it",
           deliver: true,
-          provider: "whatsapp",
+          channel: "whatsapp",
           to: "+1234",
         }),
         message: "do it",
@@ -803,7 +807,7 @@ describe("runCronIsolatedAgentTurn", () => {
         sendMessageIMessage: vi.fn(),
       };
       // Long content after HEARTBEAT_OK should still be delivered.
-      const longContent = `Important alert: ${"a".repeat(400)}`;
+      const longContent = `Important alert: ${"a".repeat(500)}`;
       vi.mocked(runEmbeddedPiAgent).mockResolvedValue({
         payloads: [{ text: `HEARTBEAT_OK ${longContent}` }],
         meta: {
@@ -819,7 +823,7 @@ describe("runCronIsolatedAgentTurn", () => {
           kind: "agentTurn",
           message: "do it",
           deliver: true,
-          provider: "telegram",
+          channel: "telegram",
           to: "123",
         }),
         message: "do it",
@@ -863,7 +867,7 @@ describe("runCronIsolatedAgentTurn", () => {
           kind: "agentTurn",
           message: "do it",
           deliver: true,
-          provider: "telegram",
+          channel: "telegram",
           to: "123",
         }),
         message: "do it",
@@ -917,7 +921,7 @@ describe("runCronIsolatedAgentTurn", () => {
           kind: "agentTurn",
           message: "do it",
           deliver: true,
-          provider: "telegram",
+          channel: "telegram",
           to: "123",
         }),
         message: "do it",

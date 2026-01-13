@@ -14,6 +14,7 @@ import {
   resolveProfile,
 } from "../browser/config.js";
 import { DEFAULT_CLAWD_BROWSER_COLOR } from "../browser/constants.js";
+import { CHANNEL_IDS } from "../channels/registry.js";
 import {
   type ClawdbotConfig,
   loadConfig,
@@ -23,7 +24,6 @@ import {
   canonicalizeMainSessionAlias,
   resolveAgentMainSessionKey,
 } from "../config/sessions.js";
-import { PROVIDER_IDS } from "../providers/registry.js";
 import { normalizeAgentId } from "../routing/session-key.js";
 import { defaultRuntime } from "../runtime.js";
 import { resolveUserPath } from "../utils.js";
@@ -33,6 +33,7 @@ import {
   resolveSessionAgentId,
 } from "./agent-scope.js";
 import { syncSkillsToWorkspace } from "./skills.js";
+import { expandToolGroups } from "./tool-policy.js";
 import {
   DEFAULT_AGENT_WORKSPACE_DIR,
   DEFAULT_AGENTS_FILENAME,
@@ -107,6 +108,7 @@ export type SandboxDockerConfig = {
   apparmorProfile?: string;
   dns?: string[];
   extraHosts?: string[];
+  binds?: string[];
 };
 
 export type SandboxPruneConfig = {
@@ -186,7 +188,7 @@ const DEFAULT_TOOL_DENY = [
   "nodes",
   "cron",
   "gateway",
-  ...PROVIDER_IDS,
+  ...CHANNEL_IDS,
 ];
 export const DEFAULT_SANDBOX_BROWSER_IMAGE =
   "clawdbot-sandbox-browser:bookworm-slim";
@@ -238,18 +240,10 @@ const BROWSER_BRIDGES = new Map<
   { bridge: BrowserBridge; containerName: string }
 >();
 
-function normalizeToolList(values?: string[]) {
-  if (!values) return [];
-  return values
-    .map((value) => value.trim())
-    .filter(Boolean)
-    .map((value) => value.toLowerCase());
-}
-
 function isToolAllowed(policy: SandboxToolPolicy, name: string) {
-  const deny = new Set(normalizeToolList(policy.deny));
+  const deny = new Set(expandToolGroups(policy.deny));
   if (deny.has(name.toLowerCase())) return false;
-  const allow = normalizeToolList(policy.allow);
+  const allow = expandToolGroups(policy.allow);
   if (allow.length === 0) return true;
   return allow.includes(name.toLowerCase());
 }
@@ -282,6 +276,8 @@ export function resolveSandboxDockerConfig(params: {
     ? { ...globalDocker?.ulimits, ...agentDocker.ulimits }
     : globalDocker?.ulimits;
 
+  const binds = [...(globalDocker?.binds ?? []), ...(agentDocker?.binds ?? [])];
+
   return {
     image: agentDocker?.image ?? globalDocker?.image ?? DEFAULT_SANDBOX_IMAGE,
     containerPrefix:
@@ -309,6 +305,7 @@ export function resolveSandboxDockerConfig(params: {
       agentDocker?.apparmorProfile ?? globalDocker?.apparmorProfile,
     dns: agentDocker?.dns ?? globalDocker?.dns,
     extraHosts: agentDocker?.extraHosts ?? globalDocker?.extraHosts,
+    binds: binds.length ? binds : undefined,
   };
 }
 
@@ -480,21 +477,27 @@ export function resolveSandboxToolPolicyForAgent(
     : Array.isArray(globalDeny)
       ? globalDeny
       : DEFAULT_TOOL_DENY;
-  let allow = Array.isArray(agentAllow)
+  const allow = Array.isArray(agentAllow)
     ? agentAllow
     : Array.isArray(globalAllow)
       ? globalAllow
       : DEFAULT_TOOL_ALLOW;
 
+  const expandedDeny = expandToolGroups(deny);
+  let expandedAllow = expandToolGroups(allow);
+
   // `image` is essential for multimodal workflows; always include it in sandboxed
   // sessions unless explicitly denied.
-  if (!deny.includes("image") && !allow.includes("image")) {
-    allow = [...allow, "image"];
+  if (
+    !expandedDeny.map((v) => v.toLowerCase()).includes("image") &&
+    !expandedAllow.map((v) => v.toLowerCase()).includes("image")
+  ) {
+    expandedAllow = [...expandedAllow, "image"];
   }
 
   return {
-    allow,
-    deny,
+    allow: expandedAllow,
+    deny: expandedDeny,
     sources: {
       allow: allowSource,
       deny: denySource,
@@ -637,8 +640,8 @@ export function formatSandboxToolPolicyBlockedMessage(params: {
   });
   if (!runtime.sandboxed) return undefined;
 
-  const deny = new Set(normalizeToolList(runtime.toolPolicy.deny));
-  const allow = normalizeToolList(runtime.toolPolicy.allow);
+  const deny = new Set(expandToolGroups(runtime.toolPolicy.deny));
+  const allow = expandToolGroups(runtime.toolPolicy.allow);
   const allowSet = allow.length > 0 ? new Set(allow) : null;
   const blockedByDeny = deny.has(tool);
   const blockedByAllow = allowSet ? !allowSet.has(tool) : false;
@@ -966,6 +969,11 @@ export function buildSandboxCreateArgs(params: {
   for (const [name, value] of Object.entries(params.cfg.ulimits ?? {})) {
     const formatted = formatUlimitValue(name, value);
     if (formatted) args.push("--ulimit", formatted);
+  }
+  if (params.cfg.binds?.length) {
+    for (const bind of params.cfg.binds) {
+      args.push("-v", bind);
+    }
   }
   return args;
 }

@@ -8,7 +8,7 @@ import type { RuntimeEnv } from "../runtime.js";
 import { runOnboardingWizard } from "./onboarding.js";
 import type { WizardPrompter } from "./prompts.js";
 
-const setupProviders = vi.hoisted(() => vi.fn(async (cfg) => cfg));
+const setupChannels = vi.hoisted(() => vi.fn(async (cfg) => cfg));
 const setupSkills = vi.hoisted(() => vi.fn(async (cfg) => cfg));
 const healthCommand = vi.hoisted(() => vi.fn(async () => {}));
 const ensureWorkspaceAndSessions = vi.hoisted(() => vi.fn(async () => {}));
@@ -25,8 +25,8 @@ const ensureControlUiAssetsBuilt = vi.hoisted(() =>
 );
 const runTui = vi.hoisted(() => vi.fn(async () => {}));
 
-vi.mock("../commands/onboard-providers.js", () => ({
-  setupProviders,
+vi.mock("../commands/onboard-channels.js", () => ({
+  setupChannels,
 }));
 
 vi.mock("../commands/onboard-skills.js", () => ({
@@ -80,6 +80,58 @@ vi.mock("../tui/tui.js", () => ({
 }));
 
 describe("runOnboardingWizard", () => {
+  it("exits when config is invalid", async () => {
+    readConfigFileSnapshot.mockResolvedValueOnce({
+      path: "/tmp/.clawdbot/clawdbot.json",
+      exists: true,
+      raw: "{}",
+      parsed: {},
+      valid: false,
+      config: {},
+      issues: [{ path: "routing.allowFrom", message: "Legacy key" }],
+      legacyIssues: [{ path: "routing.allowFrom", message: "Legacy key" }],
+    });
+
+    const select: WizardPrompter["select"] = vi.fn(async () => "quickstart");
+    const prompter: WizardPrompter = {
+      intro: vi.fn(async () => {}),
+      outro: vi.fn(async () => {}),
+      note: vi.fn(async () => {}),
+      select,
+      multiselect: vi.fn(async () => []),
+      text: vi.fn(async () => ""),
+      confirm: vi.fn(async () => false),
+      progress: vi.fn(() => ({ update: vi.fn(), stop: vi.fn() })),
+    };
+
+    const runtime: RuntimeEnv = {
+      log: vi.fn(),
+      error: vi.fn(),
+      exit: vi.fn((code: number) => {
+        throw new Error(`exit:${code}`);
+      }),
+    };
+
+    await expect(
+      runOnboardingWizard(
+        {
+          flow: "quickstart",
+          authChoice: "skip",
+          installDaemon: false,
+          skipProviders: true,
+          skipSkills: true,
+          skipHealth: true,
+          skipUi: true,
+        },
+        runtime,
+        prompter,
+      ),
+    ).rejects.toThrow("exit:1");
+
+    expect(select).not.toHaveBeenCalled();
+    expect(prompter.outro).toHaveBeenCalled();
+  });
+
   it("skips prompts and setup steps when flags are set", async () => {
     const select: WizardPrompter["select"] = vi.fn(async () => "quickstart");
     const multiselect: WizardPrompter["multiselect"] = vi.fn(async () => []);
@@ -116,7 +168,7 @@ describe("runOnboardingWizard", () => {
     );
 
     expect(select).not.toHaveBeenCalled();
-    expect(setupProviders).not.toHaveBeenCalled();
+    expect(setupChannels).not.toHaveBeenCalled();
     expect(setupSkills).not.toHaveBeenCalled();
     expect(healthCommand).not.toHaveBeenCalled();
     expect(runTui).not.toHaveBeenCalled();
