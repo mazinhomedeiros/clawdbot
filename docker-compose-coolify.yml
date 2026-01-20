@@ -23,7 +23,7 @@ services:
       [
         "node",
         "dist/index.js",
-        "gateway-daemon",
+        "gateway",
         "--bind",
         "lan",
         "--port",
@@ -33,3 +33,9 @@ services:
 volumes:
   clawdbot_config:
   clawdbot_workspace:
+
+
+# Expose a "clawdbot" command in PATH
+  RUN printf '#!/usr/bin/env sh\nexec node dist/index.js "$@"\n' > /usr/local/bin/clawdbot \
+    && chmod +x /usr/local/bin/clawdbot
+
