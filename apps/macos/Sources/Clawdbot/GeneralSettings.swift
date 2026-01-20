@@ -83,6 +83,8 @@ struct GeneralSettings: View {
                         subtitle: "Allow the agent to capture a photo or short video via the built-in camera.",
                         binding: self.$cameraEnabled)
 
+                    SystemRunSettingsView()
+
                     VStack(alignment: .leading, spacing: 6) {
                         Text("Location Access")
                             .font(.body)
@@ -92,7 +94,8 @@ struct GeneralSettings: View {
                             Text("While Using").tag(ClawdbotLocationMode.whileUsing.rawValue)
                             Text("Always").tag(ClawdbotLocationMode.always.rawValue)
                         }
-                        .pickerStyle(.segmented)
+                        .labelsHidden()
+                        .pickerStyle(.menu)
 
                         Toggle("Precise Location", isOn: self.$locationPreciseEnabled)
                             .disabled(self.locationMode == .off)
@@ -204,11 +207,6 @@ struct GeneralSettings: View {
                 if !self.isNixMode {
                     self.gatewayInstallerCard
                 }
-                SettingsToggleRow(
-                    title: "Attach only",
-                    subtitle: "Use this when the gateway runs externally; the mac app will only attach " +
-                        "to an already-running gateway and won't start one locally.",
-                    binding: self.$state.attachExistingGatewayOnly)
                 TailscaleIntegrationSection(
                     connectionMode: self.state.connectionMode,
                     isPaused: self.state.isPaused)
@@ -501,18 +499,18 @@ struct GeneralSettings: View {
             }
 
             if let snap = snapshot {
-                let linkId = snap.providerOrder?.first(where: {
-                    if let summary = snap.providers[$0] { return summary.linked != nil }
+                let linkId = snap.channelOrder?.first(where: {
+                    if let summary = snap.channels[$0] { return summary.linked != nil }
                     return false
-                }) ?? snap.providers.keys.first(where: {
-                    if let summary = snap.providers[$0] { return summary.linked != nil }
+                }) ?? snap.channels.keys.first(where: {
+                    if let summary = snap.channels[$0] { return summary.linked != nil }
                     return false
                 })
                 let linkLabel =
-                    linkId.flatMap { snap.providerLabels?[$0] } ??
+                    linkId.flatMap { snap.channelLabels?[$0] } ??
                     linkId?.capitalized ??
-                    "Link provider"
-                let linkAge = linkId.flatMap { snap.providers[$0]?.authAgeMs }
+                    "Link channel"
+                let linkAge = linkId.flatMap { snap.channels[$0]?.authAgeMs }
                 Text("\(linkLabel) auth age: \(healthAgeString(linkAge))")
                     .font(.caption)
                     .foregroundStyle(.secondary)
@@ -718,7 +716,7 @@ extension GeneralSettings {
     }
 
     private func applyDiscoveredGateway(_ gateway: GatewayDiscoveryModel.DiscoveredGateway) {
-        MacNodeModeCoordinator.shared.setPreferredBridgeStableID(gateway.stableID)
+        MacNodeModeCoordinator.shared.setPreferredGatewayStableID(gateway.stableID)
 
         let host = gateway.tailnetDns ?? gateway.lanHost
         guard let host else { return }

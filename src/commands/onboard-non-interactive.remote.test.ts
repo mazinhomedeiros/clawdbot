@@ -31,7 +31,7 @@ describe("onboard (non-interactive): remote gateway config", () => {
       home: process.env.HOME,
       stateDir: process.env.CLAWDBOT_STATE_DIR,
       configPath: process.env.CLAWDBOT_CONFIG_PATH,
-      skipProviders: process.env.CLAWDBOT_SKIP_PROVIDERS,
+      skipChannels: process.env.CLAWDBOT_SKIP_CHANNELS,
       skipGmail: process.env.CLAWDBOT_SKIP_GMAIL_WATCHER,
       skipCron: process.env.CLAWDBOT_SKIP_CRON,
       skipCanvas: process.env.CLAWDBOT_SKIP_CANVAS_HOST,
@@ -39,16 +39,14 @@ describe("onboard (non-interactive): remote gateway config", () => {
       password: process.env.CLAWDBOT_GATEWAY_PASSWORD,
     };
 
-    process.env.CLAWDBOT_SKIP_PROVIDERS = "1";
+    process.env.CLAWDBOT_SKIP_CHANNELS = "1";
     process.env.CLAWDBOT_SKIP_GMAIL_WATCHER = "1";
     process.env.CLAWDBOT_SKIP_CRON = "1";
     process.env.CLAWDBOT_SKIP_CANVAS_HOST = "1";
     delete process.env.CLAWDBOT_GATEWAY_TOKEN;
     delete process.env.CLAWDBOT_GATEWAY_PASSWORD;
 
-    const tempHome = await fs.mkdtemp(
-      path.join(os.tmpdir(), "clawdbot-onboard-remote-"),
-    );
+    const tempHome = await fs.mkdtemp(path.join(os.tmpdir(), "clawdbot-onboard-remote-"));
     process.env.HOME = tempHome;
     delete process.env.CLAWDBOT_STATE_DIR;
     delete process.env.CLAWDBOT_CONFIG_PATH;
@@ -73,9 +71,7 @@ describe("onboard (non-interactive): remote gateway config", () => {
     };
 
     try {
-      const { runNonInteractiveOnboarding } = await import(
-        "./onboard-non-interactive.js"
-      );
+      const { runNonInteractiveOnboarding } = await import("./onboard-non-interactive.js");
       await runNonInteractiveOnboarding(
         {
           nonInteractive: true,
@@ -88,10 +84,8 @@ describe("onboard (non-interactive): remote gateway config", () => {
         runtime,
       );
 
-      const { CONFIG_PATH_CLAWDBOT } = await import("../config/config.js");
-      const cfg = JSON.parse(
-        await fs.readFile(CONFIG_PATH_CLAWDBOT, "utf8"),
-      ) as {
+      const { resolveConfigPath } = await import("../config/config.js");
+      const cfg = JSON.parse(await fs.readFile(resolveConfigPath(), "utf8")) as {
         gateway?: { mode?: string; remote?: { url?: string; token?: string } };
       };
 
@@ -108,7 +102,7 @@ describe("onboard (non-interactive): remote gateway config", () => {
       process.env.HOME = prev.home;
       process.env.CLAWDBOT_STATE_DIR = prev.stateDir;
       process.env.CLAWDBOT_CONFIG_PATH = prev.configPath;
-      process.env.CLAWDBOT_SKIP_PROVIDERS = prev.skipProviders;
+      process.env.CLAWDBOT_SKIP_CHANNELS = prev.skipChannels;
       process.env.CLAWDBOT_SKIP_GMAIL_WATCHER = prev.skipGmail;
       process.env.CLAWDBOT_SKIP_CRON = prev.skipCron;
       process.env.CLAWDBOT_SKIP_CANVAS_HOST = prev.skipCanvas;

@@ -7,12 +7,14 @@ import { resolveGroupRequireMention } from "./groups.js";
 describe("resolveGroupRequireMention", () => {
   it("respects Discord guild/channel requireMention settings", () => {
     const cfg: ClawdbotConfig = {
-      discord: {
-        guilds: {
-          "145": {
-            requireMention: false,
-            channels: {
-              general: { allow: true },
+      channels: {
+        discord: {
+          guilds: {
+            "145": {
+              requireMention: false,
+              channels: {
+                general: { allow: true },
+              },
             },
           },
         },
@@ -20,26 +22,26 @@ describe("resolveGroupRequireMention", () => {
     };
     const ctx: TemplateContext = {
       Provider: "discord",
-      From: "group:123",
-      GroupRoom: "#general",
+      From: "discord:group:123",
+      GroupChannel: "#general",
       GroupSpace: "145",
     };
     const groupResolution: GroupKeyResolution = {
-      provider: "discord",
+      channel: "discord",
       id: "123",
       chatType: "group",
     };
 
-    expect(resolveGroupRequireMention({ cfg, ctx, groupResolution })).toBe(
-      false,
-    );
+    expect(resolveGroupRequireMention({ cfg, ctx, groupResolution })).toBe(false);
   });
 
   it("respects Slack channel requireMention settings", () => {
     const cfg: ClawdbotConfig = {
-      slack: {
-        channels: {
-          C123: { requireMention: false },
+      channels: {
+        slack: {
+          channels: {
+            C123: { requireMention: false },
+          },
         },
       },
     };
@@ -49,13 +51,11 @@ describe("resolveGroupRequireMention", () => {
       GroupSubject: "#general",
     };
     const groupResolution: GroupKeyResolution = {
-      provider: "slack",
+      channel: "slack",
       id: "C123",
       chatType: "group",
     };
 
-    expect(resolveGroupRequireMention({ cfg, ctx, groupResolution })).toBe(
-      false,
-    );
+    expect(resolveGroupRequireMention({ cfg, ctx, groupResolution })).toBe(false);
   });
 });

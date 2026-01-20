@@ -1,29 +1,31 @@
 import { randomUUID } from "node:crypto";
+import fs from "node:fs";
+import path from "node:path";
 
 import { resolveThinkingDefault } from "../../agents/model-selection.js";
 import { resolveAgentTimeoutMs } from "../../agents/timeout.js";
+import { formatInboundEnvelope, resolveEnvelopeFormatOptions } from "../../auto-reply/envelope.js";
 import { agentCommand } from "../../commands/agent.js";
-import { mergeSessionEntry, saveSessionStore } from "../../config/sessions.js";
+import { mergeSessionEntry, updateSessionStore } from "../../config/sessions.js";
 import { registerAgentRunContext } from "../../infra/agent-events.js";
+import { isAcpSessionKey } from "../../routing/session-key.js";
 import { defaultRuntime } from "../../runtime.js";
 import { resolveSendPolicy } from "../../sessions/send-policy.js";
-import { INTERNAL_MESSAGE_PROVIDER } from "../../utils/message-provider.js";
+import { INTERNAL_MESSAGE_CHANNEL } from "../../utils/message-channel.js";
 import {
   abortChatRunById,
   abortChatRunsForSessionKey,
   isChatStopCommandText,
   resolveChatRunExpiresAtMs,
 } from "../chat-abort.js";
-import {
-  type ChatImageContent,
-  parseMessageWithAttachments,
-} from "../chat-attachments.js";
+import { type ChatImageContent, parseMessageWithAttachments } from "../chat-attachments.js";
 import {
   ErrorCodes,
   errorShape,
   formatValidationErrors,
   validateChatAbortParams,
   validateChatHistoryParams,
+  validateChatInjectParams,
   validateChatSendParams,
 } from "../protocol/index.js";
 import { MAX_CHAT_HISTORY_MESSAGES_BYTES } from "../server-constants.js";
@@ -33,6 +35,7 @@ import {
   readSessionMessages,
   resolveSessionModelRef,
 } from "../session-utils.js";
+import { stripEnvelopeFromMessages } from "../chat-sanitize.js";
 import { formatForLog } from "../ws-log.js";
 import type { GatewayRequestHandlers } from "./types.js";
 
@@ -56,19 +59,14 @@ export const chatHandlers: GatewayRequestHandlers = {
     const { cfg, storePath, entry } = loadSessionEntry(sessionKey);
     const sessionId = entry?.sessionId;
     const rawMessages =
-      sessionId && storePath
-        ? readSessionMessages(sessionId, storePath, entry?.sessionFile)
-        : [];
+      sessionId && storePath ? readSessionMessages(sessionId, storePath, entry?.sessionFile) : [];
     const hardMax = 1000;
     const defaultLimit = 200;
     const requested = typeof limit === "number" ? limit : defaultLimit;
     const max = Math.min(hardMax, requested);
-    const sliced =
-      rawMessages.length > max ? rawMessages.slice(-max) : rawMessages;
-    const capped = capArrayByJsonBytes(
-      sliced,
-      MAX_CHAT_HISTORY_MESSAGES_BYTES,
-    ).items;
+    const sliced = rawMessages.length > max ? rawMessages.slice(-max) : rawMessages;
+    const sanitized = stripEnvelopeFromMessages(sliced);
+    const capped = capArrayByJsonBytes(sanitized, MAX_CHAT_HISTORY_MESSAGES_BYTES).items;
     let thinkingLevel = entry?.thinkingLevel;
     if (!thinkingLevel) {
       const configured = cfg.agents?.defaults?.thinkingDefault;
@@ -117,7 +115,7 @@ export const chatHandlers: GatewayRequestHandlers = {
       removeChatRun: context.removeChatRun,
       agentRunSeq: context.agentRunSeq,
       broadcast: context.broadcast,
-      bridgeSendToSession: context.bridgeSendToSession,
+      nodeSendToSession: context.nodeSendToSession,
     };
 
     if (!runId) {
@@ -138,10 +136,7 @@ export const chatHandlers: GatewayRequestHandlers = {
       respond(
         false,
         undefined,
-        errorShape(
-          ErrorCodes.INVALID_REQUEST,
-          "runId does not match sessionKey",
-        ),
+        errorShape(ErrorCodes.INVALID_REQUEST, "runId does not match sessionKey"),
       );
       return;
     }
@@ -206,23 +201,18 @@ export const chatHandlers: GatewayRequestHandlers = {
     let parsedImages: ChatImageContent[] = [];
     if (normalizedAttachments.length > 0) {
       try {
-        const parsed = await parseMessageWithAttachments(
-          p.message,
-          normalizedAttachments,
-          { maxBytes: 5_000_000, log: context.logGateway },
-        );
+        const parsed = await parseMessageWithAttachments(p.message, normalizedAttachments, {
+          maxBytes: 5_000_000,
+          log: context.logGateway,
+        });
         parsedMessage = parsed.message;
         parsedImages = parsed.images;
       } catch (err) {
-        respond(
-          false,
-          undefined,
-          errorShape(ErrorCodes.INVALID_REQUEST, String(err)),
-        );
+        respond(false, undefined, errorShape(ErrorCodes.INVALID_REQUEST, String(err)));
         return;
       }
     }
-    const { cfg, storePath, store, entry } = loadSessionEntry(p.sessionKey);
+    const { cfg, storePath, entry, canonicalKey } = loadSessionEntry(p.sessionKey);
     const timeoutMs = resolveAgentTimeoutMs({
       cfg,
       overrideMs: p.timeoutMs,
@@ -240,17 +230,14 @@ export const chatHandlers: GatewayRequestHandlers = {
       cfg,
       entry,
       sessionKey: p.sessionKey,
-      provider: entry?.provider,
+      channel: entry?.channel,
       chatType: entry?.chatType,
     });
     if (sendPolicy === "deny") {
       respond(
         false,
         undefined,
-        errorShape(
-          ErrorCodes.INVALID_REQUEST,
-          "send blocked by session policy",
-        ),
+        errorShape(ErrorCodes.INVALID_REQUEST, "send blocked by session policy"),
       );
       return;
     }
@@ -265,7 +252,7 @@ export const chatHandlers: GatewayRequestHandlers = {
           removeChatRun: context.removeChatRun,
           agentRunSeq: context.agentRunSeq,
           broadcast: context.broadcast,
-          bridgeSendToSession: context.bridgeSendToSession,
+          nodeSendToSession: context.nodeSendToSession,
         },
         { sessionKey: p.sessionKey, stopReason: "stop" },
       );
@@ -283,12 +270,10 @@ export const chatHandlers: GatewayRequestHandlers = {
 
     const activeExisting = context.chatAbortControllers.get(clientRunId);
     if (activeExisting) {
-      respond(
-        true,
-        { runId: clientRunId, status: "in_flight" as const },
-        undefined,
-        { cached: true, runId: clientRunId },
-      );
+      respond(true, { runId: clientRunId, status: "in_flight" as const }, undefined, {
+        cached: true,
+        runId: clientRunId,
+      });
       return;
     }
 
@@ -306,11 +291,10 @@ export const chatHandlers: GatewayRequestHandlers = {
         clientRunId,
       });
 
-      if (store) {
-        store[p.sessionKey] = sessionEntry;
-        if (storePath) {
-          await saveSessionStore(storePath, store);
-        }
+      if (storePath) {
+        await updateSessionStore(storePath, (store) => {
+          store[canonicalKey] = sessionEntry;
+        });
       }
 
       const ackPayload = {
@@ -319,9 +303,20 @@ export const chatHandlers: GatewayRequestHandlers = {
       };
       respond(true, ackPayload, undefined, { runId: clientRunId });
 
+      const envelopeOptions = resolveEnvelopeFormatOptions(cfg);
+      const envelopedMessage = formatInboundEnvelope({
+        channel: "WebChat",
+        from: p.sessionKey,
+        timestamp: now,
+        body: parsedMessage,
+        chatType: "direct",
+        previousTimestamp: entry?.updatedAt,
+        envelope: envelopeOptions,
+      });
+      const lane = isAcpSessionKey(p.sessionKey) ? p.sessionKey : undefined;
       void agentCommand(
         {
-          message: parsedMessage,
+          message: envelopedMessage,
           images: parsedImages.length > 0 ? parsedImages : undefined,
           sessionId,
           sessionKey: p.sessionKey,
@@ -329,8 +324,9 @@ export const chatHandlers: GatewayRequestHandlers = {
           thinking: p.thinking,
           deliver: p.deliver,
           timeout: Math.ceil(timeoutMs / 1000).toString(),
-          messageProvider: INTERNAL_MESSAGE_PROVIDER,
+          messageChannel: INTERNAL_MESSAGE_CHANNEL,
           abortSignal: abortController.signal,
+          lane,
         },
         defaultRuntime,
         context.deps,
@@ -376,5 +372,89 @@ export const chatHandlers: GatewayRequestHandlers = {
         error: formatForLog(err),
       });
     }
+  },
+  "chat.inject": async ({ params, respond, context }) => {
+    if (!validateChatInjectParams(params)) {
+      respond(
+        false,
+        undefined,
+        errorShape(
+          ErrorCodes.INVALID_REQUEST,
+          `invalid chat.inject params: ${formatValidationErrors(validateChatInjectParams.errors)}`,
+        ),
+      );
+      return;
+    }
+    const p = params as {
+      sessionKey: string;
+      message: string;
+      label?: string;
+    };
+
+    // Load session to find transcript file
+    const { storePath, entry } = loadSessionEntry(p.sessionKey);
+    const sessionId = entry?.sessionId;
+    if (!sessionId || !storePath) {
+      respond(false, undefined, errorShape(ErrorCodes.INVALID_REQUEST, "session not found"));
+      return;
+    }
+
+    // Resolve transcript path
+    const transcriptPath = entry?.sessionFile
+      ? entry.sessionFile
+      : path.join(path.dirname(storePath), `${sessionId}.jsonl`);
+
+    if (!fs.existsSync(transcriptPath)) {
+      respond(
+        false,
+        undefined,
+        errorShape(ErrorCodes.INVALID_REQUEST, "transcript file not found"),
+      );
+      return;
+    }
+
+    // Build transcript entry
+    const now = Date.now();
+    const messageId = randomUUID().slice(0, 8);
+    const labelPrefix = p.label ? `[${p.label}]\n\n` : "";
+    const messageBody: Record<string, unknown> = {
+      role: "assistant",
+      content: [{ type: "text", text: `${labelPrefix}${p.message}` }],
+      timestamp: now,
+      stopReason: "injected",
+      usage: { input: 0, output: 0, totalTokens: 0 },
+    };
+    const transcriptEntry = {
+      type: "message",
+      id: messageId,
+      timestamp: new Date(now).toISOString(),
+      message: messageBody,
+    };
+
+    // Append to transcript file
+    try {
+      fs.appendFileSync(transcriptPath, `${JSON.stringify(transcriptEntry)}\n`, "utf-8");
+    } catch (err) {
+      const errMessage = err instanceof Error ? err.message : String(err);
+      respond(
+        false,
+        undefined,
+        errorShape(ErrorCodes.UNAVAILABLE, `failed to write transcript: ${errMessage}`),
+      );
+      return;
+    }
+
+    // Broadcast to webchat for immediate UI update
+    const chatPayload = {
+      runId: `inject-${messageId}`,
+      sessionKey: p.sessionKey,
+      seq: 0,
+      state: "final" as const,
+      message: transcriptEntry.message,
+    };
+    context.broadcast("chat", chatPayload);
+    context.nodeSendToSession(p.sessionKey, "chat", chatPayload);
+
+    respond(true, { ok: true, messageId });
   },
 };

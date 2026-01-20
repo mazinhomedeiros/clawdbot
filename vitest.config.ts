@@ -1,13 +1,32 @@
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { defineConfig } from "vitest/config";
 
+const repoRoot = path.dirname(fileURLToPath(import.meta.url));
+const isCI = process.env.CI === "true" || process.env.GITHUB_ACTIONS === "true";
+
 export default defineConfig({
+  resolve: {
+    alias: {
+      "clawdbot/plugin-sdk": path.join(repoRoot, "src", "plugin-sdk", "index.ts"),
+    },
+  },
   test: {
-    include: ["src/**/*.test.ts", "test/format-error.test.ts"],
+    testTimeout: 60_000,
+    hookTimeout: 120_000,
+    pool: "forks",
+    maxWorkers: isCI ? 3 : 4,
+    include: [
+      "src/**/*.test.ts",
+      "extensions/**/*.test.ts",
+      "test/format-error.test.ts",
+    ],
     setupFiles: ["test/setup.ts"],
     exclude: [
       "dist/**",
       "apps/macos/**",
       "apps/macos/.build/**",
+      "**/node_modules/**",
       "**/vendor/**",
       "dist/Clawdbot.app/**",
       "**/*.live.test.ts",
@@ -47,7 +66,7 @@ export default defineConfig({
         // Gateway server integration surfaces are intentionally validated via manual/e2e runs.
         "src/gateway/control-ui.ts",
         "src/gateway/server-bridge.ts",
-        "src/gateway/server-providers.ts",
+        "src/gateway/server-channels.ts",
         "src/gateway/server-methods/config.ts",
         "src/gateway/server-methods/send.ts",
         "src/gateway/server-methods/skills.ts",
@@ -62,13 +81,13 @@ export default defineConfig({
         // Interactive UIs/flows are intentionally validated via manual/e2e runs.
         "src/tui/**",
         "src/wizard/**",
-        // Provider surfaces are largely integration-tested (or manually validated).
+        // Channel surfaces are largely integration-tested (or manually validated).
         "src/discord/**",
         "src/imessage/**",
         "src/signal/**",
         "src/slack/**",
         "src/browser/**",
-        "src/providers/web/**",
+        "src/channels/web/**",
         "src/telegram/index.ts",
         "src/telegram/proxy.ts",
         "src/telegram/webhook-set.ts",

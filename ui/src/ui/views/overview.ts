@@ -15,7 +15,7 @@ export type OverviewProps = {
   sessionsCount: number | null;
   cronEnabled: boolean | null;
   cronNext: number | null;
-  lastProvidersRefresh: number | null;
+  lastChannelsRefresh: number | null;
   onSettingsChange: (next: UiSettings) => void;
   onPasswordChange: (next: string) => void;
   onSessionKeyChange: (next: string) => void;
@@ -31,6 +31,52 @@ export function renderOverview(props: OverviewProps) {
   const tick = snapshot?.policy?.tickIntervalMs
     ? `${snapshot.policy.tickIntervalMs}ms`
     : "n/a";
+  const authHint = (() => {
+    if (props.connected || !props.lastError) return null;
+    const lower = props.lastError.toLowerCase();
+    const authFailed = lower.includes("unauthorized") || lower.includes("connect failed");
+    if (!authFailed) return null;
+    const hasToken = Boolean(props.settings.token.trim());
+    const hasPassword = Boolean(props.password.trim());
+    if (!hasToken && !hasPassword) {
+      return html`
+        <div class="muted" style="margin-top: 8px;">
+          This gateway requires auth. Add a token or password, then click Connect.
+          <div style="margin-top: 6px;">
+            <span class="mono">clawdbot dashboard --no-open</span> → tokenized URL<br />
+            <span class="mono">clawdbot doctor --generate-gateway-token</span> → set token
+          </div>
+          <div style="margin-top: 6px;">
+            <a
+              class="session-link"
+              href="https://docs.clawd.bot/web/dashboard"
+              target="_blank"
+              rel="noreferrer"
+              title="Control UI auth docs (opens in new tab)"
+              >Docs: Control UI auth</a
+            >
+          </div>
+        </div>
+      `;
+    }
+    return html`
+      <div class="muted" style="margin-top: 8px;">
+        Auth failed. Re-copy a tokenized URL with
+        <span class="mono">clawdbot dashboard --no-open</span>, or update the token,
+        then click Connect.
+        <div style="margin-top: 6px;">
+          <a
+            class="session-link"
+            href="https://docs.clawd.bot/web/dashboard"
+            target="_blank"
+            rel="noreferrer"
+            title="Control UI auth docs (opens in new tab)"
+            >Docs: Control UI auth</a
+          >
+        </div>
+      </div>
+    `;
+  })();
 
   return html`
     <section class="grid grid-cols-2">
@@ -109,20 +155,21 @@ export function renderOverview(props: OverviewProps) {
             <div class="stat-value">${tick}</div>
           </div>
           <div class="stat">
-            <div class="stat-label">Last Providers Refresh</div>
+            <div class="stat-label">Last Channels Refresh</div>
             <div class="stat-value">
-              ${props.lastProvidersRefresh
-                ? formatAgo(props.lastProvidersRefresh)
+              ${props.lastChannelsRefresh
+                ? formatAgo(props.lastChannelsRefresh)
                 : "n/a"}
             </div>
           </div>
         </div>
         ${props.lastError
           ? html`<div class="callout danger" style="margin-top: 14px;">
-              ${props.lastError}
+              <div>${props.lastError}</div>
+              ${authHint ?? ""}
             </div>`
           : html`<div class="callout" style="margin-top: 14px;">
-              Use Connections to link WhatsApp, Telegram, Discord, Signal, or iMessage.
+              Use Channels to link WhatsApp, Telegram, Discord, Signal, or iMessage.
             </div>`}
       </div>
     </section>

@@ -1,10 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import type { ClawdbotConfig } from "../../config/config.js";
-import {
-  createReplyToModeFilter,
-  resolveReplyToMode,
-} from "./reply-threading.js";
+import { createReplyToModeFilter, resolveReplyToMode } from "./reply-threading.js";
 
 const emptyCfg = {} as ClawdbotConfig;
 
@@ -24,9 +21,11 @@ describe("resolveReplyToMode", () => {
 
   it("uses configured value when present", () => {
     const cfg = {
-      telegram: { replyToMode: "all" },
-      discord: { replyToMode: "first" },
-      slack: { replyToMode: "all" },
+      channels: {
+        telegram: { replyToMode: "all" },
+        discord: { replyToMode: "first" },
+        slack: { replyToMode: "all" },
+      },
     } as ClawdbotConfig;
     expect(resolveReplyToMode(cfg, "telegram")).toBe("all");
     expect(resolveReplyToMode(cfg, "discord")).toBe("first");
@@ -42,9 +41,7 @@ describe("createReplyToModeFilter", () => {
 
   it("keeps replyToId when mode is off and reply tags are allowed", () => {
     const filter = createReplyToModeFilter("off", { allowTagsWhenOff: true });
-    expect(
-      filter({ text: "hi", replyToId: "1", replyToTag: true }).replyToId,
-    ).toBe("1");
+    expect(filter({ text: "hi", replyToId: "1", replyToTag: true }).replyToId).toBe("1");
   });
 
   it("keeps replyToId when mode is all", () => {

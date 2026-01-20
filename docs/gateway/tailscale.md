@@ -23,9 +23,13 @@ Set `gateway.auth.mode` to control the handshake:
 - `token` (default when `CLAWDBOT_GATEWAY_TOKEN` is set)
 - `password` (shared secret via `CLAWDBOT_GATEWAY_PASSWORD` or config)
 
-When `tailscale.mode = "serve"`, the gateway trusts Tailscale identity headers by
-default unless you force `gateway.auth.mode` to `password` or set
-`gateway.auth.allowTailscale: false`.
+When `tailscale.mode = "serve"` and `gateway.auth.allowTailscale` is `true`,
+valid Serve proxy requests can authenticate via Tailscale identity headers
+(`tailscale-user-login`) without supplying a token/password. Clawdbot only
+treats a request as Serve when it arrives from loopback with Tailscale’s
+`x-forwarded-for`, `x-forwarded-proto`, and `x-forwarded-host` headers.
+To require explicit credentials, set `gateway.auth.allowTailscale: false` or
+force `gateway.auth.mode: "password"`.
 
 ## Config examples
 
@@ -69,6 +73,38 @@ clawdbot gateway --tailscale funnel --auth password
 - `tailscale.mode: "funnel"` refuses to start unless auth mode is `password` to avoid public exposure.
 - Set `gateway.tailscale.resetOnExit` if you want Clawdbot to undo `tailscale serve`
   or `tailscale funnel` configuration on shutdown.
+- Serve/Funnel only expose the **Gateway control UI + WS**. Node **bridge** traffic
+  uses the separate bridge port (default `18790`) and is **not** proxied by Serve.
+
+## Browser control server (remote Gateway + local browser)
+
+If you run the Gateway on one machine but want to drive a browser on another machine, use a **separate browser control server**
+and publish it through Tailscale **Serve** (tailnet-only):
+
+```bash
+# on the machine that runs Chrome
+clawdbot browser serve --bind 127.0.0.1 --port 18791 --token <token>
+tailscale serve https / http://127.0.0.1:18791
+```
+
+Then point the Gateway config at the HTTPS URL:
+
+```json5
+{
+  browser: {
+    enabled: true,
+    controlUrl: "https://<magicdns>/"
+  }
+}
+```
+
+And authenticate from the Gateway with the same token (prefer env):
+
+```bash
+export CLAWDBOT_BROWSER_CONTROL_TOKEN="<token>"
+```
+
+Avoid Funnel for browser control endpoints unless you explicitly want public exposure.
 
 ## Tailscale prerequisites + limits
 

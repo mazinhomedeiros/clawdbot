@@ -69,7 +69,6 @@ final class GatewayProcessManager {
 
     func ensureLaunchAgentEnabledIfNeeded() async {
         guard !CommandResolver.connectionModeIsRemote() else { return }
-        guard !AppStateStore.attachExistingGatewayOnly else { return }
         let enabled = await GatewayLaunchAgentManager.isLoaded()
         guard !enabled else { return }
         let bundlePath = Bundle.main.bundleURL.path
@@ -88,6 +87,14 @@ final class GatewayProcessManager {
             self.status = .stopped
             return
         }
+        // Many surfaces can call `setActive(true)` in quick succession (startup, Canvas, health checks).
+        // Avoid spawning multiple concurrent "start" tasks that can thrash launchd and flap the port.
+        switch self.status {
+        case .starting, .running, .attachedExisting:
+            return
+        case .stopped, .failed:
+            break
+        }
         self.status = .starting
         self.logger.debug("gateway start requested")
 
@@ -95,15 +102,6 @@ final class GatewayProcessManager {
         Task { [weak self] in
             guard let self else { return }
             if await self.attachExistingGatewayIfAvailable() {
-                return
-            }
-            // Respect debug toggle: only attach, never spawn, when enabled.
-            if AppStateStore.attachExistingGatewayOnly {
-                await MainActor.run {
-                    self.status = .failed("Attach-only enabled; no gateway to attach")
-                    self.appendLog("[gateway] attach-only enabled; not spawning local gateway\n")
-                    self.logger.warning("gateway attach-only enabled; not spawning")
-                }
                 return
             }
             await self.enableLaunchdGateway()
@@ -116,6 +114,9 @@ final class GatewayProcessManager {
         self.lastFailureReason = nil
         self.status = .stopped
         self.logger.info("gateway stop requested")
+        if CommandResolver.connectionModeIsRemote() {
+            return
+        }
         let bundlePath = Bundle.main.bundleURL.path
         Task {
             _ = await GatewayLaunchAgentManager.set(
@@ -150,7 +151,7 @@ final class GatewayProcessManager {
 
     func refreshLog() {
         guard self.logRefreshTask == nil else { return }
-        let path = LogLocator.launchdGatewayLogPath
+        let path = GatewayLaunchAgentManager.launchdGatewayLogPath()
         let limit = self.logLimit
         self.logRefreshTask = Task { [weak self] in
             let log = await Task.detached(priority: .utility) {
@@ -221,19 +222,19 @@ final class GatewayProcessManager {
     private func describe(details instance: String?, port: Int, snap: HealthSnapshot?) -> String {
         let instanceText = instance ?? "pid unknown"
         if let snap {
-            let linkId = snap.providerOrder?.first(where: {
-                if let summary = snap.providers[$0] { return summary.linked != nil }
+            let linkId = snap.channelOrder?.first(where: {
+                if let summary = snap.channels[$0] { return summary.linked != nil }
                 return false
-            }) ?? snap.providers.keys.first(where: {
-                if let summary = snap.providers[$0] { return summary.linked != nil }
+            }) ?? snap.channels.keys.first(where: {
+                if let summary = snap.channels[$0] { return summary.linked != nil }
                 return false
             })
-            let linked = linkId.flatMap { snap.providers[$0]?.linked } ?? false
-            let authAge = linkId.flatMap { snap.providers[$0]?.authAgeMs }.flatMap(msToAge) ?? "unknown age"
+            let linked = linkId.flatMap { snap.channels[$0]?.linked } ?? false
+            let authAge = linkId.flatMap { snap.channels[$0]?.authAgeMs }.flatMap(msToAge) ?? "unknown age"
             let label =
-                linkId.flatMap { snap.providerLabels?[$0] } ??
+                linkId.flatMap { snap.channelLabels?[$0] } ??
                 linkId?.capitalized ??
-                "provider"
+                "channel"
             let linkText = linked ? "linked" : "not linked"
             return "port \(port), \(label) \(linkText), auth \(authAge), \(instanceText)"
         }
@@ -364,7 +365,7 @@ final class GatewayProcessManager {
 
     func clearLog() {
         self.log = ""
-        try? FileManager.default.removeItem(atPath: LogLocator.launchdGatewayLogPath)
+        try? FileManager.default.removeItem(atPath: GatewayLaunchAgentManager.launchdGatewayLogPath())
         self.logger.debug("gateway log cleared")
     }
 

@@ -1,15 +1,20 @@
 import type { SlashCommand } from "@mariozechner/pi-tui";
+import { formatThinkingLevels, listThinkingLevelLabels } from "../auto-reply/thinking.js";
 
-const THINK_LEVELS = ["off", "minimal", "low", "medium", "high"];
 const VERBOSE_LEVELS = ["on", "off"];
 const REASONING_LEVELS = ["on", "off"];
 const ELEVATED_LEVELS = ["on", "off"];
 const ACTIVATION_LEVELS = ["mention", "always"];
-const TOGGLE = ["on", "off"];
+const USAGE_FOOTER_LEVELS = ["off", "tokens", "full"];
 
 export type ParsedCommand = {
   name: string;
   args: string;
+};
+
+export type SlashCommandOptions = {
+  provider?: string;
+  model?: string;
 };
 
 const COMMAND_ALIASES: Record<string, string> = {
@@ -27,7 +32,8 @@ export function parseCommand(input: string): ParsedCommand {
   };
 }
 
-export function getSlashCommands(): SlashCommand[] {
+export function getSlashCommands(options: SlashCommandOptions = {}): SlashCommand[] {
+  const thinkLevels = listThinkingLevelLabels(options.provider, options.model);
   return [
     { name: "help", description: "Show slash command help" },
     { name: "status", description: "Show gateway status summary" },
@@ -44,57 +50,63 @@ export function getSlashCommands(): SlashCommand[] {
       name: "think",
       description: "Set thinking level",
       getArgumentCompletions: (prefix) =>
-        THINK_LEVELS.filter((v) => v.startsWith(prefix.toLowerCase())).map(
-          (value) => ({ value, label: value }),
-        ),
+        thinkLevels
+          .filter((v) => v.startsWith(prefix.toLowerCase()))
+          .map((value) => ({ value, label: value })),
     },
     {
       name: "verbose",
       description: "Set verbose on/off",
       getArgumentCompletions: (prefix) =>
-        VERBOSE_LEVELS.filter((v) => v.startsWith(prefix.toLowerCase())).map(
-          (value) => ({ value, label: value }),
-        ),
+        VERBOSE_LEVELS.filter((v) => v.startsWith(prefix.toLowerCase())).map((value) => ({
+          value,
+          label: value,
+        })),
     },
     {
       name: "reasoning",
       description: "Set reasoning on/off",
       getArgumentCompletions: (prefix) =>
-        REASONING_LEVELS.filter((v) => v.startsWith(prefix.toLowerCase())).map(
-          (value) => ({ value, label: value }),
-        ),
+        REASONING_LEVELS.filter((v) => v.startsWith(prefix.toLowerCase())).map((value) => ({
+          value,
+          label: value,
+        })),
     },
     {
-      name: "cost",
+      name: "usage",
       description: "Toggle per-response usage line",
       getArgumentCompletions: (prefix) =>
-        TOGGLE.filter((v) => v.startsWith(prefix.toLowerCase())).map(
-          (value) => ({ value, label: value }),
-        ),
+        USAGE_FOOTER_LEVELS.filter((v) => v.startsWith(prefix.toLowerCase())).map((value) => ({
+          value,
+          label: value,
+        })),
     },
     {
       name: "elevated",
       description: "Set elevated on/off",
       getArgumentCompletions: (prefix) =>
-        ELEVATED_LEVELS.filter((v) => v.startsWith(prefix.toLowerCase())).map(
-          (value) => ({ value, label: value }),
-        ),
+        ELEVATED_LEVELS.filter((v) => v.startsWith(prefix.toLowerCase())).map((value) => ({
+          value,
+          label: value,
+        })),
     },
     {
       name: "elev",
       description: "Alias for /elevated",
       getArgumentCompletions: (prefix) =>
-        ELEVATED_LEVELS.filter((v) => v.startsWith(prefix.toLowerCase())).map(
-          (value) => ({ value, label: value }),
-        ),
+        ELEVATED_LEVELS.filter((v) => v.startsWith(prefix.toLowerCase())).map((value) => ({
+          value,
+          label: value,
+        })),
     },
     {
       name: "activation",
       description: "Set group activation",
       getArgumentCompletions: (prefix) =>
-        ACTIVATION_LEVELS.filter((v) => v.startsWith(prefix.toLowerCase())).map(
-          (value) => ({ value, label: value }),
-        ),
+        ACTIVATION_LEVELS.filter((v) => v.startsWith(prefix.toLowerCase())).map((value) => ({
+          value,
+          label: value,
+        })),
     },
     { name: "abort", description: "Abort active run" },
     { name: "new", description: "Reset the session" },
@@ -105,7 +117,8 @@ export function getSlashCommands(): SlashCommand[] {
   ];
 }
 
-export function helpText(): string {
+export function helpText(options: SlashCommandOptions = {}): string {
+  const thinkLevels = formatThinkingLevels(options.provider, options.model, "|");
   return [
     "Slash commands:",
     "/help",
@@ -113,10 +126,10 @@ export function helpText(): string {
     "/agent <id> (or /agents)",
     "/session <key> (or /sessions)",
     "/model <provider/model> (or /models)",
-    "/think <off|minimal|low|medium|high>",
+    `/think <${thinkLevels}>`,
     "/verbose <on|off>",
     "/reasoning <on|off>",
-    "/cost <on|off>",
+    "/usage <off|tokens|full>",
     "/elevated <on|off>",
     "/elev <on|off>",
     "/activation <mention|always>",

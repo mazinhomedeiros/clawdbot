@@ -1,9 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import {
-  getFreePort,
-  installGatewayTestHooks,
-  startGatewayServer,
-} from "./test-helpers.js";
+import { getFreePort, installGatewayTestHooks, startGatewayServer } from "./test-helpers.js";
 
 const hoisted = vi.hoisted(() => {
   const cronInstances: Array<{
@@ -94,25 +90,20 @@ const hoisted = vi.hoisted(() => {
         msteams: {},
       },
     })),
-    startProviders: vi.fn(async () => {}),
-    startProvider: vi.fn(async () => {}),
-    stopProvider: vi.fn(async () => {}),
-    markProviderLoggedOut: vi.fn(),
+    startChannels: vi.fn(async () => {}),
+    startChannel: vi.fn(async () => {}),
+    stopChannel: vi.fn(async () => {}),
+    markChannelLoggedOut: vi.fn(),
   };
 
-  const createProviderManager = vi.fn(() => providerManager);
+  const createChannelManager = vi.fn(() => providerManager);
 
   const reloaderStop = vi.fn(async () => {});
-  let onHotReload:
-    | ((plan: unknown, nextConfig: unknown) => Promise<void>)
-    | null = null;
+  let onHotReload: ((plan: unknown, nextConfig: unknown) => Promise<void>) | null = null;
   let onRestart: ((plan: unknown, nextConfig: unknown) => void) | null = null;
 
   const startGatewayConfigReloader = vi.fn(
-    (opts: {
-      onHotReload: typeof onHotReload;
-      onRestart: typeof onRestart;
-    }) => {
+    (opts: { onHotReload: typeof onHotReload; onRestart: typeof onRestart }) => {
       onHotReload = opts.onHotReload as typeof onHotReload;
       onRestart = opts.onRestart as typeof onRestart;
       return { stop: reloaderStop };
@@ -129,7 +120,7 @@ const hoisted = vi.hoisted(() => {
     startGmailWatcher,
     stopGmailWatcher,
     providerManager,
-    createProviderManager,
+    createChannelManager,
     startGatewayConfigReloader,
     reloaderStop,
     getOnHotReload: () => onHotReload,
@@ -142,8 +133,7 @@ vi.mock("../cron/service.js", () => ({
 }));
 
 vi.mock("./server-browser.js", () => ({
-  startBrowserControlServerIfEnabled:
-    hoisted.startBrowserControlServerIfEnabled,
+  startBrowserControlServerIfEnabled: hoisted.startBrowserControlServerIfEnabled,
 }));
 
 vi.mock("../infra/heartbeat-runner.js", () => ({
@@ -155,8 +145,8 @@ vi.mock("../hooks/gmail-watcher.js", () => ({
   stopGmailWatcher: hoisted.stopGmailWatcher,
 }));
 
-vi.mock("./server-providers.js", () => ({
-  createProviderManager: hoisted.createProviderManager,
+vi.mock("./server-channels.js", () => ({
+  createChannelManager: hoisted.createChannelManager,
 }));
 
 vi.mock("./config-reload.js", () => ({
@@ -166,21 +156,21 @@ vi.mock("./config-reload.js", () => ({
 installGatewayTestHooks();
 
 describe("gateway hot reload", () => {
-  let prevSkipProviders: string | undefined;
+  let prevSkipChannels: string | undefined;
   let prevSkipGmail: string | undefined;
 
   beforeEach(() => {
-    prevSkipProviders = process.env.CLAWDBOT_SKIP_PROVIDERS;
+    prevSkipChannels = process.env.CLAWDBOT_SKIP_CHANNELS;
     prevSkipGmail = process.env.CLAWDBOT_SKIP_GMAIL_WATCHER;
-    process.env.CLAWDBOT_SKIP_PROVIDERS = "0";
+    process.env.CLAWDBOT_SKIP_CHANNELS = "0";
     delete process.env.CLAWDBOT_SKIP_GMAIL_WATCHER;
   });
 
   afterEach(() => {
-    if (prevSkipProviders === undefined) {
-      delete process.env.CLAWDBOT_SKIP_PROVIDERS;
+    if (prevSkipChannels === undefined) {
+      delete process.env.CLAWDBOT_SKIP_CHANNELS;
     } else {
-      process.env.CLAWDBOT_SKIP_PROVIDERS = prevSkipProviders;
+      process.env.CLAWDBOT_SKIP_CHANNELS = prevSkipChannels;
     }
     if (prevSkipGmail === undefined) {
       delete process.env.CLAWDBOT_SKIP_GMAIL_WATCHER;
@@ -206,10 +196,12 @@ describe("gateway hot reload", () => {
       agents: { defaults: { heartbeat: { every: "1m" }, maxConcurrent: 2 } },
       browser: { enabled: true, controlUrl: "http://127.0.0.1:18791" },
       web: { enabled: true },
-      telegram: { botToken: "token" },
-      discord: { token: "token" },
-      signal: { account: "+15550000000" },
-      imessage: { enabled: true },
+      channels: {
+        telegram: { botToken: "token" },
+        discord: { token: "token" },
+        signal: { account: "+15550000000" },
+        imessage: { enabled: true },
+      },
     };
 
     await onHotReload?.(
@@ -220,10 +212,10 @@ describe("gateway hot reload", () => {
           "agents.defaults.heartbeat.every",
           "browser.enabled",
           "web.enabled",
-          "telegram.botToken",
-          "discord.token",
-          "signal.account",
-          "imessage.enabled",
+          "channels.telegram.botToken",
+          "channels.discord.token",
+          "channels.signal.account",
+          "channels.imessage.enabled",
         ],
         restartGateway: false,
         restartReasons: [],
@@ -233,13 +225,7 @@ describe("gateway hot reload", () => {
         restartBrowserControl: true,
         restartCron: true,
         restartHeartbeat: true,
-        restartProviders: new Set([
-          "whatsapp",
-          "telegram",
-          "discord",
-          "signal",
-          "imessage",
-        ]),
+        restartChannels: new Set(["whatsapp", "telegram", "discord", "signal", "imessage"]),
         noopPaths: [],
       },
       nextConfig,
@@ -258,36 +244,18 @@ describe("gateway hot reload", () => {
     expect(hoisted.cronInstances[0].stop).toHaveBeenCalledTimes(1);
     expect(hoisted.cronInstances[1].start).toHaveBeenCalledTimes(1);
 
-    expect(hoisted.providerManager.stopProvider).toHaveBeenCalledTimes(5);
-    expect(hoisted.providerManager.startProvider).toHaveBeenCalledTimes(5);
-    expect(hoisted.providerManager.stopProvider).toHaveBeenCalledWith(
-      "whatsapp",
-    );
-    expect(hoisted.providerManager.startProvider).toHaveBeenCalledWith(
-      "whatsapp",
-    );
-    expect(hoisted.providerManager.stopProvider).toHaveBeenCalledWith(
-      "telegram",
-    );
-    expect(hoisted.providerManager.startProvider).toHaveBeenCalledWith(
-      "telegram",
-    );
-    expect(hoisted.providerManager.stopProvider).toHaveBeenCalledWith(
-      "discord",
-    );
-    expect(hoisted.providerManager.startProvider).toHaveBeenCalledWith(
-      "discord",
-    );
-    expect(hoisted.providerManager.stopProvider).toHaveBeenCalledWith("signal");
-    expect(hoisted.providerManager.startProvider).toHaveBeenCalledWith(
-      "signal",
-    );
-    expect(hoisted.providerManager.stopProvider).toHaveBeenCalledWith(
-      "imessage",
-    );
-    expect(hoisted.providerManager.startProvider).toHaveBeenCalledWith(
-      "imessage",
-    );
+    expect(hoisted.providerManager.stopChannel).toHaveBeenCalledTimes(5);
+    expect(hoisted.providerManager.startChannel).toHaveBeenCalledTimes(5);
+    expect(hoisted.providerManager.stopChannel).toHaveBeenCalledWith("whatsapp");
+    expect(hoisted.providerManager.startChannel).toHaveBeenCalledWith("whatsapp");
+    expect(hoisted.providerManager.stopChannel).toHaveBeenCalledWith("telegram");
+    expect(hoisted.providerManager.startChannel).toHaveBeenCalledWith("telegram");
+    expect(hoisted.providerManager.stopChannel).toHaveBeenCalledWith("discord");
+    expect(hoisted.providerManager.startChannel).toHaveBeenCalledWith("discord");
+    expect(hoisted.providerManager.stopChannel).toHaveBeenCalledWith("signal");
+    expect(hoisted.providerManager.startChannel).toHaveBeenCalledWith("signal");
+    expect(hoisted.providerManager.stopChannel).toHaveBeenCalledWith("imessage");
+    expect(hoisted.providerManager.startChannel).toHaveBeenCalledWith("imessage");
 
     await server.close();
   });
@@ -313,7 +281,7 @@ describe("gateway hot reload", () => {
         restartBrowserControl: false,
         restartCron: false,
         restartHeartbeat: false,
-        restartProviders: new Set(),
+        restartChannels: new Set(),
         noopPaths: [],
       },
       {},

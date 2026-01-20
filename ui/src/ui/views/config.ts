@@ -44,6 +44,7 @@ export function renderConfig(props: ConfigProps) {
     !props.updating &&
     (props.formMode === "raw" ? true : canSaveForm);
   const canUpdate = props.connected && !props.applying && !props.updating;
+
   return html`
     <section class="card">
       <div class="row" style="justify-content: space-between;">
@@ -99,6 +100,7 @@ export function renderConfig(props: ConfigProps) {
         Update restart the gateway and will ping the last active session when it
         comes back.
       </div>
+
 
       ${props.formMode === "form"
         ? html`<div style="margin-top: 12px;">

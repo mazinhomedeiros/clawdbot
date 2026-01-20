@@ -17,154 +17,86 @@ import {
   writeScreenRecordToFile,
 } from "../../cli/nodes-screen.js";
 import { parseDurationMs } from "../../cli/parse-duration.js";
+import type { ClawdbotConfig } from "../../config/config.js";
 import { imageMimeFromFormat } from "../../media/mime.js";
+import { resolveSessionAgentId } from "../agent-scope.js";
+import { optionalStringEnum, stringEnum } from "../schema/typebox.js";
 import { sanitizeToolResultImages } from "../tool-images.js";
 import { type AnyAgentTool, jsonResult, readStringParam } from "./common.js";
 import { callGatewayTool, type GatewayCallOptions } from "./gateway.js";
-import { resolveNodeId } from "./nodes-utils.js";
+import { listNodes, resolveNodeIdFromList, resolveNodeId } from "./nodes-utils.js";
 
-const NodesToolSchema = Type.Union([
-  Type.Object({
-    action: Type.Literal("status"),
-    gatewayUrl: Type.Optional(Type.String()),
-    gatewayToken: Type.Optional(Type.String()),
-    timeoutMs: Type.Optional(Type.Number()),
-  }),
-  Type.Object({
-    action: Type.Literal("describe"),
-    gatewayUrl: Type.Optional(Type.String()),
-    gatewayToken: Type.Optional(Type.String()),
-    timeoutMs: Type.Optional(Type.Number()),
-    node: Type.String(),
-  }),
-  Type.Object({
-    action: Type.Literal("pending"),
-    gatewayUrl: Type.Optional(Type.String()),
-    gatewayToken: Type.Optional(Type.String()),
-    timeoutMs: Type.Optional(Type.Number()),
-  }),
-  Type.Object({
-    action: Type.Literal("approve"),
-    gatewayUrl: Type.Optional(Type.String()),
-    gatewayToken: Type.Optional(Type.String()),
-    timeoutMs: Type.Optional(Type.Number()),
-    requestId: Type.String(),
-  }),
-  Type.Object({
-    action: Type.Literal("reject"),
-    gatewayUrl: Type.Optional(Type.String()),
-    gatewayToken: Type.Optional(Type.String()),
-    timeoutMs: Type.Optional(Type.Number()),
-    requestId: Type.String(),
-  }),
-  Type.Object({
-    action: Type.Literal("notify"),
-    gatewayUrl: Type.Optional(Type.String()),
-    gatewayToken: Type.Optional(Type.String()),
-    timeoutMs: Type.Optional(Type.Number()),
-    node: Type.String(),
-    title: Type.Optional(Type.String()),
-    body: Type.Optional(Type.String()),
-    sound: Type.Optional(Type.String()),
-    priority: Type.Optional(
-      Type.Union([
-        Type.Literal("passive"),
-        Type.Literal("active"),
-        Type.Literal("timeSensitive"),
-      ]),
-    ),
-    delivery: Type.Optional(
-      Type.Union([
-        Type.Literal("system"),
-        Type.Literal("overlay"),
-        Type.Literal("auto"),
-      ]),
-    ),
-  }),
-  Type.Object({
-    action: Type.Literal("camera_snap"),
-    gatewayUrl: Type.Optional(Type.String()),
-    gatewayToken: Type.Optional(Type.String()),
-    timeoutMs: Type.Optional(Type.Number()),
-    node: Type.String(),
-    facing: Type.Optional(
-      Type.Union([
-        Type.Literal("front"),
-        Type.Literal("back"),
-        Type.Literal("both"),
-      ]),
-    ),
-    maxWidth: Type.Optional(Type.Number()),
-    quality: Type.Optional(Type.Number()),
-    delayMs: Type.Optional(Type.Number()),
-    deviceId: Type.Optional(Type.String()),
-  }),
-  Type.Object({
-    action: Type.Literal("camera_list"),
-    gatewayUrl: Type.Optional(Type.String()),
-    gatewayToken: Type.Optional(Type.String()),
-    timeoutMs: Type.Optional(Type.Number()),
-    node: Type.String(),
-  }),
-  Type.Object({
-    action: Type.Literal("camera_clip"),
-    gatewayUrl: Type.Optional(Type.String()),
-    gatewayToken: Type.Optional(Type.String()),
-    timeoutMs: Type.Optional(Type.Number()),
-    node: Type.String(),
-    facing: Type.Optional(
-      Type.Union([Type.Literal("front"), Type.Literal("back")]),
-    ),
-    duration: Type.Optional(Type.String()),
-    durationMs: Type.Optional(Type.Number()),
-    includeAudio: Type.Optional(Type.Boolean()),
-    deviceId: Type.Optional(Type.String()),
-  }),
-  Type.Object({
-    action: Type.Literal("screen_record"),
-    gatewayUrl: Type.Optional(Type.String()),
-    gatewayToken: Type.Optional(Type.String()),
-    timeoutMs: Type.Optional(Type.Number()),
-    node: Type.String(),
-    duration: Type.Optional(Type.String()),
-    durationMs: Type.Optional(Type.Number()),
-    fps: Type.Optional(Type.Number()),
-    screenIndex: Type.Optional(Type.Number()),
-    includeAudio: Type.Optional(Type.Boolean()),
-    outPath: Type.Optional(Type.String()),
-  }),
-  Type.Object({
-    action: Type.Literal("location_get"),
-    gatewayUrl: Type.Optional(Type.String()),
-    gatewayToken: Type.Optional(Type.String()),
-    timeoutMs: Type.Optional(Type.Number()),
-    node: Type.String(),
-    maxAgeMs: Type.Optional(Type.Number()),
-    locationTimeoutMs: Type.Optional(Type.Number()),
-    desiredAccuracy: Type.Optional(
-      Type.Union([
-        Type.Literal("coarse"),
-        Type.Literal("balanced"),
-        Type.Literal("precise"),
-      ]),
-    ),
-  }),
-  Type.Object({
-    action: Type.Literal("run"),
-    gatewayUrl: Type.Optional(Type.String()),
-    gatewayToken: Type.Optional(Type.String()),
-    timeoutMs: Type.Optional(Type.Number()),
-    node: Type.String(),
-    command: Type.Array(Type.String()),
-    cwd: Type.Optional(Type.String()),
-    env: Type.Optional(Type.Array(Type.String())),
-    commandTimeoutMs: Type.Optional(Type.Number()),
-    invokeTimeoutMs: Type.Optional(Type.Number()),
-    needsScreenRecording: Type.Optional(Type.Boolean()),
-  }),
-]);
+const NODES_TOOL_ACTIONS = [
+  "status",
+  "describe",
+  "pending",
+  "approve",
+  "reject",
+  "notify",
+  "camera_snap",
+  "camera_list",
+  "camera_clip",
+  "screen_record",
+  "location_get",
+  "run",
+] as const;
 
-export function createNodesTool(): AnyAgentTool {
+const NOTIFY_PRIORITIES = ["passive", "active", "timeSensitive"] as const;
+const NOTIFY_DELIVERIES = ["system", "overlay", "auto"] as const;
+const CAMERA_FACING = ["front", "back", "both"] as const;
+const LOCATION_ACCURACY = ["coarse", "balanced", "precise"] as const;
+
+// Flattened schema: runtime validates per-action requirements.
+const NodesToolSchema = Type.Object({
+  action: stringEnum(NODES_TOOL_ACTIONS),
+  gatewayUrl: Type.Optional(Type.String()),
+  gatewayToken: Type.Optional(Type.String()),
+  timeoutMs: Type.Optional(Type.Number()),
+  node: Type.Optional(Type.String()),
+  requestId: Type.Optional(Type.String()),
+  // notify
+  title: Type.Optional(Type.String()),
+  body: Type.Optional(Type.String()),
+  sound: Type.Optional(Type.String()),
+  priority: optionalStringEnum(NOTIFY_PRIORITIES),
+  delivery: optionalStringEnum(NOTIFY_DELIVERIES),
+  // camera_snap / camera_clip
+  facing: optionalStringEnum(CAMERA_FACING, {
+    description: "camera_snap: front/back/both; camera_clip: front/back only.",
+  }),
+  maxWidth: Type.Optional(Type.Number()),
+  quality: Type.Optional(Type.Number()),
+  delayMs: Type.Optional(Type.Number()),
+  deviceId: Type.Optional(Type.String()),
+  duration: Type.Optional(Type.String()),
+  durationMs: Type.Optional(Type.Number()),
+  includeAudio: Type.Optional(Type.Boolean()),
+  // screen_record
+  fps: Type.Optional(Type.Number()),
+  screenIndex: Type.Optional(Type.Number()),
+  outPath: Type.Optional(Type.String()),
+  // location_get
+  maxAgeMs: Type.Optional(Type.Number()),
+  locationTimeoutMs: Type.Optional(Type.Number()),
+  desiredAccuracy: optionalStringEnum(LOCATION_ACCURACY),
+  // run
+  command: Type.Optional(Type.Array(Type.String())),
+  cwd: Type.Optional(Type.String()),
+  env: Type.Optional(Type.Array(Type.String())),
+  commandTimeoutMs: Type.Optional(Type.Number()),
+  invokeTimeoutMs: Type.Optional(Type.Number()),
+  needsScreenRecording: Type.Optional(Type.Boolean()),
+});
+
+export function createNodesTool(options?: {
+  agentSessionKey?: string;
+  config?: ClawdbotConfig;
+}): AnyAgentTool {
+  const sessionKey = options?.agentSessionKey?.trim() || undefined;
+  const agentId = resolveSessionAgentId({
+    sessionKey: options?.agentSessionKey,
+    config: options?.config,
+  });
   return {
     label: "Nodes",
     name: "nodes",
@@ -177,26 +109,19 @@ export function createNodesTool(): AnyAgentTool {
       const gatewayOpts: GatewayCallOptions = {
         gatewayUrl: readStringParam(params, "gatewayUrl", { trim: false }),
         gatewayToken: readStringParam(params, "gatewayToken", { trim: false }),
-        timeoutMs:
-          typeof params.timeoutMs === "number" ? params.timeoutMs : undefined,
+        timeoutMs: typeof params.timeoutMs === "number" ? params.timeoutMs : undefined,
       };
 
       switch (action) {
         case "status":
-          return jsonResult(
-            await callGatewayTool("node.list", gatewayOpts, {}),
-          );
+          return jsonResult(await callGatewayTool("node.list", gatewayOpts, {}));
         case "describe": {
           const node = readStringParam(params, "node", { required: true });
           const nodeId = await resolveNodeId(gatewayOpts, node);
-          return jsonResult(
-            await callGatewayTool("node.describe", gatewayOpts, { nodeId }),
-          );
+          return jsonResult(await callGatewayTool("node.describe", gatewayOpts, { nodeId }));
         }
         case "pending":
-          return jsonResult(
-            await callGatewayTool("node.pair.list", gatewayOpts, {}),
-          );
+          return jsonResult(await callGatewayTool("node.pair.list", gatewayOpts, {}));
         case "approve": {
           const requestId = readStringParam(params, "requestId", {
             required: true,
@@ -231,16 +156,9 @@ export function createNodesTool(): AnyAgentTool {
             params: {
               title: title.trim() || undefined,
               body: body.trim() || undefined,
-              sound:
-                typeof params.sound === "string" ? params.sound : undefined,
-              priority:
-                typeof params.priority === "string"
-                  ? params.priority
-                  : undefined,
-              delivery:
-                typeof params.delivery === "string"
-                  ? params.delivery
-                  : undefined,
+              sound: typeof params.sound === "string" ? params.sound : undefined,
+              priority: typeof params.priority === "string" ? params.priority : undefined,
+              delivery: typeof params.delivery === "string" ? params.delivery : undefined,
             },
             idempotencyKey: crypto.randomUUID(),
           });
@@ -250,9 +168,7 @@ export function createNodesTool(): AnyAgentTool {
           const node = readStringParam(params, "node", { required: true });
           const nodeId = await resolveNodeId(gatewayOpts, node);
           const facingRaw =
-            typeof params.facing === "string"
-              ? params.facing.toLowerCase()
-              : "both";
+            typeof params.facing === "string" ? params.facing.toLowerCase() : "both";
           const facings: CameraFacing[] =
             facingRaw === "both"
               ? ["front", "back"]
@@ -262,18 +178,15 @@ export function createNodesTool(): AnyAgentTool {
                     throw new Error("invalid facing (front|back|both)");
                   })();
           const maxWidth =
-            typeof params.maxWidth === "number" &&
-            Number.isFinite(params.maxWidth)
+            typeof params.maxWidth === "number" && Number.isFinite(params.maxWidth)
               ? params.maxWidth
               : undefined;
           const quality =
-            typeof params.quality === "number" &&
-            Number.isFinite(params.quality)
+            typeof params.quality === "number" && Number.isFinite(params.quality)
               ? params.quality
               : undefined;
           const delayMs =
-            typeof params.delayMs === "number" &&
-            Number.isFinite(params.delayMs)
+            typeof params.delayMs === "number" && Number.isFinite(params.delayMs)
               ? params.delayMs
               : undefined;
           const deviceId =
@@ -305,13 +218,10 @@ export function createNodesTool(): AnyAgentTool {
               normalizedFormat !== "jpeg" &&
               normalizedFormat !== "png"
             ) {
-              throw new Error(
-                `unsupported camera.snap format: ${payload.format}`,
-              );
+              throw new Error(`unsupported camera.snap format: ${payload.format}`);
             }
 
-            const isJpeg =
-              normalizedFormat === "jpg" || normalizedFormat === "jpeg";
+            const isJpeg = normalizedFormat === "jpg" || normalizedFormat === "jpeg";
             const filePath = cameraTempPath({
               kind: "snap",
               facing,
@@ -323,8 +233,7 @@ export function createNodesTool(): AnyAgentTool {
               type: "image",
               data: payload.base64,
               mimeType:
-                imageMimeFromFormat(payload.format) ??
-                (isJpeg ? "image/jpeg" : "image/png"),
+                imageMimeFromFormat(payload.format) ?? (isJpeg ? "image/jpeg" : "image/png"),
             });
             details.push({
               facing,
@@ -347,32 +256,24 @@ export function createNodesTool(): AnyAgentTool {
             idempotencyKey: crypto.randomUUID(),
           })) as { payload?: unknown };
           const payload =
-            raw && typeof raw.payload === "object" && raw.payload !== null
-              ? raw.payload
-              : {};
+            raw && typeof raw.payload === "object" && raw.payload !== null ? raw.payload : {};
           return jsonResult(payload);
         }
         case "camera_clip": {
           const node = readStringParam(params, "node", { required: true });
           const nodeId = await resolveNodeId(gatewayOpts, node);
-          const facing =
-            typeof params.facing === "string"
-              ? params.facing.toLowerCase()
-              : "front";
+          const facing = typeof params.facing === "string" ? params.facing.toLowerCase() : "front";
           if (facing !== "front" && facing !== "back") {
             throw new Error("invalid facing (front|back)");
           }
           const durationMs =
-            typeof params.durationMs === "number" &&
-            Number.isFinite(params.durationMs)
+            typeof params.durationMs === "number" && Number.isFinite(params.durationMs)
               ? params.durationMs
               : typeof params.duration === "string"
                 ? parseDurationMs(params.duration)
                 : 3000;
           const includeAudio =
-            typeof params.includeAudio === "boolean"
-              ? params.includeAudio
-              : true;
+            typeof params.includeAudio === "boolean" ? params.includeAudio : true;
           const deviceId =
             typeof params.deviceId === "string" && params.deviceId.trim()
               ? params.deviceId.trim()
@@ -410,25 +311,19 @@ export function createNodesTool(): AnyAgentTool {
           const node = readStringParam(params, "node", { required: true });
           const nodeId = await resolveNodeId(gatewayOpts, node);
           const durationMs =
-            typeof params.durationMs === "number" &&
-            Number.isFinite(params.durationMs)
+            typeof params.durationMs === "number" && Number.isFinite(params.durationMs)
               ? params.durationMs
               : typeof params.duration === "string"
                 ? parseDurationMs(params.duration)
                 : 10_000;
           const fps =
-            typeof params.fps === "number" && Number.isFinite(params.fps)
-              ? params.fps
-              : 10;
+            typeof params.fps === "number" && Number.isFinite(params.fps) ? params.fps : 10;
           const screenIndex =
-            typeof params.screenIndex === "number" &&
-            Number.isFinite(params.screenIndex)
+            typeof params.screenIndex === "number" && Number.isFinite(params.screenIndex)
               ? params.screenIndex
               : 0;
           const includeAudio =
-            typeof params.includeAudio === "boolean"
-              ? params.includeAudio
-              : true;
+            typeof params.includeAudio === "boolean" ? params.includeAudio : true;
           const raw = (await callGatewayTool("node.invoke", gatewayOpts, {
             nodeId,
             command: "screen.record",
@@ -446,10 +341,7 @@ export function createNodesTool(): AnyAgentTool {
             typeof params.outPath === "string" && params.outPath.trim()
               ? params.outPath.trim()
               : screenRecordTempPath({ ext: payload.format || "mp4" });
-          const written = await writeScreenRecordToFile(
-            filePath,
-            payload.base64,
-          );
+          const written = await writeScreenRecordToFile(filePath, payload.base64);
           return {
             content: [{ type: "text", text: `FILE:${written.path}` }],
             details: {
@@ -465,8 +357,7 @@ export function createNodesTool(): AnyAgentTool {
           const node = readStringParam(params, "node", { required: true });
           const nodeId = await resolveNodeId(gatewayOpts, node);
           const maxAgeMs =
-            typeof params.maxAgeMs === "number" &&
-            Number.isFinite(params.maxAgeMs)
+            typeof params.maxAgeMs === "number" && Number.isFinite(params.maxAgeMs)
               ? params.maxAgeMs
               : undefined;
           const desiredAccuracy =
@@ -494,26 +385,35 @@ export function createNodesTool(): AnyAgentTool {
         }
         case "run": {
           const node = readStringParam(params, "node", { required: true });
-          const nodeId = await resolveNodeId(gatewayOpts, node);
-          const commandRaw = params.command;
-          if (!commandRaw) {
+          const nodes = await listNodes(gatewayOpts);
+          if (nodes.length === 0) {
             throw new Error(
-              "command required (argv array, e.g. ['echo', 'Hello'])",
+              "system.run requires a paired companion app or node host (no nodes available).",
             );
           }
-          if (!Array.isArray(commandRaw)) {
+          const nodeId = resolveNodeIdFromList(nodes, node);
+          const nodeInfo = nodes.find((entry) => entry.nodeId === nodeId);
+          const supportsSystemRun = Array.isArray(nodeInfo?.commands)
+            ? nodeInfo?.commands?.includes("system.run")
+            : false;
+          if (!supportsSystemRun) {
             throw new Error(
-              "command must be an array of strings (argv), e.g. ['echo', 'Hello']",
+              "system.run requires a companion app or node host; the selected node does not support system.run.",
             );
+          }
+          const commandRaw = params.command;
+          if (!commandRaw) {
+            throw new Error("command required (argv array, e.g. ['echo', 'Hello'])");
+          }
+          if (!Array.isArray(commandRaw)) {
+            throw new Error("command must be an array of strings (argv), e.g. ['echo', 'Hello']");
           }
           const command = commandRaw.map((c) => String(c));
           if (command.length === 0) {
             throw new Error("command must not be empty");
           }
           const cwd =
-            typeof params.cwd === "string" && params.cwd.trim()
-              ? params.cwd.trim()
-              : undefined;
+            typeof params.cwd === "string" && params.cwd.trim() ? params.cwd.trim() : undefined;
           const env = parseEnvPairs(params.env);
           const commandTimeoutMs = parseTimeoutMs(params.commandTimeoutMs);
           const invokeTimeoutMs = parseTimeoutMs(params.invokeTimeoutMs);
@@ -530,6 +430,8 @@ export function createNodesTool(): AnyAgentTool {
               env,
               timeoutMs: commandTimeoutMs,
               needsScreenRecording,
+              agentId,
+              sessionKey,
             },
             timeoutMs: invokeTimeoutMs,
             idempotencyKey: crypto.randomUUID(),

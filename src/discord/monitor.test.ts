@@ -7,10 +7,14 @@ import {
   isDiscordGroupAllowedByPolicy,
   normalizeDiscordAllowList,
   normalizeDiscordSlug,
+  registerDiscordListener,
   resolveDiscordChannelConfig,
+  resolveDiscordChannelConfigWithFallback,
   resolveDiscordGuildEntry,
   resolveDiscordReplyTarget,
+  resolveDiscordShouldRequireMention,
   resolveGroupDmAllow,
+  sanitizeDiscordThreadName,
   shouldEmitDiscordReactionNotification,
 } from "./monitor.js";
 
@@ -31,6 +35,18 @@ const makeEntries = (
   }
   return out;
 };
+
+describe("registerDiscordListener", () => {
+  class FakeListener {}
+
+  it("dedupes listeners by constructor", () => {
+    const listeners: object[] = [];
+
+    expect(registerDiscordListener(listeners, new FakeListener())).toBe(true);
+    expect(registerDiscordListener(listeners, new FakeListener())).toBe(false);
+    expect(listeners).toHaveLength(1);
+  });
+});
 
 describe("discord allowlist helpers", () => {
   it("normalizes slugs", () => {
@@ -103,6 +119,7 @@ describe("discord guild/channel resolution", () => {
           enabled: false,
           users: ["123"],
           systemPrompt: "Use short answers.",
+          autoThread: true,
         },
       },
     };
@@ -127,6 +144,7 @@ describe("discord guild/channel resolution", () => {
     expect(help?.enabled).toBe(false);
     expect(help?.users).toEqual(["123"]);
     expect(help?.systemPrompt).toBe("Use short answers.");
+    expect(help?.autoThread).toBe(true);
   });
 
   it("denies channel when config present but no match", () => {
@@ -143,6 +161,123 @@ describe("discord guild/channel resolution", () => {
     });
     expect(channel?.allowed).toBe(false);
   });
+
+  it("inherits parent config for thread channels", () => {
+    const guildInfo: DiscordGuildEntryResolved = {
+      channels: {
+        general: { allow: true },
+        random: { allow: false },
+      },
+    };
+    const thread = resolveDiscordChannelConfigWithFallback({
+      guildInfo,
+      channelId: "thread-123",
+      channelName: "topic",
+      channelSlug: "topic",
+      parentId: "999",
+      parentName: "random",
+      parentSlug: "random",
+      scope: "thread",
+    });
+    expect(thread?.allowed).toBe(false);
+  });
+
+  it("does not match thread name/slug when resolving allowlists", () => {
+    const guildInfo: DiscordGuildEntryResolved = {
+      channels: {
+        general: { allow: true },
+        random: { allow: false },
+      },
+    };
+    const thread = resolveDiscordChannelConfigWithFallback({
+      guildInfo,
+      channelId: "thread-999",
+      channelName: "general",
+      channelSlug: "general",
+      parentId: "999",
+      parentName: "random",
+      parentSlug: "random",
+      scope: "thread",
+    });
+    expect(thread?.allowed).toBe(false);
+  });
+});
+
+describe("discord mention gating", () => {
+  it("requires mention by default", () => {
+    const guildInfo: DiscordGuildEntryResolved = {
+      requireMention: true,
+      channels: {
+        general: { allow: true },
+      },
+    };
+    const channelConfig = resolveDiscordChannelConfig({
+      guildInfo,
+      channelId: "1",
+      channelName: "General",
+      channelSlug: "general",
+    });
+    expect(
+      resolveDiscordShouldRequireMention({
+        isGuildMessage: true,
+        isThread: false,
+        channelConfig,
+        guildInfo,
+      }),
+    ).toBe(true);
+  });
+
+  it("does not require mention inside autoThread threads", () => {
+    const guildInfo: DiscordGuildEntryResolved = {
+      requireMention: true,
+      channels: {
+        general: { allow: true, autoThread: true },
+      },
+    };
+    const channelConfig = resolveDiscordChannelConfig({
+      guildInfo,
+      channelId: "1",
+      channelName: "General",
+      channelSlug: "general",
+    });
+    expect(
+      resolveDiscordShouldRequireMention({
+        isGuildMessage: true,
+        isThread: true,
+        channelConfig,
+        guildInfo,
+      }),
+    ).toBe(false);
+  });
+
+  it("inherits parent channel mention rules for threads", () => {
+    const guildInfo: DiscordGuildEntryResolved = {
+      requireMention: true,
+      channels: {
+        "parent-1": { allow: true, requireMention: false },
+      },
+    };
+    const channelConfig = resolveDiscordChannelConfigWithFallback({
+      guildInfo,
+      channelId: "thread-1",
+      channelName: "topic",
+      channelSlug: "topic",
+      parentId: "parent-1",
+      parentName: "Parent",
+      parentSlug: "parent",
+      scope: "thread",
+    });
+    expect(channelConfig?.matchSource).toBe("parent");
+    expect(channelConfig?.matchKey).toBe("parent-1");
+    expect(
+      resolveDiscordShouldRequireMention({
+        isGuildMessage: true,
+        isThread: true,
+        channelConfig,
+        guildInfo,
+      }),
+    ).toBe(false);
+  });
 });
 
 describe("discord groupPolicy gating", () => {
@@ -150,6 +285,7 @@ describe("discord groupPolicy gating", () => {
     expect(
       isDiscordGroupAllowedByPolicy({
         groupPolicy: "open",
+        guildAllowlisted: false,
         channelAllowlistConfigured: false,
         channelAllowed: false,
       }),
@@ -160,26 +296,40 @@ describe("discord groupPolicy gating", () => {
     expect(
       isDiscordGroupAllowedByPolicy({
         groupPolicy: "disabled",
+        guildAllowlisted: true,
         channelAllowlistConfigured: true,
         channelAllowed: true,
       }),
     ).toBe(false);
   });
 
-  it("blocks allowlist when no channel allowlist configured", () => {
+  it("blocks allowlist when guild is not allowlisted", () => {
     expect(
       isDiscordGroupAllowedByPolicy({
         groupPolicy: "allowlist",
+        guildAllowlisted: false,
         channelAllowlistConfigured: false,
         channelAllowed: true,
       }),
     ).toBe(false);
   });
 
+  it("allows allowlist when guild allowlisted but no channel allowlist", () => {
+    expect(
+      isDiscordGroupAllowedByPolicy({
+        groupPolicy: "allowlist",
+        guildAllowlisted: true,
+        channelAllowlistConfigured: false,
+        channelAllowed: true,
+      }),
+    ).toBe(true);
+  });
+
   it("allows allowlist when channel is allowed", () => {
     expect(
       isDiscordGroupAllowedByPolicy({
         groupPolicy: "allowlist",
+        guildAllowlisted: true,
         channelAllowlistConfigured: true,
         channelAllowed: true,
       }),
@@ -190,6 +340,7 @@ describe("discord groupPolicy gating", () => {
     expect(
       isDiscordGroupAllowedByPolicy({
         groupPolicy: "allowlist",
+        guildAllowlisted: true,
         channelAllowlistConfigured: true,
         channelAllowed: false,
       }),
@@ -272,6 +423,18 @@ describe("discord reply target selection", () => {
         hasReplied: true,
       }),
     ).toBe("123");
+  });
+});
+
+describe("discord autoThread name sanitization", () => {
+  it("strips mentions and collapses whitespace", () => {
+    const name = sanitizeDiscordThreadName("  <@123>  <@&456> <#789>  Help   here  ", "msg-1");
+    expect(name).toBe("Help here");
+  });
+
+  it("falls back to thread + id when empty after cleaning", () => {
+    const name = sanitizeDiscordThreadName("   <@123>", "abc");
+    expect(name).toBe("Thread abc");
   });
 });
 
@@ -369,15 +532,7 @@ describe("discord media payload", () => {
     expect(payload.MediaPath).toBe("/tmp/a.png");
     expect(payload.MediaUrl).toBe("/tmp/a.png");
     expect(payload.MediaType).toBe("image/png");
-    expect(payload.MediaPaths).toEqual([
-      "/tmp/a.png",
-      "/tmp/b.png",
-      "/tmp/c.png",
-    ]);
-    expect(payload.MediaUrls).toEqual([
-      "/tmp/a.png",
-      "/tmp/b.png",
-      "/tmp/c.png",
-    ]);
+    expect(payload.MediaPaths).toEqual(["/tmp/a.png", "/tmp/b.png", "/tmp/c.png"]);
+    expect(payload.MediaUrls).toEqual(["/tmp/a.png", "/tmp/b.png", "/tmp/c.png"]);
   });
 });

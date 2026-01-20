@@ -1,7 +1,7 @@
 import { resolveAgentConfig } from "../../agents/agent-scope.js";
+import { getChannelDock } from "../../channels/dock.js";
+import { normalizeChannelId } from "../../channels/plugins/index.js";
 import type { ClawdbotConfig } from "../../config/config.js";
-import { getProviderDock } from "../../providers/dock.js";
-import { normalizeProviderId } from "../../providers/registry.js";
 import type { MsgContext } from "../templating.js";
 
 function escapeRegExp(text: string): string {
@@ -36,10 +36,7 @@ function normalizeMentionPatterns(patterns: string[]): string[] {
   return patterns.map(normalizeMentionPattern);
 }
 
-function resolveMentionPatterns(
-  cfg: ClawdbotConfig | undefined,
-  agentId?: string,
-): string[] {
+function resolveMentionPatterns(cfg: ClawdbotConfig | undefined, agentId?: string): string[] {
   if (!cfg) return [];
   const agentConfig = agentId ? resolveAgentConfig(cfg, agentId) : undefined;
   const agentGroupChat = agentConfig?.groupChat;
@@ -54,13 +51,8 @@ function resolveMentionPatterns(
   return derived.length > 0 ? derived : [];
 }
 
-export function buildMentionRegexes(
-  cfg: ClawdbotConfig | undefined,
-  agentId?: string,
-): RegExp[] {
-  const patterns = normalizeMentionPatterns(
-    resolveMentionPatterns(cfg, agentId),
-  );
+export function buildMentionRegexes(cfg: ClawdbotConfig | undefined, agentId?: string): RegExp[] {
+  const patterns = normalizeMentionPatterns(resolveMentionPatterns(cfg, agentId));
   return patterns
     .map((pattern) => {
       try {
@@ -73,15 +65,10 @@ export function buildMentionRegexes(
 }
 
 export function normalizeMentionText(text: string): string {
-  return (text ?? "")
-    .replace(/[\u200b-\u200f\u202a-\u202e\u2060-\u206f]/g, "")
-    .toLowerCase();
+  return (text ?? "").replace(/[\u200b-\u200f\u202a-\u202e\u2060-\u206f]/g, "").toLowerCase();
 }
 
-export function matchesMentionPatterns(
-  text: string,
-  mentionRegexes: RegExp[],
-): boolean {
+export function matchesMentionPatterns(text: string, mentionRegexes: RegExp[]): boolean {
   if (mentionRegexes.length === 0) return false;
   const cleaned = normalizeMentionText(text ?? "");
   if (!cleaned) return false;
@@ -92,11 +79,7 @@ export function stripStructuralPrefixes(text: string): string {
   // Ignore wrapper labels, timestamps, and sender prefixes so directive-only
   // detection still works in group batches that include history/context.
   const afterMarker = text.includes(CURRENT_MESSAGE_MARKER)
-    ? text
-        .slice(
-          text.indexOf(CURRENT_MESSAGE_MARKER) + CURRENT_MESSAGE_MARKER.length,
-        )
-        .trimStart()
+    ? text.slice(text.indexOf(CURRENT_MESSAGE_MARKER) + CURRENT_MESSAGE_MARKER.length).trimStart()
     : text;
 
   return afterMarker
@@ -114,10 +97,8 @@ export function stripMentions(
   agentId?: string,
 ): string {
   let result = text;
-  const providerId = ctx.Provider ? normalizeProviderId(ctx.Provider) : null;
-  const providerMentions = providerId
-    ? getProviderDock(providerId)?.mentions
-    : undefined;
+  const providerId = ctx.Provider ? normalizeChannelId(ctx.Provider) : null;
+  const providerMentions = providerId ? getChannelDock(providerId)?.mentions : undefined;
   const patterns = normalizeMentionPatterns([
     ...resolveMentionPatterns(cfg, agentId),
     ...(providerMentions?.stripPatterns?.({ ctx, cfg, agentId }) ?? []),

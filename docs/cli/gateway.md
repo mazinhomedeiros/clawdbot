@@ -8,7 +8,7 @@ read_when:
 
 # Gateway CLI
 
-The Gateway is Clawdbot’s WebSocket server (providers, nodes, sessions, hooks).
+The Gateway is Clawdbot’s WebSocket server (channels, nodes, sessions, hooks).
 
 Subcommands in this page live under `clawdbot gateway …`.
 
@@ -28,7 +28,8 @@ clawdbot gateway
 Notes:
 - By default, the Gateway refuses to start unless `gateway.mode=local` is set in `~/.clawdbot/clawdbot.json`. Use `--allow-unconfigured` for ad-hoc/dev runs.
 - Binding beyond loopback without auth is blocked (safety guardrail).
-- `SIGUSR1` triggers an in-process restart (useful without a supervisor).
+- `SIGUSR1` triggers an in-process restart when authorized (enable `commands.restart` or use the gateway tool/config apply/update).
+- `SIGINT`/`SIGTERM` handlers stop the gateway process, but they don’t restore any custom terminal state. If you wrap the CLI with a TUI or raw-mode input, restore the terminal before exit.
 
 ### Options
 
@@ -78,7 +79,7 @@ clawdbot gateway health --url ws://127.0.0.1:18789
 - your configured remote gateway (if set), and
 - localhost (loopback) **even if remote is configured**.
 
-If multiple gateways are reachable, it prints all of them. Multiple gateways are supported when you use profiles for redundancy, but most installs still run a single gateway.
+If multiple gateways are reachable, it prints all of them. Multiple gateways are supported when you use isolated profiles/ports (e.g., a rescue bot), but most installs still run a single gateway.
 
 ```bash
 clawdbot gateway status
@@ -92,7 +93,7 @@ The macOS app “Remote over SSH” mode uses a local port-forward so the remote
 CLI equivalent:
 
 ```bash
-clawdbot gateway status --ssh steipete@peters-mac-studio-1
+clawdbot gateway status --ssh user@gateway-host
 ```
 
 Options:

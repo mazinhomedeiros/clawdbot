@@ -2,6 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 
 import { CONFIG_DIR, resolveUserPath } from "../utils.js";
+import { resolveBundledPluginsDir } from "./bundled-dir.js";
 import type { PluginDiagnostic, PluginOrigin } from "./types.js";
 
 const EXTENSION_EXTS = new Set([".ts", ".js", ".mts", ".cts", ".mjs", ".cjs"]);
@@ -50,9 +51,7 @@ function readPackageManifest(dir: string): PackageManifest | null {
 function resolvePackageExtensions(manifest: PackageManifest): string[] {
   const raw = manifest.clawdbot?.extensions;
   if (!Array.isArray(raw)) return [];
-  return raw
-    .map((entry) => (typeof entry === "string" ? entry.trim() : ""))
-    .filter(Boolean);
+  return raw.map((entry) => (typeof entry === "string" ? entry.trim() : "")).filter(Boolean);
 }
 
 function deriveIdHint(params: {
@@ -61,10 +60,17 @@ function deriveIdHint(params: {
   hasMultipleExtensions: boolean;
 }): string {
   const base = path.basename(params.filePath, path.extname(params.filePath));
-  const packageName = params.packageName?.trim();
-  if (!packageName) return base;
-  if (!params.hasMultipleExtensions) return packageName;
-  return `${packageName}/${base}`;
+  const rawPackageName = params.packageName?.trim();
+  if (!rawPackageName) return base;
+
+  // Prefer the unscoped name so config keys stay stable even when the npm
+  // package is scoped (example: @clawdbot/voice-call -> voice-call).
+  const unscoped = rawPackageName.includes("/")
+    ? (rawPackageName.split("/").pop() ?? rawPackageName)
+    : rawPackageName;
+
+  if (!params.hasMultipleExtensions) return unscoped;
+  return `${unscoped}/${base}`;
 }
 
 function addCandidate(params: {
@@ -207,6 +213,46 @@ function discoverFromPath(params: {
   }
 
   if (stat.isDirectory()) {
+    const manifest = readPackageManifest(resolved);
+    const extensions = manifest ? resolvePackageExtensions(manifest) : [];
+
+    if (extensions.length > 0) {
+      for (const extPath of extensions) {
+        const source = path.resolve(resolved, extPath);
+        addCandidate({
+          candidates: params.candidates,
+          seen: params.seen,
+          idHint: deriveIdHint({
+            filePath: source,
+            packageName: manifest?.name,
+            hasMultipleExtensions: extensions.length > 1,
+          }),
+          source,
+          origin: params.origin,
+          workspaceDir: params.workspaceDir,
+          manifest,
+        });
+      }
+      return;
+    }
+
+    const indexCandidates = ["index.ts", "index.js", "index.mjs", "index.cjs"];
+    const indexFile = indexCandidates
+      .map((candidate) => path.join(resolved, candidate))
+      .find((candidate) => fs.existsSync(candidate));
+
+    if (indexFile && isExtensionFile(indexFile)) {
+      addCandidate({
+        candidates: params.candidates,
+        seen: params.seen,
+        idHint: path.basename(resolved),
+        source: indexFile,
+        origin: params.origin,
+        workspaceDir: params.workspaceDir,
+      });
+      return;
+    }
+
     discoverInDirectory({
       dir: resolved,
       origin: params.origin,
@@ -226,17 +272,22 @@ export function discoverClawdbotPlugins(params: {
   const candidates: PluginCandidate[] = [];
   const diagnostics: PluginDiagnostic[] = [];
   const seen = new Set<string>();
-
-  const globalDir = path.join(CONFIG_DIR, "extensions");
-  discoverInDirectory({
-    dir: globalDir,
-    origin: "global",
-    candidates,
-    diagnostics,
-    seen,
-  });
-
   const workspaceDir = params.workspaceDir?.trim();
+
+  const extra = params.extraPaths ?? [];
+  for (const extraPath of extra) {
+    if (typeof extraPath !== "string") continue;
+    const trimmed = extraPath.trim();
+    if (!trimmed) continue;
+    discoverFromPath({
+      rawPath: trimmed,
+      origin: "config",
+      workspaceDir: workspaceDir?.trim() || undefined,
+      candidates,
+      diagnostics,
+      seen,
+    });
+  }
   if (workspaceDir) {
     const workspaceRoot = resolveUserPath(workspaceDir);
     const workspaceExt = path.join(workspaceRoot, ".clawdbot", "extensions");
@@ -250,15 +301,20 @@ export function discoverClawdbotPlugins(params: {
     });
   }
 
-  const extra = params.extraPaths ?? [];
-  for (const extraPath of extra) {
-    if (typeof extraPath !== "string") continue;
-    const trimmed = extraPath.trim();
-    if (!trimmed) continue;
-    discoverFromPath({
-      rawPath: trimmed,
-      origin: "config",
-      workspaceDir: workspaceDir?.trim() || undefined,
+  const globalDir = path.join(CONFIG_DIR, "extensions");
+  discoverInDirectory({
+    dir: globalDir,
+    origin: "global",
+    candidates,
+    diagnostics,
+    seen,
+  });
+
+  const bundledDir = resolveBundledPluginsDir();
+  if (bundledDir) {
+    discoverInDirectory({
+      dir: bundledDir,
+      origin: "bundled",
       candidates,
       diagnostics,
       seen,

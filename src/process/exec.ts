@@ -48,6 +48,7 @@ export type CommandOptions = {
   cwd?: string;
   input?: string;
   env?: NodeJS.ProcessEnv;
+  windowsVerbatimArguments?: boolean;
 };
 
 export async function runCommandWithTimeout(
@@ -55,10 +56,9 @@ export async function runCommandWithTimeout(
   optionsOrTimeout: number | CommandOptions,
 ): Promise<SpawnResult> {
   const options: CommandOptions =
-    typeof optionsOrTimeout === "number"
-      ? { timeoutMs: optionsOrTimeout }
-      : optionsOrTimeout;
+    typeof optionsOrTimeout === "number" ? { timeoutMs: optionsOrTimeout } : optionsOrTimeout;
   const { timeoutMs, cwd, input, env } = options;
+  const { windowsVerbatimArguments } = options;
   const hasInput = input !== undefined;
 
   // Spawn with inherited stdin (TTY) so tools like `pi` stay interactive when needed.
@@ -67,6 +67,7 @@ export async function runCommandWithTimeout(
       stdio: [hasInput ? "pipe" : "inherit", "pipe", "pipe"],
       cwd,
       env: env ? { ...process.env, ...env } : process.env,
+      windowsVerbatimArguments,
     });
     let stdout = "";
     let stderr = "";

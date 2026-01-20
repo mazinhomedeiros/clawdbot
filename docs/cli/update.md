@@ -9,12 +9,14 @@ read_when:
 
 Safely update a **source checkout** (git install) of Clawdbot.
 
-If you installed via **npm/pnpm/bun** (global install, no git metadata), use the package manager flow in [Updating](/install/updating).
+If you installed via **npm/pnpm** (global install, no git metadata), use the package manager flow in [Updating](/install/updating).
 
 ## Usage
 
 ```bash
 clawdbot update
+clawdbot update --channel beta
+clawdbot update --tag beta
 clawdbot update --restart
 clawdbot update --json
 clawdbot --update
@@ -23,8 +25,12 @@ clawdbot --update
 ## Options
 
 - `--restart`: restart the Gateway daemon after a successful update.
+- `--channel <stable|beta>`: set the update channel for npm installs (persisted in config).
+- `--tag <dist-tag|version>`: override the npm dist-tag or version for this update only.
 - `--json`: print machine-readable `UpdateRunResult` JSON.
 - `--timeout <seconds>`: per-step timeout (default is 1200s).
+
+Note: downgrades require confirmation because older versions can break configuration.
 
 ## What it does (git checkout)
 
@@ -32,7 +38,7 @@ High-level:
 
 1. Requires a clean worktree (no uncommitted changes).
 2. Fetches and rebases against `@{upstream}`.
-3. Installs deps (pnpm/bun/npm depending on the checkout).
+3. Installs deps (pnpm preferred; npm fallback).
 4. Builds + builds the Control UI.
 5. Runs `clawdbot doctor` as the final “safe update” check.
 

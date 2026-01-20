@@ -1,13 +1,17 @@
 import { createServer } from "node:http";
 
 import { webhookCallback } from "grammy";
+import type { ClawdbotConfig } from "../config/config.js";
 import { formatErrorMessage } from "../infra/errors.js";
 import type { RuntimeEnv } from "../runtime.js";
 import { defaultRuntime } from "../runtime.js";
+import { resolveTelegramAllowedUpdates } from "./allowed-updates.js";
 import { createTelegramBot } from "./bot.js";
 
 export async function startTelegramWebhook(opts: {
   token: string;
+  accountId?: string;
+  config?: ClawdbotConfig;
   path?: string;
   port?: number;
   host?: string;
@@ -27,6 +31,8 @@ export async function startTelegramWebhook(opts: {
     token: opts.token,
     runtime,
     proxyFetch: opts.fetch,
+    config: opts.config,
+    accountId: opts.accountId,
   });
   const handler = webhookCallback(bot, "http", {
     secretToken: opts.secret,
@@ -54,11 +60,11 @@ export async function startTelegramWebhook(opts: {
   });
 
   const publicUrl =
-    opts.publicUrl ??
-    `http://${host === "0.0.0.0" ? "localhost" : host}:${port}${path}`;
+    opts.publicUrl ?? `http://${host === "0.0.0.0" ? "localhost" : host}:${port}${path}`;
 
   await bot.api.setWebhook(publicUrl, {
     secret_token: opts.secret,
+    allowed_updates: resolveTelegramAllowedUpdates(),
   });
 
   await new Promise<void>((resolve) => server.listen(port, host, resolve));

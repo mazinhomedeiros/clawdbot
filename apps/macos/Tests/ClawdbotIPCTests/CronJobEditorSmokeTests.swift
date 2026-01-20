@@ -23,8 +23,11 @@ struct CronJobEditorSmokeTests {
     @Test func cronJobEditorBuildsBodyForExistingJob() {
         let job = CronJob(
             id: "job-1",
+            agentId: "ops",
             name: "Daily summary",
+            description: nil,
             enabled: true,
+            deleteAfterRun: nil,
             createdAtMs: 1_700_000_000_000,
             updatedAtMs: 1_700_000_000_000,
             schedule: .every(everyMs: 3_600_000, anchorMs: 1_700_000_000_000),
@@ -35,7 +38,7 @@ struct CronJobEditorSmokeTests {
                 thinking: "low",
                 timeoutSeconds: 120,
                 deliver: true,
-                provider: "whatsapp",
+                channel: "whatsapp",
                 to: "+15551234567",
                 bestEffortDeliver: true),
             isolation: CronIsolation(postToMainPrefix: "Cron"),
@@ -64,5 +67,19 @@ struct CronJobEditorSmokeTests {
             onCancel: {},
             onSave: { _ in })
         view.exerciseForTesting()
+    }
+
+    @Test func cronJobEditorIncludesDeleteAfterRunForAtSchedule() throws {
+        let view = CronJobEditor(
+            job: nil,
+            isSaving: .constant(false),
+            error: .constant(nil),
+            onCancel: {},
+            onSave: { _ in })
+
+        var root: [String: Any] = [:]
+        view.applyDeleteAfterRun(to: &root, scheduleKind: .at, deleteAfterRun: true)
+        let raw = root["deleteAfterRun"] as? Bool
+        #expect(raw == true)
     }
 }

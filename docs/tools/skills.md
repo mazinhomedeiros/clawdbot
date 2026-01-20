@@ -45,8 +45,9 @@ surface those skills teach.
 
 ## ClawdHub (install + sync)
 
-ClawdHub is the public skills registry for Clawdbot. Use it to discover,
-install, update, and back up skills. Full guide: [ClawdHub](/tools/clawdhub).
+ClawdHub is the public skills registry for Clawdbot. Browse at
+https://clawdhub.com. Use it to discover, install, update, and back up skills.
+Full guide: [ClawdHub](/tools/clawdhub).
 
 Common flows:
 
@@ -58,7 +59,8 @@ Common flows:
   - `clawdhub sync --all`
 
 By default, `clawdhub` installs into `./skills` under your current working
-directory; Clawdbot picks that up as `<workspace>/skills` on the next session.
+directory (or falls back to the configured Clawdbot workspace). Clawdbot picks
+that up as `<workspace>/skills` on the next session.
 
 ## Format (AgentSkills + Pi-compatible)
 
@@ -78,6 +80,8 @@ Notes:
 - Use `{baseDir}` in instructions to reference the skill folder path.
 - Optional frontmatter keys:
   - `homepage` — URL surfaced as “Website” in the macOS Skills UI (also supported via `metadata.clawdbot.homepage`).
+  - `user-invocable` — `true|false` (default: `true`). When `true`, the skill is exposed as a user slash command.
+  - `disable-model-invocation` — `true|false` (default: `false`). When `true`, the skill is excluded from the model prompt (still available via user invocation).
 
 ## Gating (load-time filters)
 
@@ -103,6 +107,15 @@ Fields under `metadata.clawdbot`:
 - `primaryEnv` — env var name associated with `skills.entries.<name>.apiKey`.
 - `install` — optional array of installer specs used by the macOS Skills UI (brew/node/go/uv).
 
+Note on sandboxing:
+- `requires.bins` is checked on the **host** at skill load time.
+- If an agent is sandboxed, the binary must also exist **inside the container**.
+  Install it via `agents.defaults.sandbox.docker.setupCommand` (or a custom image).
+  `setupCommand` runs once after the container is created.
+  Package installs also require network egress, a writable root FS, and a root user in the sandbox.
+  Example: the `summarize` skill (`skills/summarize/SKILL.md`) needs the `summarize` CLI
+  in the sandbox container to run there.
+
 Installer example:
 
 ```markdown
@@ -116,6 +129,8 @@ metadata: {"clawdbot":{"emoji":"♊️","requires":{"bins":["gemini"]},"install"
 Notes:
 - If multiple installers are listed, the gateway picks a **single** preferred option (brew when available, otherwise node).
 - Node installs honor `skills.install.nodeManager` in `clawdbot.json` (default: npm; options: npm/pnpm/yarn/bun).
+  This only affects **skill installs**; the Gateway runtime should still be Node
+  (Bun is not recommended for WhatsApp/Telegram).
 - Go installs: if `go` is missing and `brew` is available, the gateway installs Go via Homebrew first and sets `GOBIN` to Homebrew’s `bin` when possible.
 
 If no `metadata.clawdbot` is present, the skill is always eligible (unless
@@ -170,6 +185,29 @@ This is **scoped to the agent run**, not a global shell environment.
 
 Clawdbot snapshots the eligible skills **when a session starts** and reuses that list for subsequent turns in the same session. Changes to skills or config take effect on the next new session.
 
+Skills can also refresh mid-session when the skills watcher is enabled or when a new eligible remote node appears (see below). Think of this as a **hot reload**: the refreshed list is picked up on the next agent turn.
+
+## Remote macOS nodes (Linux gateway)
+
+If the Gateway is running on Linux but a **macOS node** is connected **with `system.run` allowed** (Exec approvals security not set to `deny`), Clawdbot can treat macOS-only skills as eligible when the required binaries are present on that node. The agent should execute those skills via the `nodes` tool (typically `nodes.run`).
+
+This relies on the node reporting its command support and on a bin probe via `system.run`. If the macOS node goes offline later, the skills remain visible; invocations may fail until the node reconnects.
+
+## Skills watcher (auto-refresh)
+
+By default, Clawdbot watches skill folders and bumps the skills snapshot when `SKILL.md` files change. Configure this under `skills.load`:
+
+```json5
+{
+  skills: {
+    load: {
+      watch: true,
+      watchDebounceMs: 250
+    }
+  }
+}
+```
+
 ## Token impact (skills list)
 
 When skills are eligible, Clawdbot injects a compact XML list of available skills into the system prompt (via `formatSkillsForPrompt` in `pi-coding-agent`). The cost is deterministic:
@@ -200,6 +238,6 @@ See [Skills config](/tools/skills-config) for the full configuration schema.
 
 ## Looking for more skills?
 
-Browse [ClawdHub](/tools/clawdhub).
+Browse https://clawdhub.com.
 
 ---

@@ -1,9 +1,33 @@
+import fs from "node:fs";
+import path from "node:path";
 import { spawn } from "node:child_process";
+
+function resolvePowerShellPath(): string {
+  const systemRoot = process.env.SystemRoot || process.env.WINDIR;
+  if (systemRoot) {
+    const candidate = path.join(
+      systemRoot,
+      "System32",
+      "WindowsPowerShell",
+      "v1.0",
+      "powershell.exe",
+    );
+    if (fs.existsSync(candidate)) return candidate;
+  }
+  return "powershell.exe";
+}
 
 export function getShellConfig(): { shell: string; args: string[] } {
   if (process.platform === "win32") {
-    const shell = process.env.COMSPEC?.trim() || "cmd.exe";
-    return { shell, args: ["/d", "/s", "/c"] };
+    // Use PowerShell instead of cmd.exe on Windows.
+    // Problem: Many Windows system utilities (ipconfig, systeminfo, etc.) write
+    // directly to the console via WriteConsole API, bypassing stdout pipes.
+    // When Node.js spawns cmd.exe with piped stdio, these utilities produce no output.
+    // PowerShell properly captures and redirects their output to stdout.
+    return {
+      shell: resolvePowerShellPath(),
+      args: ["-NoProfile", "-NonInteractive", "-Command"],
+    };
   }
 
   const shell = process.env.SHELL?.trim() || "sh";

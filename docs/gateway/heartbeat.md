@@ -33,9 +33,9 @@ Example config:
 
 ## Defaults
 
-- Interval: `30m` (set `agents.defaults.heartbeat.every`; use `0m` to disable).
+- Interval: `30m` (set `agents.defaults.heartbeat.every` or per-agent `agents.list[].heartbeat.every`; use `0m` to disable).
 - Prompt body (configurable via `agents.defaults.heartbeat.prompt`):
-  `Read HEARTBEAT.md if exists. Consider outstanding tasks. Checkup sometimes on your human during (user local) day time.`
+  `Read HEARTBEAT.md if it exists (workspace context). Follow it strictly. Do not infer or repeat old tasks from prior chats. If nothing needs attention, reply HEARTBEAT_OK.`
 - The heartbeat prompt is sent **verbatim** as the user message. The system
   prompt includes a “Heartbeat” section and the run is flagged internally.
 
@@ -49,15 +49,15 @@ The default prompt is intentionally broad:
   by using your configured local timezone (see [/concepts/timezone](/concepts/timezone)).
 
 If you want a heartbeat to do something very specific (e.g. “check Gmail PubSub
-stats” or “verify gateway health”), set `agents.defaults.heartbeat.prompt` to a
-custom body (sent verbatim).
+stats” or “verify gateway health”), set `agents.defaults.heartbeat.prompt` (or
+`agents.list[].heartbeat.prompt`) to a custom body (sent verbatim).
 
 ## Response contract
 
 - If nothing needs attention, reply with **`HEARTBEAT_OK`**.
 - During heartbeat runs, Clawdbot treats `HEARTBEAT_OK` as an ack when it appears
   at the **start or end** of the reply. The token is stripped and the reply is
-  dropped if the remaining content is **≤ `ackMaxChars`** (default: 30).
+  dropped if the remaining content is **≤ `ackMaxChars`** (default: 300).
 - If `HEARTBEAT_OK` appears in the **middle** of a reply, it is not treated
   specially.
 - For alerts, **do not** include `HEARTBEAT_OK`; return only the alert text.
@@ -76,11 +76,44 @@ and logged; a message that is only `HEARTBEAT_OK` is dropped.
         model: "anthropic/claude-opus-4-5",
         includeReasoning: false, // default: false (deliver separate Reasoning: message when available)
         target: "last",         // last | whatsapp | telegram | discord | slack | signal | imessage | none
-        to: "+15551234567",     // optional provider-specific override
-        prompt: "Read HEARTBEAT.md if exists. Consider outstanding tasks. Checkup sometimes on your human during (user local) day time.",
-        ackMaxChars: 30          // max chars allowed after HEARTBEAT_OK
+        to: "+15551234567",     // optional channel-specific override
+        prompt: "Read HEARTBEAT.md if it exists (workspace context). Follow it strictly. Do not infer or repeat old tasks from prior chats. If nothing needs attention, reply HEARTBEAT_OK.",
+        ackMaxChars: 300         // max chars allowed after HEARTBEAT_OK
       }
     }
+  }
+}
+```
+
+### Per-agent heartbeats
+
+If any `agents.list[]` entry includes a `heartbeat` block, **only those agents**
+run heartbeats. The per-agent block merges on top of `agents.defaults.heartbeat`
+(so you can set shared defaults once and override per agent).
+
+Example: two agents, only the second agent runs heartbeats.
+
+```json5
+{
+  agents: {
+    defaults: {
+      heartbeat: {
+        every: "30m",
+        target: "last"
+      }
+    },
+    list: [
+      { id: "main", default: true },
+      {
+        id: "ops",
+        heartbeat: {
+          every: "1h",
+          target: "whatsapp",
+          to: "+15551234567",
+          prompt: "Read HEARTBEAT.md if it exists (workspace context). Follow it strictly. Do not infer or repeat old tasks from prior chats. If nothing needs attention, reply HEARTBEAT_OK."
+        }
+      }
+    ]
   }
 }
 ```
@@ -91,8 +124,8 @@ and logged; a message that is only `HEARTBEAT_OK` is dropped.
 - `model`: optional model override for heartbeat runs (`provider/model`).
 - `includeReasoning`: when enabled, also deliver the separate `Reasoning:` message when available (same shape as `/reasoning on`).
 - `target`:
-  - `last` (default): deliver to the last used external provider.
-  - explicit provider: `whatsapp` / `telegram` / `discord` / `slack` / `signal` / `imessage`.
+  - `last` (default): deliver to the last used external channel.
+  - explicit channel: `whatsapp` / `telegram` / `discord` / `slack` / `signal` / `imessage`.
   - `none`: run the heartbeat but **do not deliver** externally.
 - `to`: optional recipient override (E.164 for WhatsApp, chat id for Telegram, etc.).
 - `prompt`: overrides the default prompt body (not merged).
@@ -100,7 +133,8 @@ and logged; a message that is only `HEARTBEAT_OK` is dropped.
 
 ## Delivery behavior
 
-- Heartbeats run in the **main session** (`main`, or `global` when scope is global).
+- Heartbeats run in each agent’s **main session** (`agent:<id>:<mainKey>`), or `global`
+  when `session.scope = "global"`.
 - If the main queue is busy, the heartbeat is skipped and retried later.
 - If `target` resolves to no external destination, the run still happens but no
   outbound message is sent.
@@ -148,6 +182,9 @@ You can enqueue a system event and trigger an immediate heartbeat with:
 ```bash
 clawdbot wake --text "Check for urgent follow-ups" --mode now
 ```
+
+If multiple agents have `heartbeat` configured, a manual wake runs each of those
+agent heartbeats immediately.
 
 Use `--mode next-heartbeat` to wait for the next scheduled tick.
 

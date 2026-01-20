@@ -12,6 +12,9 @@ final class ConnectionModeCoordinator {
     func apply(mode: AppState.ConnectionMode, paused: Bool) async {
         switch mode {
         case .unconfigured:
+            if let error = await NodeServiceManager.stop() {
+                NodesStore.shared.lastError = "Node service stop failed: \(error)"
+            }
             await RemoteTunnelManager.shared.stopAll()
             WebChatManager.shared.resetTunnels()
             GatewayProcessManager.shared.stop()
@@ -20,6 +23,9 @@ final class ConnectionModeCoordinator {
             Task.detached { await PortGuardian.shared.sweep(mode: .unconfigured) }
 
         case .local:
+            if let error = await NodeServiceManager.stop() {
+                NodesStore.shared.lastError = "Node service stop failed: \(error)"
+            }
             await RemoteTunnelManager.shared.stopAll()
             WebChatManager.shared.resetTunnels()
             let shouldStart = GatewayAutostartPolicy.shouldStartGateway(mode: .local, paused: paused)
@@ -27,8 +33,7 @@ final class ConnectionModeCoordinator {
                 GatewayProcessManager.shared.setActive(true)
                 if GatewayAutostartPolicy.shouldEnsureLaunchAgent(
                     mode: .local,
-                    paused: paused,
-                    attachExistingOnly: AppStateStore.attachExistingGatewayOnly)
+                    paused: paused)
                 {
                     Task { await GatewayProcessManager.shared.ensureLaunchAgentEnabledIfNeeded() }
                 }
@@ -51,6 +56,9 @@ final class ConnectionModeCoordinator {
             WebChatManager.shared.resetTunnels()
 
             do {
+                if let error = await NodeServiceManager.start() {
+                    NodesStore.shared.lastError = "Node service start failed: \(error)"
+                }
                 _ = try await GatewayEndpointStore.shared.ensureRemoteControlTunnel()
                 let settings = CommandResolver.connectionSettings()
                 try await ControlChannel.shared.configure(mode: .remote(

@@ -46,16 +46,6 @@ Capture what matters. Decisions, context, things to remember. Skip the secrets u
 - When you make a mistake → document it so future-you doesn't repeat it
 - **Text > Brain** 📝
 
-### 🧠 Memory Recall - Use qmd!
-When you need to remember something from the past, use `qmd` instead of grepping files:
-```bash
-qmd query "what happened at Christmas"   # Semantic search with reranking
-qmd search "specific phrase"              # BM25 keyword search  
-qmd vsearch "conceptual question"         # Pure vector similarity
-```
-Index your memory folder: `qmd index memory/`
-Vectors + BM25 + reranking finds things even with different wording.
-
 ## Safety
 
 - Don't exfiltrate private data. Ever.
@@ -118,7 +108,7 @@ Skills provide your tools. When you need one, check its `SKILL.md`. Keep local n
 When you receive a heartbeat poll (message matches the configured heartbeat prompt), don't just reply `HEARTBEAT_OK` every time. Use heartbeats productively!
 
 Default heartbeat prompt:
-`Read HEARTBEAT.md if exists. Consider outstanding tasks. Checkup sometimes on your human during (user local) day time.`
+`Read HEARTBEAT.md if it exists (workspace context). Follow it strictly. Do not infer or repeat old tasks from prior chats. If nothing needs attention, reply HEARTBEAT_OK.`
 
 You are free to edit `HEARTBEAT.md` with a short checklist or reminders. Keep it small to limit token burn.
 

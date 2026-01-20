@@ -203,15 +203,13 @@ actor PortGuardian {
         proc.standardOutput = pipe
         proc.standardError = Pipe()
         do {
-            try proc.run()
-            proc.waitUntilExit()
+            let data = try proc.runAndReadToEnd(from: pipe)
+            guard !data.isEmpty else { return nil }
+            return String(data: data, encoding: .utf8)?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
         } catch {
             return nil
         }
-        let data = pipe.fileHandleForReading.readToEndSafely()
-        guard !data.isEmpty else { return nil }
-        return String(data: data, encoding: .utf8)?
-            .trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     private static func parseListeners(from text: String) -> [Listener] {
@@ -344,14 +342,18 @@ actor PortGuardian {
 
     private func isExpected(_ listener: Listener, port: Int, mode: AppState.ConnectionMode) -> Bool {
         let cmd = listener.command.lowercased()
-        let expectedCommands = ["node", "clawdbot", "tsx", "pnpm", "bun"]
+        let full = listener.fullCommand.lowercased()
         switch mode {
         case .remote:
             // Remote mode expects an SSH tunnel for the gateway WebSocket port.
             if port == GatewayEnvironment.gatewayPort() { return cmd.contains("ssh") }
             return false
         case .local:
-            return expectedCommands.contains { cmd.contains($0) }
+            // The gateway daemon may listen as `clawdbot` or as its runtime (`node`, `bun`, etc).
+            if full.contains("gateway-daemon") { return true }
+            // If args are unavailable, treat a clawdbot listener as expected.
+            if cmd.contains("clawdbot"), full == cmd { return true }
+            return false
         case .unconfigured:
             return false
         }

@@ -1,9 +1,8 @@
-import { Type } from "@sinclair/typebox";
-
 import {
   browserCloseTab,
   browserFocusTab,
   browserOpenTab,
+  browserProfiles,
   browserSnapshot,
   browserStart,
   browserStatus,
@@ -20,116 +19,10 @@ import {
   browserScreenshotAction,
 } from "../../browser/client-actions.js";
 import { resolveBrowserConfig } from "../../browser/config.js";
+import { DEFAULT_AI_SNAPSHOT_MAX_CHARS } from "../../browser/constants.js";
 import { loadConfig } from "../../config/config.js";
-import {
-  type AnyAgentTool,
-  imageResultFromFile,
-  jsonResult,
-  readStringParam,
-} from "./common.js";
-
-const BROWSER_ACT_KINDS = [
-  "click",
-  "type",
-  "press",
-  "hover",
-  "drag",
-  "select",
-  "fill",
-  "resize",
-  "wait",
-  "evaluate",
-  "close",
-] as const;
-
-type BrowserActKind = (typeof BROWSER_ACT_KINDS)[number];
-
-// NOTE: Using a flattened object schema instead of Type.Union([Type.Object(...), ...])
-// because Claude API on Vertex AI rejects nested anyOf schemas as invalid JSON Schema.
-// The discriminator (kind) determines which properties are relevant; runtime validates.
-const BrowserActSchema = Type.Object({
-  kind: Type.Unsafe<BrowserActKind>({
-    type: "string",
-    enum: [...BROWSER_ACT_KINDS],
-  }),
-  // Common fields
-  targetId: Type.Optional(Type.String()),
-  ref: Type.Optional(Type.String()),
-  // click
-  doubleClick: Type.Optional(Type.Boolean()),
-  button: Type.Optional(Type.String()),
-  modifiers: Type.Optional(Type.Array(Type.String())),
-  // type
-  text: Type.Optional(Type.String()),
-  submit: Type.Optional(Type.Boolean()),
-  slowly: Type.Optional(Type.Boolean()),
-  // press
-  key: Type.Optional(Type.String()),
-  // drag
-  startRef: Type.Optional(Type.String()),
-  endRef: Type.Optional(Type.String()),
-  // select
-  values: Type.Optional(Type.Array(Type.String())),
-  // fill - use permissive array of objects
-  fields: Type.Optional(
-    Type.Array(Type.Object({}, { additionalProperties: true })),
-  ),
-  // resize
-  width: Type.Optional(Type.Number()),
-  height: Type.Optional(Type.Number()),
-  // wait
-  timeMs: Type.Optional(Type.Number()),
-  textGone: Type.Optional(Type.String()),
-  // evaluate
-  fn: Type.Optional(Type.String()),
-});
-
-// IMPORTANT: OpenAI function tool schemas must have a top-level `type: "object"`.
-// A root-level `Type.Union([...])` compiles to `{ anyOf: [...] }` (no `type`),
-// which OpenAI rejects ("Invalid schema ... type: None"). Keep this schema an object.
-const BrowserToolSchema = Type.Object({
-  action: Type.Union([
-    Type.Literal("status"),
-    Type.Literal("start"),
-    Type.Literal("stop"),
-    Type.Literal("tabs"),
-    Type.Literal("open"),
-    Type.Literal("focus"),
-    Type.Literal("close"),
-    Type.Literal("snapshot"),
-    Type.Literal("screenshot"),
-    Type.Literal("navigate"),
-    Type.Literal("console"),
-    Type.Literal("pdf"),
-    Type.Literal("upload"),
-    Type.Literal("dialog"),
-    Type.Literal("act"),
-  ]),
-  target: Type.Optional(
-    Type.Union([
-      Type.Literal("sandbox"),
-      Type.Literal("host"),
-      Type.Literal("custom"),
-    ]),
-  ),
-  profile: Type.Optional(Type.String()),
-  controlUrl: Type.Optional(Type.String()),
-  targetUrl: Type.Optional(Type.String()),
-  targetId: Type.Optional(Type.String()),
-  limit: Type.Optional(Type.Number()),
-  format: Type.Optional(Type.Union([Type.Literal("aria"), Type.Literal("ai")])),
-  fullPage: Type.Optional(Type.Boolean()),
-  ref: Type.Optional(Type.String()),
-  element: Type.Optional(Type.String()),
-  type: Type.Optional(Type.Union([Type.Literal("png"), Type.Literal("jpeg")])),
-  level: Type.Optional(Type.String()),
-  paths: Type.Optional(Type.Array(Type.String())),
-  inputRef: Type.Optional(Type.String()),
-  timeoutMs: Type.Optional(Type.Number()),
-  accept: Type.Optional(Type.Boolean()),
-  promptText: Type.Optional(Type.String()),
-  request: Type.Optional(BrowserActSchema),
-});
+import { BrowserToolSchema } from "./browser-tool.schema.js";
+import { type AnyAgentTool, imageResultFromFile, jsonResult, readStringParam } from "./common.js";
 
 function resolveBrowserBaseUrl(params: {
   target?: "sandbox" | "host" | "custom";
@@ -145,22 +38,13 @@ function resolveBrowserBaseUrl(params: {
   const normalizedControlUrl = params.controlUrl?.trim() ?? "";
   const normalizedDefault = params.defaultControlUrl?.trim() ?? "";
   const target =
-    params.target ??
-    (normalizedControlUrl ? "custom" : normalizedDefault ? "sandbox" : "host");
+    params.target ?? (normalizedControlUrl ? "custom" : normalizedDefault ? "sandbox" : "host");
 
   const assertAllowedControlUrl = (url: string) => {
-    const allowedUrls = params.allowedControlUrls?.map((entry) =>
-      entry.trim().replace(/\/$/, ""),
-    );
-    const allowedHosts = params.allowedControlHosts?.map((entry) =>
-      entry.trim().toLowerCase(),
-    );
+    const allowedUrls = params.allowedControlUrls?.map((entry) => entry.trim().replace(/\/$/, ""));
+    const allowedHosts = params.allowedControlHosts?.map((entry) => entry.trim().toLowerCase());
     const allowedPorts = params.allowedControlPorts;
-    if (
-      !allowedUrls?.length &&
-      !allowedHosts?.length &&
-      !allowedPorts?.length
-    ) {
+    if (!allowedUrls?.length && !allowedHosts?.length && !allowedPorts?.length) {
       return;
     }
     let parsed: URL;
@@ -174,21 +58,13 @@ function resolveBrowserBaseUrl(params: {
       throw new Error("Browser controlUrl is not in the allowed URL list.");
     }
     if (allowedHosts?.length && !allowedHosts.includes(parsed.hostname)) {
-      throw new Error(
-        "Browser controlUrl hostname is not in the allowed host list.",
-      );
+      throw new Error("Browser controlUrl hostname is not in the allowed host list.");
     }
     if (allowedPorts?.length) {
       const port =
-        parsed.port?.trim() !== ""
-          ? Number(parsed.port)
-          : parsed.protocol === "https:"
-            ? 443
-            : 80;
+        parsed.port?.trim() !== "" ? Number(parsed.port) : parsed.protocol === "https:" ? 443 : 80;
       if (!Number.isFinite(port) || !allowedPorts.includes(port)) {
-        throw new Error(
-          "Browser controlUrl port is not in the allowed port list.",
-        );
+        throw new Error("Browser controlUrl port is not in the allowed port list.");
       }
     }
   };
@@ -237,9 +113,7 @@ export function createBrowserTool(opts?: {
 }): AnyAgentTool {
   const targetDefault = opts?.defaultControlUrl ? "sandbox" : "host";
   const hostHint =
-    opts?.allowHostControl === false
-      ? "Host target blocked by policy."
-      : "Host target allowed.";
+    opts?.allowHostControl === false ? "Host target blocked by policy." : "Host target allowed.";
   const allowlistHint =
     opts?.allowedControlUrls?.length ||
     opts?.allowedControlHosts?.length ||
@@ -250,7 +124,12 @@ export function createBrowserTool(opts?: {
     label: "Browser",
     name: "browser",
     description: [
-      "Control clawd's dedicated browser (status/start/stop/tabs/open/snapshot/screenshot/actions).",
+      "Control the browser via Clawdbot's browser control server (status/start/stop/profiles/tabs/open/snapshot/screenshot/actions).",
+      'Profiles: use profile="chrome" for Chrome extension relay takeover (your existing Chrome tabs). Use profile="clawd" for the isolated clawd-managed browser.',
+      'If the user mentions the Chrome extension / Browser Relay / toolbar button / “attach tab”, ALWAYS use profile="chrome" (do not ask which profile).',
+      "Chrome extension relay needs an attached tab: user must click the Clawdbot Browser Relay toolbar icon on the tab (badge ON). If no tab is connected, ask them to attach it.",
+      "When using refs from snapshot (e.g. e12), keep the same tab: prefer passing targetId from the snapshot response into subsequent actions (act/click/type/etc).",
+      'For stable, self-resolving refs across calls, use snapshot with refs="aria" (Playwright aria-ref ids). Default refs="role" are role+name-based.',
       "Use snapshot+act for UI automation. Avoid act:wait by default; use only in exceptional cases when no reliable UI state exists.",
       `target selects browser location (sandbox|host|custom). Default: ${targetDefault}.`,
       "controlUrl implies target=custom (remote control server).",
@@ -262,12 +141,12 @@ export function createBrowserTool(opts?: {
       const params = args as Record<string, unknown>;
       const action = readStringParam(params, "action", { required: true });
       const controlUrl = readStringParam(params, "controlUrl");
-      const target = readStringParam(params, "target") as
-        | "sandbox"
-        | "host"
-        | "custom"
-        | undefined;
       const profile = readStringParam(params, "profile");
+      let target = readStringParam(params, "target") as "sandbox" | "host" | "custom" | undefined;
+      if (profile === "chrome" && !target && !controlUrl?.trim()) {
+        // Chrome extension relay takeover is a host Chrome feature; default to host even in sandboxed sessions.
+        target = "host";
+      }
       const baseUrl = resolveBrowserBaseUrl({
         target,
         controlUrl,
@@ -287,15 +166,15 @@ export function createBrowserTool(opts?: {
         case "stop":
           await browserStop(baseUrl, { profile });
           return jsonResult(await browserStatus(baseUrl, { profile }));
+        case "profiles":
+          return jsonResult({ profiles: await browserProfiles(baseUrl) });
         case "tabs":
           return jsonResult({ tabs: await browserTabs(baseUrl, { profile }) });
         case "open": {
           const targetUrl = readStringParam(params, "targetUrl", {
             required: true,
           });
-          return jsonResult(
-            await browserOpenTab(baseUrl, targetUrl, { profile }),
-          );
+          return jsonResult(await browserOpenTab(baseUrl, targetUrl, { profile }));
         }
         case "focus": {
           const targetId = readStringParam(params, "targetId", {
@@ -312,24 +191,65 @@ export function createBrowserTool(opts?: {
         }
         case "snapshot": {
           const format =
-            params.format === "ai" || params.format === "aria"
-              ? (params.format as "ai" | "aria")
+            params.snapshotFormat === "ai" || params.snapshotFormat === "aria"
+              ? (params.snapshotFormat as "ai" | "aria")
               : "ai";
-          const targetId =
-            typeof params.targetId === "string"
-              ? params.targetId.trim()
-              : undefined;
+          const mode = params.mode === "efficient" ? "efficient" : undefined;
+          const labels = typeof params.labels === "boolean" ? params.labels : undefined;
+          const refs = params.refs === "aria" || params.refs === "role" ? params.refs : undefined;
+          const hasMaxChars = Object.hasOwn(params, "maxChars");
+          const targetId = typeof params.targetId === "string" ? params.targetId.trim() : undefined;
           const limit =
             typeof params.limit === "number" && Number.isFinite(params.limit)
               ? params.limit
               : undefined;
+          const maxChars =
+            typeof params.maxChars === "number" &&
+            Number.isFinite(params.maxChars) &&
+            params.maxChars > 0
+              ? Math.floor(params.maxChars)
+              : undefined;
+          const resolvedMaxChars =
+            format === "ai"
+              ? hasMaxChars
+                ? maxChars
+                : mode === "efficient"
+                  ? undefined
+                  : DEFAULT_AI_SNAPSHOT_MAX_CHARS
+              : undefined;
+          const interactive =
+            typeof params.interactive === "boolean" ? params.interactive : undefined;
+          const compact = typeof params.compact === "boolean" ? params.compact : undefined;
+          const depth =
+            typeof params.depth === "number" && Number.isFinite(params.depth)
+              ? params.depth
+              : undefined;
+          const selector = typeof params.selector === "string" ? params.selector.trim() : undefined;
+          const frame = typeof params.frame === "string" ? params.frame.trim() : undefined;
           const snapshot = await browserSnapshot(baseUrl, {
             format,
             targetId,
             limit,
+            ...(typeof resolvedMaxChars === "number" ? { maxChars: resolvedMaxChars } : {}),
+            refs,
+            interactive,
+            compact,
+            depth,
+            selector,
+            frame,
+            labels,
+            mode,
             profile,
           });
           if (snapshot.format === "ai") {
+            if (labels && snapshot.imagePath) {
+              return await imageResultFromFile({
+                label: "browser:snapshot",
+                path: snapshot.imagePath,
+                extraText: snapshot.snapshot,
+                details: snapshot,
+              });
+            }
             return {
               content: [{ type: "text", text: snapshot.snapshot }],
               details: snapshot,
@@ -371,21 +291,12 @@ export function createBrowserTool(opts?: {
           );
         }
         case "console": {
-          const level =
-            typeof params.level === "string" ? params.level.trim() : undefined;
-          const targetId =
-            typeof params.targetId === "string"
-              ? params.targetId.trim()
-              : undefined;
-          return jsonResult(
-            await browserConsoleMessages(baseUrl, { level, targetId, profile }),
-          );
+          const level = typeof params.level === "string" ? params.level.trim() : undefined;
+          const targetId = typeof params.targetId === "string" ? params.targetId.trim() : undefined;
+          return jsonResult(await browserConsoleMessages(baseUrl, { level, targetId, profile }));
         }
         case "pdf": {
-          const targetId =
-            typeof params.targetId === "string"
-              ? params.targetId.trim()
-              : undefined;
+          const targetId = typeof params.targetId === "string" ? params.targetId.trim() : undefined;
           const result = await browserPdfSave(baseUrl, { targetId, profile });
           return {
             content: [{ type: "text", text: `FILE:${result.path}` }],
@@ -393,20 +304,14 @@ export function createBrowserTool(opts?: {
           };
         }
         case "upload": {
-          const paths = Array.isArray(params.paths)
-            ? params.paths.map((p) => String(p))
-            : [];
+          const paths = Array.isArray(params.paths) ? params.paths.map((p) => String(p)) : [];
           if (paths.length === 0) throw new Error("paths required");
           const ref = readStringParam(params, "ref");
           const inputRef = readStringParam(params, "inputRef");
           const element = readStringParam(params, "element");
-          const targetId =
-            typeof params.targetId === "string"
-              ? params.targetId.trim()
-              : undefined;
+          const targetId = typeof params.targetId === "string" ? params.targetId.trim() : undefined;
           const timeoutMs =
-            typeof params.timeoutMs === "number" &&
-            Number.isFinite(params.timeoutMs)
+            typeof params.timeoutMs === "number" && Number.isFinite(params.timeoutMs)
               ? params.timeoutMs
               : undefined;
           return jsonResult(
@@ -423,17 +328,10 @@ export function createBrowserTool(opts?: {
         }
         case "dialog": {
           const accept = Boolean(params.accept);
-          const promptText =
-            typeof params.promptText === "string"
-              ? params.promptText
-              : undefined;
-          const targetId =
-            typeof params.targetId === "string"
-              ? params.targetId.trim()
-              : undefined;
+          const promptText = typeof params.promptText === "string" ? params.promptText : undefined;
+          const targetId = typeof params.targetId === "string" ? params.targetId.trim() : undefined;
           const timeoutMs =
-            typeof params.timeoutMs === "number" &&
-            Number.isFinite(params.timeoutMs)
+            typeof params.timeoutMs === "number" && Number.isFinite(params.timeoutMs)
               ? params.timeoutMs
               : undefined;
           return jsonResult(
@@ -451,12 +349,26 @@ export function createBrowserTool(opts?: {
           if (!request || typeof request !== "object") {
             throw new Error("request required");
           }
-          const result = await browserAct(
-            baseUrl,
-            request as Parameters<typeof browserAct>[1],
-            { profile },
-          );
-          return jsonResult(result);
+          try {
+            const result = await browserAct(baseUrl, request as Parameters<typeof browserAct>[1], {
+              profile,
+            });
+            return jsonResult(result);
+          } catch (err) {
+            const msg = String(err);
+            if (msg.includes("404:") && msg.includes("tab not found") && profile === "chrome") {
+              const tabs = await browserTabs(baseUrl, { profile }).catch(() => []);
+              if (!tabs.length) {
+                throw new Error(
+                  "No Chrome tabs are attached via the Clawdbot Browser Relay extension. Click the toolbar icon on the tab you want to control (badge ON), then retry.",
+                );
+              }
+              throw new Error(
+                `Chrome tab not found (stale targetId?). Run action=tabs profile="chrome" and use one of the returned targetIds.`,
+              );
+            }
+            throw err;
+          }
         }
         default:
           throw new Error(`Unknown action: ${action}`);

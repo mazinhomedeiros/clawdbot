@@ -1,11 +1,12 @@
 import ClawdbotChatUI
+import ClawdbotKit
 import ClawdbotProtocol
 import Foundation
 import OSLog
 
 private let gatewayConnectionLogger = Logger(subsystem: "com.clawdbot", category: "gateway.connection")
 
-enum GatewayAgentProvider: String, Codable, CaseIterable, Sendable {
+enum GatewayAgentChannel: String, Codable, CaseIterable, Sendable {
     case last
     case whatsapp
     case telegram
@@ -18,7 +19,7 @@ enum GatewayAgentProvider: String, Codable, CaseIterable, Sendable {
 
     init(raw: String?) {
         let normalized = (raw ?? "").trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        self = GatewayAgentProvider(rawValue: normalized) ?? .last
+        self = GatewayAgentChannel(rawValue: normalized) ?? .last
     }
 
     var isDeliverable: Bool { self != .webchat }
@@ -32,7 +33,7 @@ struct GatewayAgentInvocation: Sendable {
     var thinking: String?
     var deliver: Bool = false
     var to: String?
-    var provider: GatewayAgentProvider = .last
+    var channel: GatewayAgentChannel = .last
     var timeoutSeconds: Int?
     var idempotencyKey: String = UUID().uuidString
 }
@@ -52,9 +53,11 @@ actor GatewayConnection {
         case setHeartbeats = "set-heartbeats"
         case systemEvent = "system-event"
         case health
-        case providersStatus = "providers.status"
+        case channelsStatus = "channels.status"
         case configGet = "config.get"
         case configSet = "config.set"
+        case configPatch = "config.patch"
+        case configSchema = "config.schema"
         case wizardStart = "wizard.start"
         case wizardNext = "wizard.next"
         case wizardCancel = "wizard.cancel"
@@ -62,7 +65,7 @@ actor GatewayConnection {
         case talkMode = "talk.mode"
         case webLoginStart = "web.login.start"
         case webLoginWait = "web.login.wait"
-        case providersLogout = "providers.logout"
+        case channelsLogout = "channels.logout"
         case modelsList = "models.list"
         case chatHistory = "chat.history"
         case chatSend = "chat.send"
@@ -74,6 +77,10 @@ actor GatewayConnection {
         case voicewakeSet = "voicewake.set"
         case nodePairApprove = "node.pair.approve"
         case nodePairReject = "node.pair.reject"
+        case devicePairList = "device.pair.list"
+        case devicePairApprove = "device.pair.approve"
+        case devicePairReject = "device.pair.reject"
+        case execApprovalResolve = "exec.approval.resolve"
         case cronList = "cron.list"
         case cronRuns = "cron.runs"
         case cronRun = "cron.run"
@@ -232,7 +239,25 @@ actor GatewayConnection {
 
     func canvasHostUrl() async -> String? {
         guard let snapshot = self.lastSnapshot else { return nil }
-        let trimmed = snapshot.canvashosturl?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let trimmed = snapshot.canvashosturl?.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines) ?? ""
+        return trimmed.isEmpty ? nil : trimmed
+    }
+
+    private func sessionDefaultString(_ defaults: [String: AnyCodable]?, key: String) -> String {
+        (defaults?[key]?.stringValue ?? "")
+            .trimmingCharacters(in: CharacterSet.whitespacesAndNewlines)
+    }
+
+    func cachedMainSessionKey() -> String? {
+        guard let snapshot = self.lastSnapshot else { return nil }
+        let trimmed = self.sessionDefaultString(snapshot.snapshot.sessiondefaults, key: "mainSessionKey")
+        return trimmed.isEmpty ? nil : trimmed
+    }
+
+    func cachedGatewayVersion() -> String? {
+        guard let snapshot = self.lastSnapshot else { return nil }
+        let raw = snapshot.server["version"]?.value as? String
+        let trimmed = raw?.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines) ?? ""
         return trimmed.isEmpty ? nil : trimmed
     }
 
@@ -267,10 +292,33 @@ actor GatewayConnection {
     private func broadcast(_ push: GatewayPush) {
         if case let .snapshot(snapshot) = push {
             self.lastSnapshot = snapshot
+            if let mainSessionKey = self.cachedMainSessionKey() {
+                Task { @MainActor in
+                    WorkActivityStore.shared.setMainSessionKey(mainSessionKey)
+                }
+            }
         }
         for (_, continuation) in self.subscribers {
             continuation.yield(push)
         }
+    }
+
+    private func canonicalizeSessionKey(_ raw: String) -> String {
+        let trimmed = raw.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return trimmed }
+        guard let defaults = self.lastSnapshot?.snapshot.sessiondefaults else { return trimmed }
+        let mainSessionKey = self.sessionDefaultString(defaults, key: "mainSessionKey")
+        guard !mainSessionKey.isEmpty else { return trimmed }
+        let mainKey = self.sessionDefaultString(defaults, key: "mainKey")
+        let defaultAgentId = self.sessionDefaultString(defaults, key: "defaultAgentId")
+        let isMainAlias =
+            trimmed == "main" ||
+            (!mainKey.isEmpty && trimmed == mainKey) ||
+            trimmed == mainSessionKey ||
+            (!defaultAgentId.isEmpty &&
+                (trimmed == "agent:\(defaultAgentId):main" ||
+                    (mainKey.isEmpty == false && trimmed == "agent:\(defaultAgentId):\(mainKey)")))
+        return isMainAlias ? mainSessionKey : trimmed
     }
 
     private func configure(url: URL, token: String?, password: String?) async {
@@ -331,6 +379,9 @@ extension GatewayConnection {
     }
 
     func mainSessionKey(timeoutMs: Double = 15000) async -> String {
+        if let cached = self.cachedMainSessionKey() {
+            return cached
+        }
         do {
             let data = try await self.requestRaw(method: "config.get", params: nil, timeoutMs: timeoutMs)
             return try Self.mainSessionKey(fromConfigGetData: data)
@@ -361,14 +412,15 @@ extension GatewayConnection {
     func sendAgent(_ invocation: GatewayAgentInvocation) async -> (ok: Bool, error: String?) {
         let trimmed = invocation.message.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return (false, "message empty") }
+        let sessionKey = self.canonicalizeSessionKey(invocation.sessionKey)
 
         var params: [String: AnyCodable] = [
             "message": AnyCodable(trimmed),
-            "sessionKey": AnyCodable(invocation.sessionKey),
+            "sessionKey": AnyCodable(sessionKey),
             "thinking": AnyCodable(invocation.thinking ?? "default"),
             "deliver": AnyCodable(invocation.deliver),
             "to": AnyCodable(invocation.to ?? ""),
-            "provider": AnyCodable(invocation.provider.rawValue),
+            "channel": AnyCodable(invocation.channel.rawValue),
             "idempotencyKey": AnyCodable(invocation.idempotencyKey),
         ]
         if let timeout = invocation.timeoutSeconds {
@@ -389,7 +441,7 @@ extension GatewayConnection {
         sessionKey: String,
         deliver: Bool,
         to: String?,
-        provider: GatewayAgentProvider = .last,
+        channel: GatewayAgentChannel = .last,
         timeoutSeconds: Int? = nil,
         idempotencyKey: String = UUID().uuidString) async -> (ok: Bool, error: String?)
     {
@@ -399,7 +451,7 @@ extension GatewayConnection {
             thinking: thinking,
             deliver: deliver,
             to: to,
-            provider: provider,
+            channel: channel,
             timeoutSeconds: timeoutSeconds,
             idempotencyKey: idempotencyKey))
     }
@@ -468,7 +520,8 @@ extension GatewayConnection {
         limit: Int? = nil,
         timeoutMs: Int? = nil) async throws -> ClawdbotChatHistoryPayload
     {
-        var params: [String: AnyCodable] = ["sessionKey": AnyCodable(sessionKey)]
+        let resolvedKey = self.canonicalizeSessionKey(sessionKey)
+        var params: [String: AnyCodable] = ["sessionKey": AnyCodable(resolvedKey)]
         if let limit { params["limit"] = AnyCodable(limit) }
         let timeout = timeoutMs.map { Double($0) }
         return try await self.requestDecoded(
@@ -485,8 +538,9 @@ extension GatewayConnection {
         attachments: [ClawdbotChatAttachmentPayload],
         timeoutMs: Int = 30000) async throws -> ClawdbotChatSendResponse
     {
+        let resolvedKey = self.canonicalizeSessionKey(sessionKey)
         var params: [String: AnyCodable] = [
-            "sessionKey": AnyCodable(sessionKey),
+            "sessionKey": AnyCodable(resolvedKey),
             "message": AnyCodable(message),
             "thinking": AnyCodable(thinking),
             "idempotencyKey": AnyCodable(idempotencyKey),
@@ -512,10 +566,11 @@ extension GatewayConnection {
     }
 
     func chatAbort(sessionKey: String, runId: String) async throws -> Bool {
+        let resolvedKey = self.canonicalizeSessionKey(sessionKey)
         struct AbortResponse: Decodable { let ok: Bool?; let aborted: Bool? }
         let res: AbortResponse = try await self.requestDecoded(
             method: .chatAbort,
-            params: ["sessionKey": AnyCodable(sessionKey), "runId": AnyCodable(runId)])
+            params: ["sessionKey": AnyCodable(resolvedKey), "runId": AnyCodable(runId)])
         return res.aborted ?? false
     }
 
@@ -556,6 +611,22 @@ extension GatewayConnection {
     func nodePairReject(requestId: String) async throws {
         try await self.requestVoid(
             method: .nodePairReject,
+            params: ["requestId": AnyCodable(requestId)],
+            timeoutMs: 10000)
+    }
+
+    // MARK: - Device pairing
+
+    func devicePairApprove(requestId: String) async throws {
+        try await self.requestVoid(
+            method: .devicePairApprove,
+            params: ["requestId": AnyCodable(requestId)],
+            timeoutMs: 10000)
+    }
+
+    func devicePairReject(requestId: String) async throws {
+        try await self.requestVoid(
+            method: .devicePairReject,
             params: ["requestId": AnyCodable(requestId)],
             timeoutMs: 10000)
     }
