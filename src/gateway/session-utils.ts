@@ -1,13 +1,9 @@
 import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
+
 import { resolveDefaultAgentId } from "../agents/agent-scope.js";
 import { lookupContextTokens } from "../agents/context.js";
-import {
-  DEFAULT_CONTEXT_TOKENS,
-  DEFAULT_MODEL,
-  DEFAULT_PROVIDER,
-} from "../agents/defaults.js";
+import { DEFAULT_CONTEXT_TOKENS, DEFAULT_MODEL, DEFAULT_PROVIDER } from "../agents/defaults.js";
 import { resolveConfiguredModelRef } from "../agents/model-selection.js";
 import { type ClawdbotConfig, loadConfig } from "../config/config.js";
 import { resolveStateDir } from "../config/paths.js";
@@ -16,7 +12,6 @@ import {
   canonicalizeMainSessionAlias,
   loadSessionStore,
   resolveMainSessionKey,
-  resolveSessionTranscriptPath,
   resolveStorePath,
   type SessionEntry,
   type SessionScope,
@@ -26,144 +21,27 @@ import {
   normalizeMainKey,
   parseAgentSessionKey,
 } from "../routing/session-key.js";
+import { normalizeSessionDeliveryFields } from "../utils/delivery-context.js";
+import type {
+  GatewayAgentRow,
+  GatewaySessionRow,
+  GatewaySessionsDefaults,
+  SessionsListResult,
+} from "./session-utils.types.js";
 
-export type GatewaySessionsDefaults = {
-  model: string | null;
-  contextTokens: number | null;
-};
-
-export type GatewaySessionRow = {
-  key: string;
-  kind: "direct" | "group" | "global" | "unknown";
-  label?: string;
-  displayName?: string;
-  channel?: string;
-  subject?: string;
-  room?: string;
-  space?: string;
-  chatType?: "direct" | "group" | "room";
-  updatedAt: number | null;
-  sessionId?: string;
-  systemSent?: boolean;
-  abortedLastRun?: boolean;
-  thinkingLevel?: string;
-  verboseLevel?: string;
-  reasoningLevel?: string;
-  elevatedLevel?: string;
-  sendPolicy?: "allow" | "deny";
-  inputTokens?: number;
-  outputTokens?: number;
-  totalTokens?: number;
-  responseUsage?: "on" | "off";
-  modelProvider?: string;
-  model?: string;
-  contextTokens?: number;
-  lastChannel?: SessionEntry["lastChannel"];
-  lastTo?: string;
-  lastAccountId?: string;
-};
-
-export type GatewayAgentRow = {
-  id: string;
-  name?: string;
-};
-
-export type SessionsListResult = {
-  ts: number;
-  path: string;
-  count: number;
-  defaults: GatewaySessionsDefaults;
-  sessions: GatewaySessionRow[];
-};
-
-export type SessionsPatchResult = {
-  ok: true;
-  path: string;
-  key: string;
-  entry: SessionEntry;
-};
-
-export function readSessionMessages(
-  sessionId: string,
-  storePath: string | undefined,
-  sessionFile?: string,
-): unknown[] {
-  const candidates = resolveSessionTranscriptCandidates(
-    sessionId,
-    storePath,
-    sessionFile,
-  );
-
-  const filePath = candidates.find((p) => fs.existsSync(p));
-  if (!filePath) return [];
-
-  const lines = fs.readFileSync(filePath, "utf-8").split(/\r?\n/);
-  const messages: unknown[] = [];
-  for (const line of lines) {
-    if (!line.trim()) continue;
-    try {
-      const parsed = JSON.parse(line);
-      if (parsed?.message) {
-        messages.push(parsed.message);
-      }
-    } catch {
-      // ignore bad lines
-    }
-  }
-  return messages;
-}
-
-export function resolveSessionTranscriptCandidates(
-  sessionId: string,
-  storePath: string | undefined,
-  sessionFile?: string,
-  agentId?: string,
-): string[] {
-  const candidates: string[] = [];
-  if (sessionFile) candidates.push(sessionFile);
-  if (storePath) {
-    const dir = path.dirname(storePath);
-    candidates.push(path.join(dir, `${sessionId}.jsonl`));
-  }
-  if (agentId) {
-    candidates.push(resolveSessionTranscriptPath(sessionId, agentId));
-  }
-  candidates.push(
-    path.join(os.homedir(), ".clawdbot", "sessions", `${sessionId}.jsonl`),
-  );
-  return candidates;
-}
-
-export function archiveFileOnDisk(filePath: string, reason: string): string {
-  const ts = new Date().toISOString().replaceAll(":", "-");
-  const archived = `${filePath}.${reason}.${ts}`;
-  fs.renameSync(filePath, archived);
-  return archived;
-}
-
-function jsonUtf8Bytes(value: unknown): number {
-  try {
-    return Buffer.byteLength(JSON.stringify(value), "utf8");
-  } catch {
-    return Buffer.byteLength(String(value), "utf8");
-  }
-}
-
-export function capArrayByJsonBytes<T>(
-  items: T[],
-  maxBytes: number,
-): { items: T[]; bytes: number } {
-  if (items.length === 0) return { items, bytes: 2 };
-  const parts = items.map((item) => jsonUtf8Bytes(item));
-  let bytes = 2 + parts.reduce((a, b) => a + b, 0) + (items.length - 1);
-  let start = 0;
-  while (bytes > maxBytes && start < items.length - 1) {
-    bytes -= parts[start] + 1;
-    start += 1;
-  }
-  const next = start > 0 ? items.slice(start) : items;
-  return { items: next, bytes };
-}
+export {
+  archiveFileOnDisk,
+  capArrayByJsonBytes,
+  readSessionMessages,
+  resolveSessionTranscriptCandidates,
+} from "./session-utils.fs.js";
+export type {
+  GatewayAgentRow,
+  GatewaySessionRow,
+  GatewaySessionsDefaults,
+  SessionsListResult,
+  SessionsPatchResult,
+} from "./session-utils.types.js";
 
 export function loadSessionEntry(sessionKey: string) {
   const cfg = loadConfig();
@@ -172,28 +50,17 @@ export function loadSessionEntry(sessionKey: string) {
   const agentId = resolveSessionStoreAgentId(cfg, canonicalKey);
   const storePath = resolveStorePath(sessionCfg?.store, { agentId });
   const store = loadSessionStore(storePath);
-  const parsed = parseAgentSessionKey(canonicalKey);
-  const legacyKey =
-    parsed?.rest ?? parseAgentSessionKey(sessionKey)?.rest ?? undefined;
-  const entry =
-    store[canonicalKey] ??
-    store[sessionKey] ??
-    (legacyKey ? store[legacyKey] : undefined);
+  const entry = store[canonicalKey];
   return { cfg, storePath, store, entry, canonicalKey };
 }
 
-export function classifySessionKey(
-  key: string,
-  entry?: SessionEntry,
-): GatewaySessionRow["kind"] {
+export function classifySessionKey(key: string, entry?: SessionEntry): GatewaySessionRow["kind"] {
   if (key === "global") return "global";
   if (key === "unknown") return "unknown";
-  if (entry?.chatType === "group" || entry?.chatType === "room") return "group";
-  if (
-    key.startsWith("group:") ||
-    key.includes(":group:") ||
-    key.includes(":channel:")
-  ) {
+  if (entry?.chatType === "group" || entry?.chatType === "channel") {
+    return "group";
+  }
+  if (key.includes(":group:") || key.includes(":channel:")) {
     return "group";
   }
   return "direct";
@@ -204,10 +71,6 @@ export function parseGroupKey(
 ): { channel?: string; kind?: "group" | "channel"; id?: string } | null {
   const agentParsed = parseAgentSessionKey(key);
   const rawKey = agentParsed?.rest ?? key;
-  if (rawKey.startsWith("group:")) {
-    const raw = rawKey.slice("group:".length);
-    return raw ? { id: raw } : null;
-  }
   const parts = rawKey.split(":").filter(Boolean);
   if (parts.length >= 3) {
     const [channel, kind, ...rest] = parts;
@@ -278,10 +141,7 @@ export function listAgentsForGateway(cfg: ClawdbotConfig): {
   for (const entry of cfg.agents?.list ?? []) {
     if (!entry?.id) continue;
     configuredById.set(normalizeAgentId(entry.id), {
-      name:
-        typeof entry.name === "string" && entry.name.trim()
-          ? entry.name.trim()
-          : undefined,
+      name: typeof entry.name === "string" && entry.name.trim() ? entry.name.trim() : undefined,
     });
   }
   const explicitIds = new Set(
@@ -289,8 +149,7 @@ export function listAgentsForGateway(cfg: ClawdbotConfig): {
       .map((entry) => (entry?.id ? normalizeAgentId(entry.id) : ""))
       .filter(Boolean),
   );
-  const allowedIds =
-    explicitIds.size > 0 ? new Set([...explicitIds, defaultId]) : null;
+  const allowedIds = explicitIds.size > 0 ? new Set([...explicitIds, defaultId]) : null;
   let agentIds = listConfiguredAgentIds(cfg).filter((id) =>
     allowedIds ? allowedIds.has(id) : true,
   );
@@ -345,10 +204,7 @@ export function resolveSessionStoreKey(params: {
   return canonicalizeSessionKeyForAgent(agentId, raw);
 }
 
-function resolveSessionStoreAgentId(
-  cfg: ClawdbotConfig,
-  canonicalKey: string,
-): string {
+function resolveSessionStoreAgentId(cfg: ClawdbotConfig, canonicalKey: string): string {
   if (canonicalKey === "global" || canonicalKey === "unknown") {
     return resolveDefaultStoreAgentId(cfg);
   }
@@ -357,10 +213,7 @@ function resolveSessionStoreAgentId(
   return resolveDefaultStoreAgentId(cfg);
 }
 
-function canonicalizeSpawnedByForAgent(
-  agentId: string,
-  spawnedBy?: string,
-): string | undefined {
+function canonicalizeSpawnedByForAgent(agentId: string, spawnedBy?: string): string | undefined {
   const raw = spawnedBy?.trim();
   if (!raw) return undefined;
   if (raw === "global" || raw === "unknown") return raw;
@@ -368,10 +221,7 @@ function canonicalizeSpawnedByForAgent(
   return `agent:${normalizeAgentId(agentId)}:${raw}`;
 }
 
-export function resolveGatewaySessionStoreTarget(params: {
-  cfg: ClawdbotConfig;
-  key: string;
-}): {
+export function resolveGatewaySessionStoreTarget(params: { cfg: ClawdbotConfig; key: string }): {
   agentId: string;
   storePath: string;
   canonicalKey: string;
@@ -391,10 +241,8 @@ export function resolveGatewaySessionStoreTarget(params: {
     return { agentId, storePath, canonicalKey, storeKeys };
   }
 
-  const parsed = parseAgentSessionKey(canonicalKey);
   const storeKeys = new Set<string>();
   storeKeys.add(canonicalKey);
-  if (parsed?.rest) storeKeys.add(parsed.rest);
   if (key && key !== canonicalKey) storeKeys.add(key);
   return {
     agentId,
@@ -418,10 +266,7 @@ export function loadCombinedSessionStoreForGateway(cfg: ClawdbotConfig): {
       const canonicalKey = canonicalizeSessionKeyForAgent(defaultAgentId, key);
       combined[canonicalKey] = {
         ...entry,
-        spawnedBy: canonicalizeSpawnedByForAgent(
-          defaultAgentId,
-          entry.spawnedBy,
-        ),
+        spawnedBy: canonicalizeSpawnedByForAgent(defaultAgentId, entry.spawnedBy),
       };
     }
     return { storePath, store: combined };
@@ -434,23 +279,22 @@ export function loadCombinedSessionStoreForGateway(cfg: ClawdbotConfig): {
     const store = loadSessionStore(storePath);
     for (const [key, entry] of Object.entries(store)) {
       const canonicalKey = canonicalizeSessionKeyForAgent(agentId, key);
+      // Merge with existing entry if present (avoid overwriting with less complete data)
+      const existing = combined[canonicalKey];
       combined[canonicalKey] = {
+        ...existing,
         ...entry,
-        spawnedBy: canonicalizeSpawnedByForAgent(agentId, entry.spawnedBy),
+        spawnedBy: canonicalizeSpawnedByForAgent(agentId, entry.spawnedBy ?? existing?.spawnedBy),
       };
     }
   }
 
   const storePath =
-    typeof storeConfig === "string" && storeConfig.trim()
-      ? storeConfig.trim()
-      : "(multiple)";
+    typeof storeConfig === "string" && storeConfig.trim() ? storeConfig.trim() : "(multiple)";
   return { storePath, store: combined };
 }
 
-export function getSessionDefaults(
-  cfg: ClawdbotConfig,
-): GatewaySessionsDefaults {
+export function getSessionDefaults(cfg: ClawdbotConfig): GatewaySessionsDefaults {
   const resolved = resolveConfiguredModelRef({
     cfg,
     defaultProvider: DEFAULT_PROVIDER,
@@ -461,6 +305,7 @@ export function getSessionDefaults(
     lookupContextTokens(resolved.model) ??
     DEFAULT_CONTEXT_TOKENS;
   return {
+    modelProvider: resolved.provider ?? null,
     model: resolved.model ?? null,
     contextTokens: contextTokens ?? null,
   };
@@ -498,11 +343,9 @@ export function listSessionsFromStore(params: {
   const includeUnknown = opts.includeUnknown === true;
   const spawnedBy = typeof opts.spawnedBy === "string" ? opts.spawnedBy : "";
   const label = typeof opts.label === "string" ? opts.label.trim() : "";
-  const agentId =
-    typeof opts.agentId === "string" ? normalizeAgentId(opts.agentId) : "";
+  const agentId = typeof opts.agentId === "string" ? normalizeAgentId(opts.agentId) : "";
   const activeMinutes =
-    typeof opts.activeMinutes === "number" &&
-    Number.isFinite(opts.activeMinutes)
+    typeof opts.activeMinutes === "number" && Number.isFinite(opts.activeMinutes)
       ? Math.max(1, Math.floor(opts.activeMinutes))
       : undefined;
 
@@ -535,21 +378,26 @@ export function listSessionsFromStore(params: {
       const parsed = parseGroupKey(key);
       const channel = entry?.channel ?? parsed?.channel;
       const subject = entry?.subject;
-      const room = entry?.room;
+      const groupChannel = entry?.groupChannel;
       const space = entry?.space;
       const id = parsed?.id;
+      const origin = entry?.origin;
+      const originLabel = origin?.label;
       const displayName =
         entry?.displayName ??
         (channel
           ? buildGroupDisplayName({
               provider: channel,
               subject,
-              room,
+              groupChannel,
               space,
               id,
               key,
             })
-          : undefined);
+          : undefined) ??
+        entry?.label ??
+        originLabel;
+      const deliveryFields = normalizeSessionDeliveryFields(entry);
       return {
         key,
         kind: classifySessionKey(key, entry),
@@ -557,9 +405,10 @@ export function listSessionsFromStore(params: {
         displayName,
         channel,
         subject,
-        room,
+        groupChannel,
         space,
         chatType: entry?.chatType,
+        origin,
         updatedAt,
         sessionId: entry?.sessionId,
         systemSent: entry?.systemSent,
@@ -576,9 +425,10 @@ export function listSessionsFromStore(params: {
         modelProvider: entry?.modelProvider,
         model: entry?.model,
         contextTokens: entry?.contextTokens,
-        lastChannel: entry?.lastChannel,
-        lastTo: entry?.lastTo,
-        lastAccountId: entry?.lastAccountId,
+        deliveryContext: deliveryFields.deliveryContext,
+        lastChannel: deliveryFields.lastChannel ?? entry?.lastChannel,
+        lastTo: deliveryFields.lastTo ?? entry?.lastTo,
+        lastAccountId: deliveryFields.lastAccountId ?? entry?.lastAccountId,
       } satisfies GatewaySessionRow;
     })
     .sort((a, b) => (b.updatedAt ?? 0) - (a.updatedAt ?? 0));

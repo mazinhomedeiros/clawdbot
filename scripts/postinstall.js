@@ -1,6 +1,8 @@
 import fs from "node:fs";
 import path from "node:path";
+import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import { setupGitHooks } from "./setup-git-hooks.js";
 
 function detectPackageManager(ua = process.env.npm_config_user_agent ?? "") {
   // Examples:
@@ -35,6 +37,11 @@ function ensureExecutable(targetPath) {
   } catch (err) {
     console.warn(`[postinstall] chmod failed: ${err}`);
   }
+}
+
+function hasGit(repoRoot) {
+  const result = spawnSync("git", ["--version"], { cwd: repoRoot, stdio: "ignore" });
+  return result.status === 0;
 }
 
 function extractPackageName(key) {
@@ -149,6 +156,26 @@ function writeFileLines(targetPath, lines, hadTrailingNewline) {
 
 function applyHunk(lines, hunk, offset) {
   let cursor = hunk.oldStart - 1 + offset;
+  const expected = [];
+  for (const raw of hunk.lines) {
+    const marker = raw[0];
+    if (marker === " " || marker === "+") {
+      expected.push(raw.slice(1));
+    }
+  }
+  if (cursor >= 0 && cursor + expected.length <= lines.length) {
+    let alreadyApplied = true;
+    for (let i = 0; i < expected.length; i += 1) {
+      if (lines[cursor + i] !== expected[i]) {
+        alreadyApplied = false;
+        break;
+      }
+    }
+    if (alreadyApplied) {
+      const delta = hunk.newLines - hunk.oldLines;
+      return offset + delta;
+    }
+  }
 
   for (const raw of hunk.lines) {
     const marker = raw[0];
@@ -226,6 +253,7 @@ function main() {
   process.chdir(repoRoot);
 
   ensureExecutable(path.join(repoRoot, "dist", "entry.js"));
+  setupGitHooks({ repoRoot });
 
   if (!shouldApplyPnpmPatchedDependenciesFallback()) {
     return;
