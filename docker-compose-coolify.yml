@@ -35,7 +35,7 @@ volumes:
   clawdbot_workspace:
 
 
-# Expose a "clawdbot" command in PATH
-  RUN printf '#!/usr/bin/env sh\nexec node dist/index.js "$@"\n' > /usr/local/bin/clawdbot \
-    && chmod +x /usr/local/bin/clawdbot
+# # Expose a "clawdbot" command in PATH
+#   RUN printf '#!/usr/bin/env sh\nexec node dist/index.js "$@"\n' > /usr/local/bin/clawdbot \
+#     && chmod +x /usr/local/bin/clawdbot
 
