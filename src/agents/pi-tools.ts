@@ -44,6 +44,7 @@ import {
   collectExplicitAllowlist,
   expandPolicyWithPluginGroups,
   resolveToolProfilePolicy,
+  stripPluginOnlyAllowlist,
 } from "./tool-policy.js";
 import { getPluginToolMeta } from "../plugins/tools.js";
 
@@ -84,6 +85,7 @@ function resolveExecConfig(cfg: ClawdbotConfig | undefined) {
     pathPrepend: globalExec?.pathPrepend,
     backgroundMs: globalExec?.backgroundMs,
     timeoutSec: globalExec?.timeoutSec,
+    approvalRunningNoticeMs: globalExec?.approvalRunningNoticeMs,
     cleanupMs: globalExec?.cleanupMs,
     notifyOnExit: globalExec?.notifyOnExit,
     applyPatch: globalExec?.applyPatch,
@@ -102,6 +104,8 @@ export function createClawdbotCodingTools(options?: {
   exec?: ExecToolDefaults & ProcessToolDefaults;
   messageProvider?: string;
   agentAccountId?: string;
+  messageTo?: string;
+  messageThreadId?: string | number;
   sandbox?: SandboxContext | null;
   sessionKey?: string;
   agentDir?: string;
@@ -217,6 +221,8 @@ export function createClawdbotCodingTools(options?: {
     messageProvider: options?.messageProvider,
     backgroundMs: options?.exec?.backgroundMs ?? execConfig.backgroundMs,
     timeoutSec: options?.exec?.timeoutSec ?? execConfig.timeoutSec,
+    approvalRunningNoticeMs:
+      options?.exec?.approvalRunningNoticeMs ?? execConfig.approvalRunningNoticeMs,
     notifyOnExit: options?.exec?.notifyOnExit ?? execConfig.notifyOnExit,
     sandbox: sandbox
       ? {
@@ -265,6 +271,8 @@ export function createClawdbotCodingTools(options?: {
       agentSessionKey: options?.sessionKey,
       agentChannel: resolveGatewayMessageChannel(options?.messageProvider),
       agentAccountId: options?.agentAccountId,
+      agentTo: options?.messageTo,
+      agentThreadId: options?.messageThreadId,
       agentDir: options?.agentDir,
       sandboxRoot,
       workspaceDir: options?.workspaceDir,
@@ -291,12 +299,30 @@ export function createClawdbotCodingTools(options?: {
     tools,
     toolMeta: (tool) => getPluginToolMeta(tool as AnyAgentTool),
   });
-  const profilePolicyExpanded = expandPolicyWithPluginGroups(profilePolicy, pluginGroups);
-  const providerProfileExpanded = expandPolicyWithPluginGroups(providerProfilePolicy, pluginGroups);
-  const globalPolicyExpanded = expandPolicyWithPluginGroups(globalPolicy, pluginGroups);
-  const globalProviderExpanded = expandPolicyWithPluginGroups(globalProviderPolicy, pluginGroups);
-  const agentPolicyExpanded = expandPolicyWithPluginGroups(agentPolicy, pluginGroups);
-  const agentProviderExpanded = expandPolicyWithPluginGroups(agentProviderPolicy, pluginGroups);
+  const profilePolicyExpanded = expandPolicyWithPluginGroups(
+    stripPluginOnlyAllowlist(profilePolicy, pluginGroups),
+    pluginGroups,
+  );
+  const providerProfileExpanded = expandPolicyWithPluginGroups(
+    stripPluginOnlyAllowlist(providerProfilePolicy, pluginGroups),
+    pluginGroups,
+  );
+  const globalPolicyExpanded = expandPolicyWithPluginGroups(
+    stripPluginOnlyAllowlist(globalPolicy, pluginGroups),
+    pluginGroups,
+  );
+  const globalProviderExpanded = expandPolicyWithPluginGroups(
+    stripPluginOnlyAllowlist(globalProviderPolicy, pluginGroups),
+    pluginGroups,
+  );
+  const agentPolicyExpanded = expandPolicyWithPluginGroups(
+    stripPluginOnlyAllowlist(agentPolicy, pluginGroups),
+    pluginGroups,
+  );
+  const agentProviderExpanded = expandPolicyWithPluginGroups(
+    stripPluginOnlyAllowlist(agentProviderPolicy, pluginGroups),
+    pluginGroups,
+  );
   const sandboxPolicyExpanded = expandPolicyWithPluginGroups(sandbox?.tools, pluginGroups);
   const subagentPolicyExpanded = expandPolicyWithPluginGroups(subagentPolicy, pluginGroups);
 

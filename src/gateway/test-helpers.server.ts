@@ -3,11 +3,16 @@ import { type AddressInfo, createServer } from "node:net";
 import os from "node:os";
 import path from "node:path";
 
-import { afterEach, beforeEach, expect, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, expect, vi } from "vitest";
 import { WebSocket } from "ws";
 
 import { resolveMainSessionKeyFromConfig, type SessionEntry } from "../config/sessions.js";
 import { resetAgentRunContextForTest } from "../infra/agent-events.js";
+import {
+  loadOrCreateDeviceIdentity,
+  publicKeyRawBase64UrlFromPem,
+  signDevicePayload,
+} from "../infra/device-identity.js";
 import { drainSystemEvents, peekSystemEvents } from "../infra/system-events.js";
 import { rawDataToString } from "../infra/ws.js";
 import { resetLogger, setLoggerOverride } from "../logging.js";
@@ -16,6 +21,7 @@ import { getDeterministicFreePortBlock } from "../test-utils/ports.js";
 import { GATEWAY_CLIENT_MODES, GATEWAY_CLIENT_NAMES } from "../utils/message-channel.js";
 
 import { PROTOCOL_VERSION } from "./protocol/index.js";
+import { buildDeviceAuthPayload } from "./device-auth.js";
 import type { GatewayServerOptions } from "./server.js";
 import {
   agentCommand,
@@ -69,66 +75,79 @@ export async function writeSessionStore(params: {
   await fs.writeFile(storePath, JSON.stringify(store, null, 2), "utf-8");
 }
 
-export function installGatewayTestHooks() {
-  beforeEach(async () => {
-    // Some tests intentionally use fake timers; ensure they don't leak into gateway suites.
-    vi.useRealTimers();
-    setLoggerOverride({ level: "silent", consoleLevel: "silent" });
-    previousHome = process.env.HOME;
-    previousUserProfile = process.env.USERPROFILE;
-    previousStateDir = process.env.CLAWDBOT_STATE_DIR;
-    previousConfigPath = process.env.CLAWDBOT_CONFIG_PATH;
-    previousSkipBrowserControl = process.env.CLAWDBOT_SKIP_BROWSER_CONTROL_SERVER;
-    previousSkipGmailWatcher = process.env.CLAWDBOT_SKIP_GMAIL_WATCHER;
-    previousSkipCanvasHost = process.env.CLAWDBOT_SKIP_CANVAS_HOST;
-    tempHome = await fs.mkdtemp(path.join(os.tmpdir(), "clawdbot-gateway-home-"));
-    process.env.HOME = tempHome;
-    process.env.USERPROFILE = tempHome;
-    process.env.CLAWDBOT_STATE_DIR = path.join(tempHome, ".clawdbot");
-    delete process.env.CLAWDBOT_CONFIG_PATH;
-    process.env.CLAWDBOT_SKIP_BROWSER_CONTROL_SERVER = "1";
-    process.env.CLAWDBOT_SKIP_GMAIL_WATCHER = "1";
-    process.env.CLAWDBOT_SKIP_CANVAS_HOST = "1";
-    tempConfigRoot = path.join(tempHome, ".clawdbot-test");
-    setTestConfigRoot(tempConfigRoot);
-    sessionStoreSaveDelayMs.value = 0;
-    testTailnetIPv4.value = undefined;
-    testState.gatewayBind = undefined;
-    testState.gatewayAuth = undefined;
-    testState.hooksConfig = undefined;
-    testState.canvasHostPort = undefined;
-    testState.legacyIssues = [];
-    testState.legacyParsed = {};
-    testState.migrationConfig = null;
-    testState.migrationChanges = [];
-    testState.cronEnabled = false;
-    testState.cronStorePath = undefined;
-    testState.sessionConfig = undefined;
-    testState.sessionStorePath = undefined;
-    testState.agentConfig = undefined;
-    testState.agentsConfig = undefined;
-    testState.bindingsConfig = undefined;
-    testState.channelsConfig = undefined;
-    testState.allowFrom = undefined;
-    testIsNixMode.value = false;
-    cronIsolatedRun.mockClear();
-    agentCommand.mockClear();
-    embeddedRunMock.activeIds.clear();
-    embeddedRunMock.abortCalls = [];
-    embeddedRunMock.waitCalls = [];
-    embeddedRunMock.waitResults.clear();
-    drainSystemEvents(resolveMainSessionKeyFromConfig());
-    resetAgentRunContextForTest();
-    const mod = await serverModulePromise;
-    mod.__resetModelCatalogCacheForTest();
-    piSdkMock.enabled = false;
-    piSdkMock.discoverCalls = 0;
-    piSdkMock.models = [];
-  }, 60_000);
+async function setupGatewayTestHome() {
+  previousHome = process.env.HOME;
+  previousUserProfile = process.env.USERPROFILE;
+  previousStateDir = process.env.CLAWDBOT_STATE_DIR;
+  previousConfigPath = process.env.CLAWDBOT_CONFIG_PATH;
+  previousSkipBrowserControl = process.env.CLAWDBOT_SKIP_BROWSER_CONTROL_SERVER;
+  previousSkipGmailWatcher = process.env.CLAWDBOT_SKIP_GMAIL_WATCHER;
+  previousSkipCanvasHost = process.env.CLAWDBOT_SKIP_CANVAS_HOST;
+  tempHome = await fs.mkdtemp(path.join(os.tmpdir(), "clawdbot-gateway-home-"));
+  process.env.HOME = tempHome;
+  process.env.USERPROFILE = tempHome;
+  process.env.CLAWDBOT_STATE_DIR = path.join(tempHome, ".clawdbot");
+  delete process.env.CLAWDBOT_CONFIG_PATH;
+}
 
-  afterEach(async () => {
-    vi.useRealTimers();
-    resetLogger();
+function applyGatewaySkipEnv() {
+  process.env.CLAWDBOT_SKIP_BROWSER_CONTROL_SERVER = "1";
+  process.env.CLAWDBOT_SKIP_GMAIL_WATCHER = "1";
+  process.env.CLAWDBOT_SKIP_CANVAS_HOST = "1";
+}
+
+async function resetGatewayTestState(options: { uniqueConfigRoot: boolean }) {
+  // Some tests intentionally use fake timers; ensure they don't leak into gateway suites.
+  vi.useRealTimers();
+  setLoggerOverride({ level: "silent", consoleLevel: "silent" });
+  if (!tempHome) {
+    throw new Error("resetGatewayTestState called before temp home was initialized");
+  }
+  applyGatewaySkipEnv();
+  tempConfigRoot = options.uniqueConfigRoot
+    ? await fs.mkdtemp(path.join(tempHome, "clawdbot-test-"))
+    : path.join(tempHome, ".clawdbot-test");
+  setTestConfigRoot(tempConfigRoot);
+  sessionStoreSaveDelayMs.value = 0;
+  testTailnetIPv4.value = undefined;
+  testState.gatewayBind = undefined;
+  testState.gatewayAuth = undefined;
+  testState.gatewayControlUi = undefined;
+  testState.hooksConfig = undefined;
+  testState.canvasHostPort = undefined;
+  testState.legacyIssues = [];
+  testState.legacyParsed = {};
+  testState.migrationConfig = null;
+  testState.migrationChanges = [];
+  testState.cronEnabled = false;
+  testState.cronStorePath = undefined;
+  testState.sessionConfig = undefined;
+  testState.sessionStorePath = undefined;
+  testState.agentConfig = undefined;
+  testState.agentsConfig = undefined;
+  testState.bindingsConfig = undefined;
+  testState.channelsConfig = undefined;
+  testState.allowFrom = undefined;
+  testIsNixMode.value = false;
+  cronIsolatedRun.mockClear();
+  agentCommand.mockClear();
+  embeddedRunMock.activeIds.clear();
+  embeddedRunMock.abortCalls = [];
+  embeddedRunMock.waitCalls = [];
+  embeddedRunMock.waitResults.clear();
+  drainSystemEvents(resolveMainSessionKeyFromConfig());
+  resetAgentRunContextForTest();
+  const mod = await serverModulePromise;
+  mod.__resetModelCatalogCacheForTest();
+  piSdkMock.enabled = false;
+  piSdkMock.discoverCalls = 0;
+  piSdkMock.models = [];
+}
+
+async function cleanupGatewayTestHome(options: { restoreEnv: boolean }) {
+  vi.useRealTimers();
+  resetLogger();
+  if (options.restoreEnv) {
     if (previousHome === undefined) delete process.env.HOME;
     else process.env.HOME = previousHome;
     if (previousUserProfile === undefined) delete process.env.USERPROFILE;
@@ -144,16 +163,45 @@ export function installGatewayTestHooks() {
     else process.env.CLAWDBOT_SKIP_GMAIL_WATCHER = previousSkipGmailWatcher;
     if (previousSkipCanvasHost === undefined) delete process.env.CLAWDBOT_SKIP_CANVAS_HOST;
     else process.env.CLAWDBOT_SKIP_CANVAS_HOST = previousSkipCanvasHost;
-    if (tempHome) {
-      await fs.rm(tempHome, {
-        recursive: true,
-        force: true,
-        maxRetries: 20,
-        retryDelay: 25,
-      });
-      tempHome = undefined;
-    }
-    tempConfigRoot = undefined;
+  }
+  if (options.restoreEnv && tempHome) {
+    await fs.rm(tempHome, {
+      recursive: true,
+      force: true,
+      maxRetries: 20,
+      retryDelay: 25,
+    });
+    tempHome = undefined;
+  }
+  tempConfigRoot = undefined;
+}
+
+export function installGatewayTestHooks(options?: { scope?: "test" | "suite" }) {
+  const scope = options?.scope ?? "test";
+  if (scope === "suite") {
+    beforeAll(async () => {
+      await setupGatewayTestHome();
+      await resetGatewayTestState({ uniqueConfigRoot: true });
+    });
+    beforeEach(async () => {
+      await resetGatewayTestState({ uniqueConfigRoot: true });
+    }, 60_000);
+    afterEach(async () => {
+      await cleanupGatewayTestHome({ restoreEnv: false });
+    });
+    afterAll(async () => {
+      await cleanupGatewayTestHome({ restoreEnv: true });
+    });
+    return;
+  }
+
+  beforeEach(async () => {
+    await setupGatewayTestHome();
+    await resetGatewayTestState({ uniqueConfigRoot: false });
+  }, 60_000);
+
+  afterEach(async () => {
+    await cleanupGatewayTestHome({ restoreEnv: true });
   });
 }
 
@@ -268,10 +316,47 @@ export async function connectReq(
     caps?: string[];
     commands?: string[];
     permissions?: Record<string, boolean>;
+    device?: {
+      id: string;
+      publicKey: string;
+      signature: string;
+      signedAt: number;
+      nonce?: string;
+    } | null;
   },
 ): Promise<ConnectResponse> {
   const { randomUUID } = await import("node:crypto");
   const id = randomUUID();
+  const client = opts?.client ?? {
+    id: GATEWAY_CLIENT_NAMES.TEST,
+    version: "1.0.0",
+    platform: "test",
+    mode: GATEWAY_CLIENT_MODES.TEST,
+  };
+  const role = opts?.role ?? "operator";
+  const requestedScopes = Array.isArray(opts?.scopes) ? opts?.scopes : [];
+  const device = (() => {
+    if (opts?.device === null) return undefined;
+    if (opts?.device) return opts.device;
+    const identity = loadOrCreateDeviceIdentity();
+    const signedAtMs = Date.now();
+    const payload = buildDeviceAuthPayload({
+      deviceId: identity.deviceId,
+      clientId: client.id,
+      clientMode: client.mode,
+      role,
+      scopes: requestedScopes,
+      signedAtMs,
+      token: opts?.token ?? null,
+    });
+    return {
+      id: identity.deviceId,
+      publicKey: publicKeyRawBase64UrlFromPem(identity.publicKeyPem),
+      signature: signDevicePayload(identity.privateKeyPem, payload),
+      signedAt: signedAtMs,
+      nonce: opts?.device?.nonce,
+    };
+  })();
   ws.send(
     JSON.stringify({
       type: "req",
@@ -280,16 +365,11 @@ export async function connectReq(
       params: {
         minProtocol: opts?.minProtocol ?? PROTOCOL_VERSION,
         maxProtocol: opts?.maxProtocol ?? PROTOCOL_VERSION,
-        client: opts?.client ?? {
-          id: GATEWAY_CLIENT_NAMES.TEST,
-          version: "1.0.0",
-          platform: "test",
-          mode: GATEWAY_CLIENT_MODES.TEST,
-        },
+        client,
         caps: opts?.caps ?? [],
         commands: opts?.commands ?? [],
         permissions: opts?.permissions ?? undefined,
-        role: opts?.role,
+        role,
         scopes: opts?.scopes,
         auth:
           opts?.token || opts?.password
@@ -298,6 +378,7 @@ export async function connectReq(
                 password: opts?.password,
               }
             : undefined,
+        device,
       },
     }),
   );

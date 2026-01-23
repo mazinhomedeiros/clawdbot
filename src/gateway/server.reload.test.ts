@@ -1,5 +1,12 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { getFreePort, installGatewayTestHooks, startGatewayServer } from "./test-helpers.js";
+import {
+  connectOk,
+  getFreePort,
+  installGatewayTestHooks,
+  rpcReq,
+  startGatewayServer,
+  startServerWithClient,
+} from "./test-helpers.js";
 
 const hoisted = vi.hoisted(() => {
   const cronInstances: Array<{
@@ -21,7 +28,11 @@ const hoisted = vi.hoisted(() => {
   }));
 
   const heartbeatStop = vi.fn();
-  const startHeartbeatRunner = vi.fn(() => ({ stop: heartbeatStop }));
+  const heartbeatUpdateConfig = vi.fn();
+  const startHeartbeatRunner = vi.fn(() => ({
+    stop: heartbeatStop,
+    updateConfig: heartbeatUpdateConfig,
+  }));
 
   const startGmailWatcher = vi.fn(async () => ({ started: true }));
   const stopGmailWatcher = vi.fn(async () => {});
@@ -116,6 +127,7 @@ const hoisted = vi.hoisted(() => {
     browserStop,
     startBrowserControlServerIfEnabled,
     heartbeatStop,
+    heartbeatUpdateConfig,
     startHeartbeatRunner,
     startGmailWatcher,
     stopGmailWatcher,
@@ -153,7 +165,7 @@ vi.mock("./config-reload.js", () => ({
   startGatewayConfigReloader: hoisted.startGatewayConfigReloader,
 }));
 
-installGatewayTestHooks();
+installGatewayTestHooks({ scope: "suite" });
 
 describe("gateway hot reload", () => {
   let prevSkipChannels: string | undefined;
@@ -179,7 +191,7 @@ describe("gateway hot reload", () => {
     }
   });
 
-  it("applies hot reload actions for providers + services", async () => {
+  it("applies hot reload actions and emits restart signal", async () => {
     const port = await getFreePort();
     const server = await startGatewayServer(port);
 
@@ -237,8 +249,9 @@ describe("gateway hot reload", () => {
     expect(hoisted.browserStop).toHaveBeenCalledTimes(1);
     expect(hoisted.startBrowserControlServerIfEnabled).toHaveBeenCalledTimes(2);
 
-    expect(hoisted.startHeartbeatRunner).toHaveBeenCalledTimes(2);
-    expect(hoisted.heartbeatStop).toHaveBeenCalledTimes(1);
+    expect(hoisted.startHeartbeatRunner).toHaveBeenCalledTimes(1);
+    expect(hoisted.heartbeatUpdateConfig).toHaveBeenCalledTimes(1);
+    expect(hoisted.heartbeatUpdateConfig).toHaveBeenCalledWith(nextConfig);
 
     expect(hoisted.cronInstances.length).toBe(2);
     expect(hoisted.cronInstances[0].stop).toHaveBeenCalledTimes(1);
@@ -256,13 +269,6 @@ describe("gateway hot reload", () => {
     expect(hoisted.providerManager.startChannel).toHaveBeenCalledWith("signal");
     expect(hoisted.providerManager.stopChannel).toHaveBeenCalledWith("imessage");
     expect(hoisted.providerManager.startChannel).toHaveBeenCalledWith("imessage");
-
-    await server.close();
-  });
-
-  it("emits SIGUSR1 on restart plan when listener exists", async () => {
-    const port = await getFreePort();
-    const server = await startGatewayServer(port);
 
     const onRestart = hoisted.getOnRestart();
     expect(onRestart).toBeTypeOf("function");
@@ -289,6 +295,18 @@ describe("gateway hot reload", () => {
 
     expect(signalSpy).toHaveBeenCalledTimes(1);
 
+    await server.close();
+  });
+});
+
+describe("gateway agents", () => {
+  it("lists configured agents via agents.list RPC", async () => {
+    const { server, ws } = await startServerWithClient();
+    await connectOk(ws);
+    const res = await rpcReq<{ agents: Array<{ id: string }> }>(ws, "agents.list", {});
+    expect(res.ok).toBe(true);
+    expect(res.payload?.agents.map((agent) => agent.id)).toContain("main");
+    ws.close();
     await server.close();
   });
 });

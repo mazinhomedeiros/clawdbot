@@ -1,6 +1,6 @@
 import type { AgentBinding, AgentsConfig } from "./types.agents.js";
 import type { AuthConfig } from "./types.auth.js";
-import type { LoggingConfig, SessionConfig, WebConfig } from "./types.base.js";
+import type { DiagnosticsConfig, LoggingConfig, SessionConfig, WebConfig } from "./types.base.js";
 import type { BrowserConfig } from "./types.browser.js";
 import type { ChannelsConfig } from "./types.channels.js";
 import type { CronConfig } from "./types.cron.js";
@@ -53,10 +53,11 @@ export type ClawdbotConfig = {
     lastRunCommand?: string;
     lastRunMode?: "local" | "remote";
   };
+  diagnostics?: DiagnosticsConfig;
   logging?: LoggingConfig;
   update?: {
-    /** Update channel for npm installs ("stable" or "beta"). */
-    channel?: "stable" | "beta";
+    /** Update channel for git + npm installs ("stable", "beta", or "dev"). */
+    channel?: "stable" | "beta" | "dev";
     /** Check for updates on gateway start (npm installs only). */
     checkOnStart?: boolean;
   };
@@ -64,6 +65,12 @@ export type ClawdbotConfig = {
   ui?: {
     /** Accent color for Clawdbot UI chrome (hex). */
     seamColor?: string;
+    assistant?: {
+      /** Assistant display name for UI surfaces. */
+      name?: string;
+      /** Assistant avatar (emoji, short text, or image URL/data URI). */
+      avatar?: string;
+    };
   };
   skills?: SkillsConfig;
   plugins?: PluginsConfig;
@@ -105,5 +112,6 @@ export type ConfigFileSnapshot = {
   config: ClawdbotConfig;
   hash?: string;
   issues: ConfigValidationIssue[];
+  warnings: ConfigValidationIssue[];
   legacyIssues: LegacyConfigIssue[];
 };

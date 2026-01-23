@@ -248,6 +248,7 @@ export const SlackDmSchema = z
     allowFrom: z.array(z.union([z.string(), z.number()])).optional(),
     groupEnabled: z.boolean().optional(),
     groupChannels: z.array(z.union([z.string(), z.number()])).optional(),
+    replyToMode: ReplyToModeSchema.optional(),
   })
   .strict()
   .superRefine((value, ctx) => {
@@ -280,6 +281,14 @@ export const SlackThreadSchema = z
   })
   .strict();
 
+const SlackReplyToModeByChatTypeSchema = z
+  .object({
+    direct: ReplyToModeSchema.optional(),
+    group: ReplyToModeSchema.optional(),
+    channel: ReplyToModeSchema.optional(),
+  })
+  .strict();
+
 export const SlackAccountSchema = z
   .object({
     name: z.string().optional(),
@@ -307,6 +316,7 @@ export const SlackAccountSchema = z
     reactionNotifications: z.enum(["off", "own", "all", "allowlist"]).optional(),
     reactionAllowlist: z.array(z.union([z.string(), z.number()])).optional(),
     replyToMode: ReplyToModeSchema.optional(),
+    replyToModeByChatType: SlackReplyToModeByChatTypeSchema.optional(),
     thread: SlackThreadSchema.optional(),
     actions: z
       .object({
@@ -482,6 +492,80 @@ export const IMessageConfigSchema = IMessageAccountSchemaBase.extend({
   });
 });
 
+const BlueBubblesAllowFromEntry = z.union([z.string(), z.number()]);
+
+const BlueBubblesActionSchema = z
+  .object({
+    reactions: z.boolean().optional(),
+    edit: z.boolean().optional(),
+    unsend: z.boolean().optional(),
+    reply: z.boolean().optional(),
+    sendWithEffect: z.boolean().optional(),
+    renameGroup: z.boolean().optional(),
+    setGroupIcon: z.boolean().optional(),
+    addParticipant: z.boolean().optional(),
+    removeParticipant: z.boolean().optional(),
+    leaveGroup: z.boolean().optional(),
+    sendAttachment: z.boolean().optional(),
+  })
+  .strict()
+  .optional();
+
+const BlueBubblesGroupConfigSchema = z
+  .object({
+    requireMention: z.boolean().optional(),
+  })
+  .strict();
+
+export const BlueBubblesAccountSchemaBase = z
+  .object({
+    name: z.string().optional(),
+    capabilities: z.array(z.string()).optional(),
+    configWrites: z.boolean().optional(),
+    enabled: z.boolean().optional(),
+    serverUrl: z.string().optional(),
+    password: z.string().optional(),
+    webhookPath: z.string().optional(),
+    dmPolicy: DmPolicySchema.optional().default("pairing"),
+    allowFrom: z.array(BlueBubblesAllowFromEntry).optional(),
+    groupAllowFrom: z.array(BlueBubblesAllowFromEntry).optional(),
+    groupPolicy: GroupPolicySchema.optional().default("allowlist"),
+    historyLimit: z.number().int().min(0).optional(),
+    dmHistoryLimit: z.number().int().min(0).optional(),
+    dms: z.record(z.string(), DmConfigSchema.optional()).optional(),
+    textChunkLimit: z.number().int().positive().optional(),
+    mediaMaxMb: z.number().int().positive().optional(),
+    sendReadReceipts: z.boolean().optional(),
+    blockStreaming: z.boolean().optional(),
+    blockStreamingCoalesce: BlockStreamingCoalesceSchema.optional(),
+    groups: z.record(z.string(), BlueBubblesGroupConfigSchema.optional()).optional(),
+  })
+  .strict();
+
+export const BlueBubblesAccountSchema = BlueBubblesAccountSchemaBase.superRefine((value, ctx) => {
+  requireOpenAllowFrom({
+    policy: value.dmPolicy,
+    allowFrom: value.allowFrom,
+    ctx,
+    path: ["allowFrom"],
+    message: 'channels.bluebubbles.accounts.*.dmPolicy="open" requires allowFrom to include "*"',
+  });
+});
+
+export const BlueBubblesConfigSchema = BlueBubblesAccountSchemaBase.extend({
+  accounts: z.record(z.string(), BlueBubblesAccountSchema.optional()).optional(),
+  actions: BlueBubblesActionSchema,
+}).superRefine((value, ctx) => {
+  requireOpenAllowFrom({
+    policy: value.dmPolicy,
+    allowFrom: value.allowFrom,
+    ctx,
+    path: ["allowFrom"],
+    message:
+      'channels.bluebubbles.dmPolicy="open" requires channels.bluebubbles.allowFrom to include "*"',
+  });
+});
+
 export const MSTeamsChannelSchema = z
   .object({
     requireMention: z.boolean().optional(),
@@ -525,6 +609,10 @@ export const MSTeamsConfigSchema = z
     dms: z.record(z.string(), DmConfigSchema.optional()).optional(),
     replyStyle: MSTeamsReplyStyleSchema.optional(),
     teams: z.record(z.string(), MSTeamsTeamSchema.optional()).optional(),
+    /** Max media size in MB (default: 100MB for OneDrive upload support). */
+    mediaMaxMb: z.number().positive().optional(),
+    /** SharePoint site ID for file uploads in group chats/channels (e.g., "contoso.sharepoint.com,guid1,guid2") */
+    sharePointSiteId: z.string().optional(),
   })
   .strict()
   .superRefine((value, ctx) => {

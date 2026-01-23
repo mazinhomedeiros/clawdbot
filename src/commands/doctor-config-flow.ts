@@ -8,6 +8,7 @@ import {
   readConfigFileSnapshot,
 } from "../config/config.js";
 import { applyPluginAutoEnable } from "../config/plugin-auto-enable.js";
+import { formatCliCommand } from "../cli/command-format.js";
 import { note } from "../terminal/note.js";
 import { normalizeLegacyConfigValues } from "./doctor-legacy-config.js";
 import type { DoctorOptions } from "./doctor-prompter.js";
@@ -120,12 +121,21 @@ export async function loadAndMaybeMigrateDoctorConfig(params: {
   options: DoctorOptions;
   confirm: (p: { message: string; initialValue: boolean }) => Promise<boolean>;
 }) {
-  void params.confirm;
   const shouldRepair = params.options.repair === true || params.options.yes === true;
   const snapshot = await readConfigFileSnapshot();
-  let cfg: ClawdbotConfig = snapshot.config ?? {};
+  const baseCfg = snapshot.config ?? {};
+  let cfg: ClawdbotConfig = baseCfg;
+  let candidate = structuredClone(baseCfg) as ClawdbotConfig;
+  let pendingChanges = false;
+  let shouldWriteConfig = false;
+  const fixHints: string[] = [];
   if (snapshot.exists && !snapshot.valid && snapshot.legacyIssues.length === 0) {
     note("Config invalid; doctor will run with best-effort config.", "Config");
+  }
+  const warnings = snapshot.warnings ?? [];
+  if (warnings.length > 0) {
+    const lines = warnings.map((issue) => `- ${issue.path}: ${issue.message}`).join("\n");
+    note(lines, "Config warnings");
   }
 
   if (snapshot.legacyIssues.length > 0) {
@@ -133,49 +143,76 @@ export async function loadAndMaybeMigrateDoctorConfig(params: {
       snapshot.legacyIssues.map((issue) => `- ${issue.path}: ${issue.message}`).join("\n"),
       "Legacy config keys detected",
     );
+    const { config: migrated, changes } = migrateLegacyConfig(snapshot.parsed);
+    if (changes.length > 0) {
+      note(changes.join("\n"), "Doctor changes");
+    }
+    if (migrated) {
+      candidate = migrated;
+      pendingChanges = pendingChanges || changes.length > 0;
+    }
     if (shouldRepair) {
       // Legacy migration (2026-01-02, commit: 16420e5b) — normalize per-provider allowlists; move WhatsApp gating into channels.whatsapp.allowFrom.
-      const { config: migrated, changes } = migrateLegacyConfig(snapshot.parsed);
-      if (changes.length > 0) note(changes.join("\n"), "Doctor changes");
       if (migrated) cfg = migrated;
     } else {
-      note('Run "clawdbot doctor --fix" to apply legacy migrations.', "Doctor");
+      fixHints.push(
+        `Run "${formatCliCommand("clawdbot doctor --fix")}" to apply legacy migrations.`,
+      );
     }
   }
 
-  const normalized = normalizeLegacyConfigValues(cfg);
+  const normalized = normalizeLegacyConfigValues(candidate);
   if (normalized.changes.length > 0) {
     note(normalized.changes.join("\n"), "Doctor changes");
+    candidate = normalized.config;
+    pendingChanges = true;
     if (shouldRepair) {
       cfg = normalized.config;
     } else {
-      note('Run "clawdbot doctor --fix" to apply these changes.', "Doctor");
+      fixHints.push(`Run "${formatCliCommand("clawdbot doctor --fix")}" to apply these changes.`);
     }
   }
 
-  const autoEnable = applyPluginAutoEnable({ config: cfg, env: process.env });
+  const autoEnable = applyPluginAutoEnable({ config: candidate, env: process.env });
   if (autoEnable.changes.length > 0) {
     note(autoEnable.changes.join("\n"), "Doctor changes");
+    candidate = autoEnable.config;
+    pendingChanges = true;
     if (shouldRepair) {
       cfg = autoEnable.config;
     } else {
-      note('Run "clawdbot doctor --fix" to apply these changes.', "Doctor");
+      fixHints.push(`Run "${formatCliCommand("clawdbot doctor --fix")}" to apply these changes.`);
     }
   }
 
-  const unknown = stripUnknownConfigKeys(cfg);
+  const unknown = stripUnknownConfigKeys(candidate);
   if (unknown.removed.length > 0) {
     const lines = unknown.removed.map((path) => `- ${path}`).join("\n");
+    candidate = unknown.config;
+    pendingChanges = true;
     if (shouldRepair) {
       cfg = unknown.config;
       note(lines, "Doctor changes");
     } else {
       note(lines, "Unknown config keys");
-      note('Run "clawdbot doctor --fix" to remove these keys.', "Doctor");
+      fixHints.push('Run "clawdbot doctor --fix" to remove these keys.');
+    }
+  }
+
+  if (!shouldRepair && pendingChanges) {
+    const shouldApply = await params.confirm({
+      message: "Apply recommended config repairs now?",
+      initialValue: true,
+    });
+    if (shouldApply) {
+      cfg = candidate;
+      shouldWriteConfig = true;
+    } else if (fixHints.length > 0) {
+      note(fixHints.join("\n"), "Doctor");
     }
   }
 
   noteOpencodeProviderOverrides(cfg);
 
-  return { cfg, path: snapshot.path ?? CONFIG_PATH_CLAWDBOT };
+  return { cfg, path: snapshot.path ?? CONFIG_PATH_CLAWDBOT, shouldWriteConfig };
 }

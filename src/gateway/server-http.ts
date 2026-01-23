@@ -9,9 +9,11 @@ import type { TlsOptions } from "node:tls";
 import type { WebSocketServer } from "ws";
 import { handleA2uiHttpRequest } from "../canvas-host/a2ui.js";
 import type { CanvasHostHandler } from "../canvas-host/server.js";
+import { loadConfig } from "../config/config.js";
 import type { createSubsystemLogger } from "../logging/subsystem.js";
 import { handleSlackHttpRequest } from "../slack/http/index.js";
-import { handleControlUiHttpRequest } from "./control-ui.js";
+import { resolveAgentAvatar } from "../agents/identity-avatar.js";
+import { handleControlUiAvatarRequest, handleControlUiHttpRequest } from "./control-ui.js";
 import {
   extractHookToken,
   getHookChannelError,
@@ -26,6 +28,7 @@ import {
 } from "./hooks.js";
 import { applyHookMappings } from "./hooks-mapping.js";
 import { handleOpenAiHttpRequest } from "./openai-http.js";
+import { handleOpenResponsesHttpRequest } from "./openresponses-http.js";
 
 type SubsystemLogger = ReturnType<typeof createSubsystemLogger>;
 
@@ -192,6 +195,8 @@ export function createGatewayHttpServer(opts: {
   controlUiEnabled: boolean;
   controlUiBasePath: string;
   openAiChatCompletionsEnabled: boolean;
+  openResponsesEnabled: boolean;
+  openResponsesConfig?: import("../config/types.gateway.js").GatewayHttpResponsesConfig;
   handleHooksRequest: HooksRequestHandler;
   handlePluginRequest?: HooksRequestHandler;
   resolvedAuth: import("./auth.js").ResolvedGatewayAuth;
@@ -202,6 +207,8 @@ export function createGatewayHttpServer(opts: {
     controlUiEnabled,
     controlUiBasePath,
     openAiChatCompletionsEnabled,
+    openResponsesEnabled,
+    openResponsesConfig,
     handleHooksRequest,
     handlePluginRequest,
     resolvedAuth,
@@ -222,6 +229,15 @@ export function createGatewayHttpServer(opts: {
       if (await handleHooksRequest(req, res)) return;
       if (await handleSlackHttpRequest(req, res)) return;
       if (handlePluginRequest && (await handlePluginRequest(req, res))) return;
+      if (openResponsesEnabled) {
+        if (
+          await handleOpenResponsesHttpRequest(req, res, {
+            auth: resolvedAuth,
+            config: openResponsesConfig,
+          })
+        )
+          return;
+      }
       if (openAiChatCompletionsEnabled) {
         if (await handleOpenAiHttpRequest(req, res, { auth: resolvedAuth })) return;
       }
@@ -231,8 +247,16 @@ export function createGatewayHttpServer(opts: {
       }
       if (controlUiEnabled) {
         if (
+          handleControlUiAvatarRequest(req, res, {
+            basePath: controlUiBasePath,
+            resolveAvatar: (agentId) => resolveAgentAvatar(loadConfig(), agentId),
+          })
+        )
+          return;
+        if (
           handleControlUiHttpRequest(req, res, {
             basePath: controlUiBasePath,
+            config: loadConfig(),
           })
         )
           return;

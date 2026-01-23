@@ -110,6 +110,14 @@
       "destination": "/providers/opencode"
     },
     {
+      "source": "/mattermost",
+      "destination": "/channels/mattermost"
+    },
+    {
+      "source": "/mattermost/",
+      "destination": "/channels/mattermost"
+    },
+    {
       "source": "/glm",
       "destination": "/providers/glm"
     },
@@ -164,6 +172,14 @@
     {
       "source": "/providers/location/",
       "destination": "/channels/location"
+    },
+    {
+      "source": "/providers/mattermost",
+      "destination": "/channels/mattermost"
+    },
+    {
+      "source": "/providers/mattermost/",
+      "destination": "/channels/mattermost"
     },
     {
       "source": "/providers/msteams",
@@ -793,6 +809,7 @@
           "install/index",
           "install/installer",
           "install/updating",
+          "install/development-channels",
           "install/uninstall",
           "install/ansible",
           "install/nix",
@@ -828,8 +845,6 @@
           "cli/nodes",
           "cli/approvals",
           "cli/gateway",
-          "cli/daemon",
-          "cli/service",
           "cli/tui",
           "cli/voicecall",
           "cli/wake",
@@ -931,6 +946,7 @@
           "channels/grammy",
           "channels/discord",
           "channels/slack",
+          "channels/mattermost",
           "channels/signal",
           "channels/imessage",
           "channels/msteams",

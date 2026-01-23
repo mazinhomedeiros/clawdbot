@@ -26,15 +26,19 @@ import {
 import { normalizeAgentId } from "../../routing/session-key.js";
 import { parseMessageWithAttachments } from "../chat-attachments.js";
 import {
+  type AgentIdentityParams,
   type AgentWaitParams,
   ErrorCodes,
   errorShape,
   formatValidationErrors,
+  validateAgentIdentityParams,
   validateAgentParams,
   validateAgentWaitParams,
 } from "../protocol/index.js";
 import { loadSessionEntry } from "../session-utils.js";
 import { formatForLog } from "../ws-log.js";
+import { resolveAssistantIdentity } from "../assistant-identity.js";
+import { resolveAssistantAvatarUrl } from "../control-ui-shared.js";
 import { waitForAgentJob } from "./agent-job.js";
 import type { GatewayRequestHandlers } from "./types.js";
 
@@ -71,6 +75,7 @@ export const agentHandlers: GatewayRequestHandlers = {
       replyChannel?: string;
       accountId?: string;
       replyAccountId?: string;
+      threadId?: string;
       lane?: string;
       extraSystemPrompt?: string;
       idempotencyKey: string;
@@ -257,10 +262,15 @@ export const agentHandlers: GatewayRequestHandlers = {
         : typeof request.to === "string" && request.to.trim()
           ? request.to.trim()
           : undefined;
+    const explicitThreadId =
+      typeof request.threadId === "string" && request.threadId.trim()
+        ? request.threadId.trim()
+        : undefined;
     const deliveryPlan = resolveAgentDeliveryPlan({
       sessionEntry,
       requestedChannel: request.replyChannel ?? request.channel,
       explicitTo,
+      explicitThreadId,
       accountId: request.replyAccountId ?? request.accountId,
       wantsDelivery,
     });
@@ -298,6 +308,8 @@ export const agentHandlers: GatewayRequestHandlers = {
     });
     respond(true, accepted, undefined, { runId });
 
+    const resolvedThreadId = explicitThreadId ?? deliveryPlan.resolvedThreadId;
+
     void agentCommand(
       {
         message,
@@ -310,9 +322,11 @@ export const agentHandlers: GatewayRequestHandlers = {
         deliveryTargetMode,
         channel: resolvedChannel,
         accountId: resolvedAccountId,
+        threadId: resolvedThreadId,
         runContext: {
           messageChannel: resolvedChannel,
           accountId: resolvedAccountId,
+          currentThreadTs: resolvedThreadId != null ? String(resolvedThreadId) : undefined,
         },
         timeout: request.timeout?.toString(),
         bestEffortDeliver,
@@ -358,6 +372,49 @@ export const agentHandlers: GatewayRequestHandlers = {
           error: formatForLog(err),
         });
       });
+  },
+  "agent.identity.get": ({ params, respond }) => {
+    if (!validateAgentIdentityParams(params)) {
+      respond(
+        false,
+        undefined,
+        errorShape(
+          ErrorCodes.INVALID_REQUEST,
+          `invalid agent.identity.get params: ${formatValidationErrors(
+            validateAgentIdentityParams.errors,
+          )}`,
+        ),
+      );
+      return;
+    }
+    const p = params as AgentIdentityParams;
+    const agentIdRaw = typeof p.agentId === "string" ? p.agentId.trim() : "";
+    const sessionKeyRaw = typeof p.sessionKey === "string" ? p.sessionKey.trim() : "";
+    let agentId = agentIdRaw ? normalizeAgentId(agentIdRaw) : undefined;
+    if (sessionKeyRaw) {
+      const resolved = resolveAgentIdFromSessionKey(sessionKeyRaw);
+      if (agentId && resolved !== agentId) {
+        respond(
+          false,
+          undefined,
+          errorShape(
+            ErrorCodes.INVALID_REQUEST,
+            `invalid agent.identity.get params: agent "${agentIdRaw}" does not match session key agent "${resolved}"`,
+          ),
+        );
+        return;
+      }
+      agentId = resolved;
+    }
+    const cfg = loadConfig();
+    const identity = resolveAssistantIdentity({ cfg, agentId });
+    const avatarValue =
+      resolveAssistantAvatarUrl({
+        avatar: identity.avatar,
+        agentId: identity.agentId,
+        basePath: cfg.gateway?.controlUi?.basePath,
+      }) ?? identity.avatar;
+    respond(true, { ...identity, avatar: avatarValue }, undefined);
   },
   "agent.wait": async ({ params, respond }) => {
     if (!validateAgentWaitParams(params)) {

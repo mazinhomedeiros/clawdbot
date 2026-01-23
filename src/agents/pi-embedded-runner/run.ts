@@ -5,6 +5,7 @@ import { resolveUserPath } from "../../utils.js";
 import { isMarkdownCapableMessageChannel } from "../../utils/message-channel.js";
 import { resolveClawdbotAgentDir } from "../agent-paths.js";
 import {
+  isProfileInCooldown,
   markAuthProfileFailure,
   markAuthProfileGood,
   markAuthProfileUsed,
@@ -21,7 +22,9 @@ import {
   ensureAuthProfileStore,
   getApiKeyForModel,
   resolveAuthProfileOrder,
+  type ResolvedProviderAuth,
 } from "../model-auth.js";
+import { normalizeProviderId } from "../model-selection.js";
 import { ensureClawdbotModelsJson } from "../models-config.js";
 import {
   classifyFailoverReason,
@@ -47,11 +50,19 @@ import { buildEmbeddedRunPayloads } from "./run/payloads.js";
 import type { EmbeddedPiAgentMeta, EmbeddedPiRunResult } from "./types.js";
 import { describeUnknownError } from "./utils.js";
 
-type ApiKeyInfo = {
-  apiKey: string;
-  profileId?: string;
-  source: string;
-};
+type ApiKeyInfo = ResolvedProviderAuth;
+
+// Avoid Anthropic's refusal test token poisoning session transcripts.
+const ANTHROPIC_MAGIC_STRING_TRIGGER_REFUSAL = "ANTHROPIC_MAGIC_STRING_TRIGGER_REFUSAL";
+const ANTHROPIC_MAGIC_STRING_REPLACEMENT = "ANTHROPIC MAGIC STRING TRIGGER REFUSAL (redacted)";
+
+function scrubAnthropicRefusalMagic(prompt: string): string {
+  if (!prompt.includes(ANTHROPIC_MAGIC_STRING_TRIGGER_REFUSAL)) return prompt;
+  return prompt.replaceAll(
+    ANTHROPIC_MAGIC_STRING_TRIGGER_REFUSAL,
+    ANTHROPIC_MAGIC_STRING_REPLACEMENT,
+  );
+}
 
 export async function runEmbeddedPiAgent(
   params: RunEmbeddedPiAgentParams,
@@ -119,8 +130,16 @@ export async function runEmbeddedPiAgent(
 
       const authStore = ensureAuthProfileStore(agentDir, { allowKeychainPrompt: false });
       const preferredProfileId = params.authProfileId?.trim();
-      const lockedProfileId =
-        params.authProfileIdSource === "user" ? preferredProfileId : undefined;
+      let lockedProfileId = params.authProfileIdSource === "user" ? preferredProfileId : undefined;
+      if (lockedProfileId) {
+        const lockedProfile = authStore.profiles[lockedProfileId];
+        if (
+          !lockedProfile ||
+          normalizeProviderId(lockedProfile.provider) !== normalizeProviderId(provider)
+        ) {
+          lockedProfileId = undefined;
+        }
+      }
       const profileOrder = resolveAuthProfileOrder({
         cfg: params.config,
         store: authStore,
@@ -130,7 +149,11 @@ export async function runEmbeddedPiAgent(
       if (lockedProfileId && !profileOrder.includes(lockedProfileId)) {
         throw new Error(`Auth profile "${lockedProfileId}" is not configured for ${provider}.`);
       }
-      const profileCandidates = profileOrder.length > 0 ? profileOrder : [undefined];
+      const profileCandidates = lockedProfileId
+        ? [lockedProfileId]
+        : profileOrder.length > 0
+          ? profileOrder
+          : [undefined];
       let profileIndex = 0;
 
       const initialThinkLevel = params.thinkLevel ?? "off";
@@ -151,6 +174,16 @@ export async function runEmbeddedPiAgent(
 
       const applyApiKeyInfo = async (candidate?: string): Promise<void> => {
         apiKeyInfo = await resolveApiKeyForCandidate(candidate);
+        const resolvedProfileId = apiKeyInfo.profileId ?? candidate;
+        if (!apiKeyInfo.apiKey) {
+          if (apiKeyInfo.mode !== "aws-sdk") {
+            throw new Error(
+              `No API key resolved for provider "${model.provider}" (auth mode: ${apiKeyInfo.mode}).`,
+            );
+          }
+          lastProfileId = resolvedProfileId;
+          return;
+        }
         if (model.provider === "github-copilot") {
           const { resolveCopilotApiToken } =
             await import("../../providers/github-copilot-token.js");
@@ -169,6 +202,10 @@ export async function runEmbeddedPiAgent(
         let nextIndex = profileIndex + 1;
         while (nextIndex < profileCandidates.length) {
           const candidate = profileCandidates[nextIndex];
+          if (candidate && isProfileInCooldown(authStore, candidate)) {
+            nextIndex += 1;
+            continue;
+          }
           try {
             await applyApiKeyInfo(candidate);
             profileIndex = nextIndex;
@@ -184,7 +221,24 @@ export async function runEmbeddedPiAgent(
       };
 
       try {
-        await applyApiKeyInfo(profileCandidates[profileIndex]);
+        while (profileIndex < profileCandidates.length) {
+          const candidate = profileCandidates[profileIndex];
+          if (
+            candidate &&
+            candidate !== lockedProfileId &&
+            isProfileInCooldown(authStore, candidate)
+          ) {
+            profileIndex += 1;
+            continue;
+          }
+          await applyApiKeyInfo(profileCandidates[profileIndex]);
+          break;
+        }
+        if (profileIndex >= profileCandidates.length) {
+          throw new Error(
+            `No available auth profile for ${provider} (all in cooldown or unavailable).`,
+          );
+        }
       } catch (err) {
         if (profileCandidates[profileIndex] === lockedProfileId) throw err;
         const advanced = await advanceAuthProfile();
@@ -196,12 +250,17 @@ export async function runEmbeddedPiAgent(
           attemptedThinking.add(thinkLevel);
           await fs.mkdir(resolvedWorkspace, { recursive: true });
 
+          const prompt =
+            provider === "anthropic" ? scrubAnthropicRefusalMagic(params.prompt) : params.prompt;
+
           const attempt = await runEmbeddedAttempt({
             sessionId: params.sessionId,
             sessionKey: params.sessionKey,
             messageChannel: params.messageChannel,
             messageProvider: params.messageProvider,
             agentAccountId: params.agentAccountId,
+            messageTo: params.messageTo,
+            messageThreadId: params.messageThreadId,
             currentChannelId: params.currentChannelId,
             currentThreadTs: params.currentThreadTs,
             replyToMode: params.replyToMode,
@@ -211,7 +270,7 @@ export async function runEmbeddedPiAgent(
             agentDir,
             config: params.config,
             skillsSnapshot: params.skillsSnapshot,
-            prompt: params.prompt,
+            prompt,
             images: params.images,
             provider,
             modelId,
@@ -239,6 +298,7 @@ export async function runEmbeddedPiAgent(
             onToolResult: params.onToolResult,
             onAgentEvent: params.onAgentEvent,
             extraSystemPrompt: params.extraSystemPrompt,
+            streamParams: params.streamParams,
             ownerNumbers: params.ownerNumbers,
             enforceFinalTag: params.enforceFinalTag,
           });
@@ -469,10 +529,12 @@ export async function runEmbeddedPiAgent(
               store: authStore,
               provider,
               profileId: lastProfileId,
+              agentDir: params.agentDir,
             });
             await markAuthProfileUsed({
               store: authStore,
               profileId: lastProfileId,
+              agentDir: params.agentDir,
             });
           }
           return {
@@ -482,6 +544,17 @@ export async function runEmbeddedPiAgent(
               agentMeta,
               aborted,
               systemPromptReport: attempt.systemPromptReport,
+              // Handle client tool calls (OpenResponses hosted tools)
+              stopReason: attempt.clientToolCall ? "tool_calls" : undefined,
+              pendingToolCalls: attempt.clientToolCall
+                ? [
+                    {
+                      id: `call_${Date.now()}`,
+                      name: attempt.clientToolCall.name,
+                      arguments: JSON.stringify(attempt.clientToolCall.params),
+                    },
+                  ]
+                : undefined,
             },
             didSendViaMessagingTool: attempt.didSendViaMessagingTool,
             messagingToolSentTexts: attempt.messagingToolSentTexts,

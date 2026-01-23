@@ -27,12 +27,14 @@ const BASE_METHODS = [
   "models.list",
   "agents.list",
   "skills.status",
+  "skills.bins",
   "skills.install",
   "skills.update",
   "update.run",
   "voicewake.get",
   "voicewake.set",
   "sessions.list",
+  "sessions.preview",
   "sessions.patch",
   "sessions.reset",
   "sessions.delete",
@@ -48,6 +50,8 @@ const BASE_METHODS = [
   "device.pair.list",
   "device.pair.approve",
   "device.pair.reject",
+  "device.token.rotate",
+  "device.token.revoke",
   "node.rename",
   "node.list",
   "node.describe",
@@ -65,6 +69,7 @@ const BASE_METHODS = [
   "system-event",
   "send",
   "agent",
+  "agent.identity.get",
   "agent.wait",
   // WebChat WebSocket-native chat methods
   "chat.history",
@@ -78,6 +83,7 @@ export function listGatewayMethods(): string[] {
 }
 
 export const GATEWAY_EVENTS = [
+  "connect.challenge",
   "agent",
   "chat",
   "presence",

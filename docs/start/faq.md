@@ -59,20 +59,21 @@ Quick answers plus deeper troubleshooting for real-world setups (local dev, VPS,
   - [How do I use Brave for browser control?](#how-do-i-use-brave-for-browser-control)
 - [Remote gateways + nodes](#remote-gateways-nodes)
   - [How do commands propagate between Telegram, the gateway, and nodes?](#how-do-commands-propagate-between-telegram-the-gateway-and-nodes)
-  - [Do nodes run a gateway daemon?](#do-nodes-run-a-gateway-daemon)
+  - [Do nodes run a gateway service?](#do-nodes-run-a-gateway-service)
   - [Is there an API / RPC way to apply config?](#is-there-an-api-rpc-way-to-apply-config)
   - [What’s a minimal “sane” config for a first install?](#whats-a-minimal-sane-config-for-a-first-install)
   - [How do I set up Tailscale on a VPS and connect from my Mac?](#how-do-i-set-up-tailscale-on-a-vps-and-connect-from-my-mac)
   - [How do I connect a Mac node to a remote Gateway (Tailscale Serve)?](#how-do-i-connect-a-mac-node-to-a-remote-gateway-tailscale-serve)
 - [Env vars and .env loading](#env-vars-and-env-loading)
   - [How does Clawdbot load environment variables?](#how-does-clawdbot-load-environment-variables)
-  - [“I started the Gateway via a daemon and my env vars disappeared.” What now?](#i-started-the-gateway-via-a-daemon-and-my-env-vars-disappeared-what-now)
+  - [“I started the Gateway via the service and my env vars disappeared.” What now?](#i-started-the-gateway-via-the-service-and-my-env-vars-disappeared-what-now)
   - [I set `COPILOT_GITHUB_TOKEN`, but models status shows “Shell env: off.” Why?](#i-set-copilot_github_token-but-models-status-shows-shell-env-off-why)
 - [Sessions & multiple chats](#sessions-multiple-chats)
   - [How do I start a fresh conversation?](#how-do-i-start-a-fresh-conversation)
   - [Do sessions reset automatically if I never send `/new`?](#do-sessions-reset-automatically-if-i-never-send-new)
   - [How do I completely reset Clawdbot but keep it installed?](#how-do-i-completely-reset-clawdbot-but-keep-it-installed)
   - [I’m getting “context too large” errors — how do I reset or compact?](#im-getting-context-too-large-errors-how-do-i-reset-or-compact)
+  - [Why am I seeing “LLM request rejected: messages.N.content.X.tool_use.input: Field required”?](#why-am-i-seeing-llm-request-rejected-messagesncontentxtool_useinput-field-required)
   - [Why am I getting heartbeat messages every 30 minutes?](#why-am-i-getting-heartbeat-messages-every-30-minutes)
   - [Do I need to add a “bot account” to a WhatsApp group?](#do-i-need-to-add-a-bot-account-to-a-whatsapp-group)
   - [Why doesn’t Clawdbot reply in a group?](#why-doesnt-clawdbot-reply-in-a-group)
@@ -99,8 +100,8 @@ Quick answers plus deeper troubleshooting for real-world setups (local dev, VPS,
   - [OAuth vs API key: what’s the difference?](#oauth-vs-api-key-whats-the-difference)
 - [Gateway: ports, “already running”, and remote mode](#gateway-ports-already-running-and-remote-mode)
   - [What port does the Gateway use?](#what-port-does-the-gateway-use)
-  - [Why does `clawdbot daemon status` say `Runtime: running` but `RPC probe: failed`?](#why-does-clawdbot-daemon-status-say-runtime-running-but-rpc-probe-failed)
-  - [Why does `clawdbot daemon status` show `Config (cli)` and `Config (daemon)` different?](#why-does-clawdbot-daemon-status-show-config-cli-and-config-daemon-different)
+  - [Why does `clawdbot gateway status` say `Runtime: running` but `RPC probe: failed`?](#why-does-clawdbot-gateway-status-say-runtime-running-but-rpc-probe-failed)
+  - [Why does `clawdbot gateway status` show `Config (cli)` and `Config (service)` different?](#why-does-clawdbot-gateway-status-show-config-cli-and-config-service-different)
   - [What does “another gateway instance is already listening” mean?](#what-does-another-gateway-instance-is-already-listening-mean)
   - [How do I run Clawdbot in remote mode (client connects to a Gateway elsewhere)?](#how-do-i-run-clawdbot-in-remote-mode-client-connects-to-a-gateway-elsewhere)
   - [The Control UI says “unauthorized” (or keeps reconnecting). What now?](#the-control-ui-says-unauthorized-or-keeps-reconnecting-what-now)
@@ -109,13 +110,15 @@ Quick answers plus deeper troubleshooting for real-world setups (local dev, VPS,
   - [What does “invalid handshake” / code 1008 mean?](#what-does-invalid-handshake--code-1008-mean)
 - [Logging and debugging](#logging-and-debugging)
   - [Where are logs?](#where-are-logs)
-  - [How do I start/stop/restart the Gateway daemon?](#how-do-i-startstoprestart-the-gateway-daemon)
-  - [ELI5: `clawdbot daemon restart` vs `clawdbot gateway`](#eli5-clawdbot-daemon-restart-vs-clawdbot-gateway)
+  - [How do I start/stop/restart the Gateway service?](#how-do-i-startstoprestart-the-gateway-service)
+  - [ELI5: `clawdbot gateway restart` vs `clawdbot gateway`](#eli5-clawdbot-gateway-restart-vs-clawdbot-gateway)
   - [What’s the fastest way to get more details when something fails?](#whats-the-fastest-way-to-get-more-details-when-something-fails)
 - [Media & attachments](#media-attachments)
   - [My skill generated an image/PDF, but nothing was sent](#my-skill-generated-an-imagepdf-but-nothing-was-sent)
 - [Security and access control](#security-and-access-control)
   - [Is it safe to expose Clawdbot to inbound DMs?](#is-it-safe-to-expose-clawdbot-to-inbound-dms)
+  - [Is prompt injection only a concern for public bots?](#is-prompt-injection-only-a-concern-for-public-bots)
+  - [Can I use cheaper models for personal assistant tasks?](#can-i-use-cheaper-models-for-personal-assistant-tasks)
   - [I ran `/start` in Telegram but didn’t get a pairing code](#i-ran-start-in-telegram-but-didnt-get-a-pairing-code)
   - [WhatsApp: will it message my contacts? How does pairing work?](#whatsapp-will-it-message-my-contacts-how-does-pairing-work)
 - [Chat commands, aborting tasks, and “it won’t stop”](#chat-commands-aborting-tasks-and-it-wont-stop)
@@ -128,7 +131,7 @@ Quick answers plus deeper troubleshooting for real-world setups (local dev, VPS,
    ```bash
    clawdbot status
    ```
-   Fast local summary: OS + update, gateway/daemon reachability, agents/sessions, provider config + runtime issues (when gateway is reachable).
+   Fast local summary: OS + update, gateway/service reachability, agents/sessions, provider config + runtime issues (when gateway is reachable).
 
 2) **Pasteable report (safe to share)**
    ```bash
@@ -138,9 +141,9 @@ Quick answers plus deeper troubleshooting for real-world setups (local dev, VPS,
 
 3) **Daemon + port state**
    ```bash
-   clawdbot daemon status
+   clawdbot gateway status
    ```
-   Shows supervisor runtime vs RPC reachability, the probe target URL, and which config the daemon likely used.
+   Shows supervisor runtime vs RPC reachability, the probe target URL, and which config the service likely used.
 
 4) **Deep probes**
    ```bash
@@ -175,7 +178,7 @@ Quick answers plus deeper troubleshooting for real-world setups (local dev, VPS,
 
 ### What is Clawdbot, in one paragraph?
 
-Clawdbot is a personal AI assistant you run on your own devices. It replies on the messaging surfaces you already use (WhatsApp, Telegram, Slack, Discord, Signal, iMessage, WebChat) and can also do voice + a live Canvas on supported platforms. The **Gateway** is the always‑on control plane; the assistant is the product.
+Clawdbot is a personal AI assistant you run on your own devices. It replies on the messaging surfaces you already use (WhatsApp, Telegram, Slack, Mattermost (plugin), Discord, Signal, iMessage, WebChat) and can also do voice + a live Canvas on supported platforms. The **Gateway** is the always-on control plane; the assistant is the product.
 
 ## Quick start and first-run setup
 
@@ -184,21 +187,24 @@ Clawdbot is a personal AI assistant you run on your own devices. It replies on t
 The repo recommends running from source and using the onboarding wizard:
 
 ```bash
-git clone https://github.com/clawdbot/clawdbot.git
-cd clawdbot
-
-pnpm install
-
-# Optional if you want built output / global linking:
-pnpm build
-
-# If the Control UI assets are missing or you want the dashboard:
-pnpm ui:build # auto-installs UI deps on first run
-
-pnpm clawdbot onboard
+curl -fsSL https://clawd.bot/install.sh | bash
+clawdbot onboard --install-daemon
 ```
 
 The wizard can also build UI assets automatically. After onboarding, you typically run the Gateway on port **18789**.
+
+From source (contributors/dev):
+
+```bash
+git clone https://github.com/clawdbot/clawdbot.git
+cd clawdbot
+pnpm install
+pnpm build
+pnpm ui:build # auto-installs UI deps on first run
+clawdbot onboard
+```
+
+If you don’t have a global install yet, run it via `pnpm clawdbot onboard`.
 
 ### How do I open the dashboard after onboarding?
 
@@ -229,7 +235,7 @@ Node **>= 22** is required. `pnpm` is recommended. Bun is **not recommended** fo
 - **Model/auth setup** (Anthropic **setup-token** recommended for Claude subscriptions, OpenAI Codex OAuth supported, API keys optional, LM Studio local models supported)
 - **Workspace** location + bootstrap files
 - **Gateway settings** (bind/port/auth/tailscale)
-- **Providers** (WhatsApp, Telegram, Discord, Signal, iMessage)
+- **Providers** (WhatsApp, Telegram, Discord, Mattermost (plugin), Signal, iMessage)
 - **Daemon install** (LaunchAgent on macOS; systemd user unit on Linux/WSL2)
 - **Health checks** and **skills** selection
 
@@ -237,7 +243,7 @@ It also warns if your configured model is unknown or missing auth.
 
 ### How does Anthropic "setup-token" auth work?
 
-`claude setup-token` generates a **token string** via the Claude Code CLI (it is not available in the web console). You can run it on **any machine**. If you run it on the gateway host, the wizard can auto-detect the CLI credentials. If you run it elsewhere, choose **Anthropic token (paste setup-token)** and paste the string. The token is stored as an auth profile for the **anthropic** provider and used like an API key or OAuth profile. More detail: [OAuth](/concepts/oauth).
+`claude setup-token` generates a **token string** via the Claude Code CLI (it is not available in the web console). You can run it on **any machine**. If Claude Code CLI credentials are present on the gateway host, Clawdbot can reuse them; otherwise choose **Anthropic token (paste setup-token)** and paste the string. The token is stored as an auth profile for the **anthropic** provider and used like an API key or OAuth profile. More detail: [OAuth](/concepts/oauth).
 
 Clawdbot keeps `auth.profiles["anthropic:claude-cli"].mode` set to `"oauth"` so
 the profile accepts both OAuth and setup-token credentials; older `"token"` mode
@@ -251,11 +257,11 @@ It is **not** in the Anthropic Console. The setup-token is generated by the **Cl
 claude setup-token
 ```
 
-Copy the token it prints, then choose **Anthropic token (paste setup-token)** in the wizard. If you want Clawdbot to run the command for you, use `clawdbot onboard --auth-choice setup-token` or `clawdbot models auth setup-token --provider anthropic`. If you ran `claude setup-token` elsewhere, paste it on the gateway host with `clawdbot models auth paste-token --provider anthropic`. See [Anthropic](/providers/anthropic).
+Copy the token it prints, then choose **Anthropic token (paste setup-token)** in the wizard. If you want to run it on the gateway host, use `clawdbot models auth setup-token --provider anthropic`. If you ran `claude setup-token` elsewhere, paste it on the gateway host with `clawdbot models auth paste-token --provider anthropic`. See [Anthropic](/providers/anthropic).
 
 ### Do you support Claude subscription auth (Claude Code OAuth)?
 
-Yes. Clawdbot can **reuse Claude Code CLI credentials** (OAuth) and also supports **setup-token**. If you have a Claude subscription, we recommend **setup-token** for long‑running setups (requires Claude Pro/Max + the `claude` CLI). You can generate it anywhere and paste it on the gateway host, or run it locally on the gateway so it auto-syncs. OAuth reuse is supported, but avoid logging in separately via Clawdbot and Claude Code to prevent token conflicts. See [Anthropic](/providers/anthropic) and [OAuth](/concepts/oauth).
+Yes. Clawdbot can **reuse Claude Code CLI credentials** (OAuth) and also supports **setup-token**. If you have a Claude subscription, we recommend **setup-token** for long‑running setups (requires Claude Pro/Max + the `claude` CLI). You can generate it anywhere and paste it on the gateway host. OAuth reuse is supported, but avoid logging in separately via Clawdbot and Claude Code to prevent token conflicts. See [Anthropic](/providers/anthropic) and [OAuth](/concepts/oauth).
 
 Note: Claude subscription access is governed by Anthropic’s terms. For production or multi‑user workloads, API keys are usually the safer choice.
 
@@ -330,8 +336,8 @@ git clone https://github.com/clawdbot/clawdbot.git
 cd clawdbot
 pnpm install
 pnpm build
-pnpm clawdbot doctor
-clawdbot daemon restart
+clawdbot doctor
+clawdbot gateway restart
 ```
 
 From git → npm:
@@ -339,7 +345,7 @@ From git → npm:
 ```bash
 npm install -g clawdbot@latest
 clawdbot doctor
-clawdbot daemon restart
+clawdbot gateway restart
 ```
 
 Doctor detects a gateway service entrypoint mismatch and offers to rewrite the service config to match the current install (use `--repair` in automation).
@@ -357,7 +363,7 @@ lowest friction and you’re okay with sleep/restarts, run it locally.
 - **Pros:** always‑on, stable network, no laptop sleep issues, easier to keep running.
 - **Cons:** often run headless (use screenshots), remote file access only, you must SSH for updates.
 
-**Clawdbot‑specific note:** WhatsApp/Telegram/Slack/Discord all work fine from a VPS. The only real trade‑off is **headless browser** vs a visible window. See [Browser](/tools/browser).
+**Clawdbot-specific note:** WhatsApp/Telegram/Slack/Mattermost (plugin)/Discord all work fine from a VPS. The only real trade-off is **headless browser** vs a visible window. See [Browser](/tools/browser).
 
 **Recommended default:** VPS if you had gateway disconnects before. Local is great when you’re actively using the Mac and want local file access or UI automation with a visible browser.
 
@@ -713,43 +719,42 @@ See the full config examples in [Browser](/tools/browser#use-brave-or-another-ch
 ### How do commands propagate between Telegram, the gateway, and nodes?
 
 Telegram messages are handled by the **gateway**. The gateway runs the agent and
-only then calls nodes over the **Bridge** when a node tool is needed:
+only then calls nodes over the **Gateway WebSocket** when a node tool is needed:
 
 Telegram → Gateway → Agent → `node.*` → Node → Gateway → Telegram
 
-Nodes don’t see inbound provider traffic; they only receive bridge RPC calls.
+Nodes don’t see inbound provider traffic; they only receive node RPC calls.
 
 ### How can my agent access my computer if the Gateway is hosted remotely?
 
 Short answer: **pair your computer as a node**. The Gateway runs elsewhere, but it can
-call `node.*` tools (screen, camera, system) on your local machine over the Bridge.
+call `node.*` tools (screen, camera, system) on your local machine over the Gateway WebSocket.
 
 Typical setup:
 1) Run the Gateway on the always‑on host (VPS/home server).
 2) Put the Gateway host + your computer on the same tailnet.
-3) Enable the bridge on the Gateway host:
-   ```json5
-   { bridge: { enabled: true, bind: "auto" } }
-   ```
-4) Open the macOS app locally and connect in **Remote over SSH** mode so it can tunnel
-   the bridge port and register as a node.
+3) Ensure the Gateway WS is reachable (tailnet bind or SSH tunnel).
+4) Open the macOS app locally and connect in **Remote over SSH** mode (or direct tailnet)
+   so it can register as a node.
 5) Approve the node on the Gateway:
    ```bash
    clawdbot nodes pending
    clawdbot nodes approve <requestId>
    ```
 
+No separate TCP bridge is required; nodes connect over the Gateway WebSocket.
+
 Security reminder: pairing a macOS node allows `system.run` on that machine. Only
 pair devices you trust, and review [Security](/gateway/security).
 
-Docs: [Nodes](/nodes), [Bridge protocol](/gateway/bridge-protocol), [macOS remote mode](/platforms/mac/remote), [Security](/gateway/security).
+Docs: [Nodes](/nodes), [Gateway protocol](/gateway/protocol), [macOS remote mode](/platforms/mac/remote), [Security](/gateway/security).
 
-### Do nodes run a gateway daemon?
+### Do nodes run a gateway service?
 
 No. Only **one gateway** should run per host unless you intentionally run isolated profiles (see [Multiple gateways](/gateway/multiple-gateways)). Nodes are peripherals that connect
 to the gateway (iOS/Android nodes, or macOS “node mode” in the menubar app).
 
-A full restart is required for `gateway`, `bridge`, `discovery`, and `canvasHost` changes.
+A full restart is required for `gateway`, `discovery`, and `canvasHost` changes.
 
 ### Is there an API / RPC way to apply config?
 
@@ -791,26 +796,19 @@ This keeps the gateway bound to loopback and exposes HTTPS via Tailscale. See [T
 
 ### How do I connect a Mac node to a remote Gateway (Tailscale Serve)?
 
-Serve only exposes the **Gateway Control UI**. Nodes use the **bridge port**.
+Serve exposes the **Gateway Control UI + WS**. Nodes connect over the same Gateway WS endpoint.
 
 Recommended setup:
-1) **Enable the bridge on the gateway host**:
-   ```json5
-   {
-     bridge: { enabled: true, bind: "auto" }
-   }
-   ```
-   `auto` prefers a tailnet IP when Tailscale is present.
-2) **Make sure the VPS + Mac are on the same tailnet**.
-3) **Use the macOS app in Remote mode** (SSH target can be the tailnet hostname).
-   The app will tunnel the bridge port and connect as a node.
-4) **Approve the node** on the gateway:
+1) **Make sure the VPS + Mac are on the same tailnet**.
+2) **Use the macOS app in Remote mode** (SSH target can be the tailnet hostname).
+   The app will tunnel the Gateway port and connect as a node.
+3) **Approve the node** on the gateway:
    ```bash
    clawdbot nodes pending
    clawdbot nodes approve <requestId>
    ```
 
-Docs: [Bridge protocol](/gateway/bridge-protocol), [Discovery](/gateway/discovery), [macOS remote mode](/platforms/mac/remote).
+Docs: [Gateway protocol](/gateway/protocol), [Discovery](/gateway/discovery), [macOS remote mode](/platforms/mac/remote).
 
 ## Env vars and .env loading
 
@@ -836,11 +834,11 @@ You can also define inline env vars in config (applied only if missing from the 
 
 See [/environment](/environment) for full precedence and sources.
 
-### “I started the Gateway via a daemon and my env vars disappeared.” What now?
+### “I started the Gateway via a service and my env vars disappeared.” What now?
 
 Two common fixes:
 
-1) Put the missing keys in `~/.clawdbot/.env` so they’re picked up even when the daemon doesn’t inherit your shell env.
+1) Put the missing keys in `~/.clawdbot/.env` so they’re picked up even when the service doesn’t inherit your shell env.
 2) Enable shell import (opt‑in convenience):
 
 ```json5
@@ -863,7 +861,7 @@ This runs your login shell and imports only missing expected keys (never overrid
 does **not** mean your env vars are missing — it just means Clawdbot won’t load
 your login shell automatically.
 
-If the Gateway runs as a daemon (launchd/systemd), it won’t inherit your shell
+If the Gateway runs as a service (launchd/systemd), it won’t inherit your shell
 environment. Fix by doing one of these:
 
 1) Put the token in `~/.clawdbot/.env`:
@@ -947,6 +945,14 @@ If it keeps happening:
 - Use a model with a larger context window.
 
 Docs: [Compaction](/concepts/compaction), [Session pruning](/concepts/session-pruning), [Session management](/concepts/session).
+
+### Why am I seeing “LLM request rejected: messages.N.content.X.tool_use.input: Field required”?
+
+This is a provider validation error: the model emitted a `tool_use` block without the required
+`input`. It usually means the session history is stale or corrupted (often after long threads
+or a tool/schema change).
+
+Fix: start a fresh session with `/new` (standalone message).
 
 ### Why am I getting heartbeat messages every 30 minutes?
 
@@ -1052,6 +1058,17 @@ You can also force a specific auth profile for the provider (per session):
 
 Tip: `/model status` shows which agent is active, which `auth-profiles.json` file is being used, and which auth profile will be tried next.
 It also shows the configured provider endpoint (`baseUrl`) and API mode (`api`) when available.
+
+### How do I unpin a profile I set with `@profile`?
+
+Re-run `/model` **without** the `@profile` suffix:
+
+```
+/model anthropic/claude-opus-4-5
+```
+
+If you want to return to the default, pick it from `/model` (or send `/model <default provider/model>`).
+Use `/model status` to confirm which auth profile is active.
 
 ### Why do I see “Model … is not allowed” and then no reply?
 
@@ -1262,7 +1279,7 @@ Fix: either provide Google auth, or remove/avoid Google models in `agents.defaul
 Cause: the session history contains **thinking blocks without signatures** (often from
 an aborted/partial stream). Google Antigravity requires signatures for thinking blocks.
 
-Fix: start a **new session** or set `/thinking off` for that agent.
+Fix: Clawdbot now strips unsigned thinking blocks for Google Antigravity Claude. If it still appears, start a **new session** or set `/thinking off` for that agent.
 
 ## Auth profiles: what they are and how to manage them
 
@@ -1333,24 +1350,24 @@ Precedence:
 --port > CLAWDBOT_GATEWAY_PORT > gateway.port > default 18789
 ```
 
-### Why does `clawdbot daemon status` say `Runtime: running` but `RPC probe: failed`?
+### Why does `clawdbot gateway status` say `Runtime: running` but `RPC probe: failed`?
 
 Because “running” is the **supervisor’s** view (launchd/systemd/schtasks). The RPC probe is the CLI actually connecting to the gateway WebSocket and calling `status`.
 
-Use `clawdbot daemon status` and trust these lines:
+Use `clawdbot gateway status` and trust these lines:
 - `Probe target:` (the URL the probe actually used)
 - `Listening:` (what’s actually bound on the port)
 - `Last gateway error:` (common root cause when the process is alive but the port isn’t listening)
 
-### Why does `clawdbot daemon status` show `Config (cli)` and `Config (daemon)` different?
+### Why does `clawdbot gateway status` show `Config (cli)` and `Config (service)` different?
 
-You’re editing one config file while the daemon is running another (often a `--profile` / `CLAWDBOT_STATE_DIR` mismatch).
+You’re editing one config file while the service is running another (often a `--profile` / `CLAWDBOT_STATE_DIR` mismatch).
 
 Fix:
 ```bash
-clawdbot daemon install --force
+clawdbot gateway install --force
 ```
-Run that from the same `--profile` / environment you want the daemon to use.
+Run that from the same `--profile` / environment you want the service to use.
 
 ### What does “another gateway instance is already listening” mean?
 
@@ -1403,7 +1420,7 @@ Fix:
 - Start Tailscale on that host (so it has a 100.x address), or
 - Switch to `gateway.bind: "loopback"` / `"lan"`.
   
-Note: `tailnet` is legacy and is migrated to `auto` by Doctor. Prefer `gateway.bind: "auto"` when using Tailscale.
+Note: `tailnet` is explicit. `auto` prefers loopback; use `gateway.bind: "tailnet"` when you want a tailnet-only bind.
 
 ### Can I run multiple Gateways on the same host?
 
@@ -1419,7 +1436,7 @@ Yes, but you must isolate:
 Quick setup (recommended):
 - Use `clawdbot --profile <name> …` per instance (auto-creates `~/.clawdbot-<name>`).
 - Set a unique `gateway.port` in each profile config (or pass `--port` for manual runs).
-- Install a per-profile daemon: `clawdbot --profile <name> daemon install`.
+- Install a per-profile service: `clawdbot --profile <name> gateway install`.
 
 Profiles also suffix service names (`com.clawdbot.<profile>`, `clawdbot-gateway-<profile>.service`, `Clawdbot Gateway (<profile>)`).
 Full guide: [Multiple gateways](/gateway/multiple-gateways).
@@ -1472,23 +1489,23 @@ Service/supervisor logs (when the gateway runs via launchd/systemd):
 
 See [Troubleshooting](/gateway/troubleshooting#log-locations) for more.
 
-### How do I start/stop/restart the Gateway daemon?
+### How do I start/stop/restart the Gateway service?
 
-Use the daemon helpers:
+Use the gateway helpers:
 
 ```bash
-clawdbot daemon status
-clawdbot daemon restart
+clawdbot gateway status
+clawdbot gateway restart
 ```
 
 If you run the gateway manually, `clawdbot gateway --force` can reclaim the port. See [Gateway](/gateway).
 
-### ELI5: `clawdbot daemon restart` vs `clawdbot gateway`
+### ELI5: `clawdbot gateway restart` vs `clawdbot gateway`
 
-- `clawdbot daemon restart`: restarts the **background service** (launchd/systemd).
+- `clawdbot gateway restart`: restarts the **background service** (launchd/systemd).
 - `clawdbot gateway`: runs the gateway **in the foreground** for this terminal session.
 
-If you installed the daemon, use the daemon commands. Use `clawdbot gateway` when
+If you installed the service, use the gateway commands. Use `clawdbot gateway` when
 you want a one-off, foreground run.
 
 ### What’s the fastest way to get more details when something fails?
@@ -1526,6 +1543,28 @@ Treat inbound DMs as untrusted input. Defaults are designed to reduce risk:
 - Opening DMs publicly requires explicit opt‑in (`dmPolicy: "open"` and allowlist `"*"`).
 
 Run `clawdbot doctor` to surface risky DM policies.
+
+### Is prompt injection only a concern for public bots?
+
+No. Prompt injection is about **untrusted content**, not just who can DM the bot.
+If your assistant reads external content (web search/fetch, browser pages, emails,
+docs, attachments, pasted logs), that content can include instructions that try
+to hijack the model. This can happen even if **you are the only sender**.
+
+The biggest risk is when tools are enabled: the model can be tricked into
+exfiltrating context or calling tools on your behalf. Reduce the blast radius by:
+- using a read-only or tool-disabled "reader" agent to summarize untrusted content
+- keeping `web_search` / `web_fetch` / `browser` off for tool-enabled agents
+- sandboxing and strict tool allowlists
+
+Details: [Security](/gateway/security).
+
+### Can I use cheaper models for personal assistant tasks?
+
+Yes, **if** the agent is chat-only and the input is trusted. Smaller tiers are
+more susceptible to instruction hijacking, so avoid them for tool-enabled agents
+or when reading untrusted content. If you must use a smaller model, lock down
+tools and run inside a sandbox. See [Security](/gateway/security).
 
 ### I ran `/start` in Telegram but didn’t get a pairing code
 

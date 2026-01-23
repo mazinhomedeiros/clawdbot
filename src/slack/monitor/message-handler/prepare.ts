@@ -22,6 +22,7 @@ import { resolveThreadSessionKeys } from "../../../routing/session-key.js";
 import { resolveMentionGatingWithBypass } from "../../../channels/mention-gating.js";
 import { resolveConversationLabel } from "../../../channels/conversation-label.js";
 import { resolveControlCommandGate } from "../../../channels/command-gating.js";
+import { formatAllowlistMatchMeta } from "../../../channels/allowlist-match.js";
 import {
   readSessionUpdatedAt,
   recordSessionMetaFromInbound,
@@ -32,6 +33,7 @@ import type { ResolvedSlackAccount } from "../../accounts.js";
 import { reactSlackMessage } from "../../actions.js";
 import { sendMessageSlack } from "../../send.js";
 import type { SlackMessageEvent } from "../../types.js";
+import { resolveSlackThreadContext } from "../../threading.js";
 
 import { resolveSlackAllowListMatch, resolveSlackUserAllowed } from "../allow-list.js";
 import { resolveSlackEffectiveAllowFrom } from "../auth.js";
@@ -131,9 +133,7 @@ export async function prepareSlackMessage(params: {
         allowList: allowFromLower,
         id: directUserId,
       });
-      const allowMatchMeta = `matchKey=${allowMatch.matchKey ?? "none"} matchSource=${
-        allowMatch.matchSource ?? "none"
-      }`;
+      const allowMatchMeta = formatAllowlistMatchMeta(allowMatch);
       if (!allowMatch.allowed) {
         if (ctx.dmPolicy === "pairing") {
           const sender = await ctx.resolveUserName(directUserId);
@@ -189,9 +189,9 @@ export async function prepareSlackMessage(params: {
   });
 
   const baseSessionKey = route.sessionKey;
-  const threadTs = message.thread_ts;
-  const hasThreadTs = typeof threadTs === "string" && threadTs.length > 0;
-  const isThreadReply = hasThreadTs && (threadTs !== message.ts || Boolean(message.parent_user_id));
+  const threadContext = resolveSlackThreadContext({ message, replyToMode: ctx.replyToMode });
+  const threadTs = threadContext.incomingThreadTs;
+  const isThreadReply = threadContext.isThreadReply;
   const threadKeys = resolveThreadSessionKeys({
     baseSessionKey,
     threadId: isThreadReply ? threadTs : undefined,
@@ -434,6 +434,7 @@ export async function prepareSlackMessage(params: {
 
   let threadStarterBody: string | undefined;
   let threadLabel: string | undefined;
+  let threadStarterMedia: Awaited<ReturnType<typeof resolveSlackMedia>> = null;
   if (isThreadReply && threadTs) {
     const starter = await resolveSlackThreadStarter({
       channelId: message.channel,
@@ -453,10 +454,26 @@ export async function prepareSlackMessage(params: {
       });
       const snippet = starter.text.replace(/\s+/g, " ").slice(0, 80);
       threadLabel = `Slack thread ${roomLabel}${snippet ? `: ${snippet}` : ""}`;
+      // If current message has no files but thread starter does, fetch starter's files
+      if (!media && starter.files && starter.files.length > 0) {
+        threadStarterMedia = await resolveSlackMedia({
+          files: starter.files,
+          token: ctx.botToken,
+          maxBytes: ctx.mediaMaxBytes,
+        });
+        if (threadStarterMedia) {
+          logVerbose(
+            `slack: hydrated thread starter file ${threadStarterMedia.placeholder} from root message`,
+          );
+        }
+      }
     } else {
       threadLabel = `Slack thread ${roomLabel}`;
     }
   }
+
+  // Use thread starter media if current message has none
+  const effectiveMedia = media ?? threadStarterMedia;
 
   const ctxPayload = finalizeInboundContext({
     Body: combinedBody,
@@ -475,15 +492,17 @@ export async function prepareSlackMessage(params: {
     Provider: "slack" as const,
     Surface: "slack" as const,
     MessageSid: message.ts,
-    ReplyToId: message.thread_ts ?? message.ts,
+    ReplyToId: threadContext.replyToId,
+    // Preserve thread context for routed tool notifications.
+    MessageThreadId: threadContext.messageThreadId,
     ParentSessionKey: threadKeys.parentSessionKey,
     ThreadStarterBody: threadStarterBody,
     ThreadLabel: threadLabel,
     Timestamp: message.ts ? Math.round(Number(message.ts) * 1000) : undefined,
     WasMentioned: isRoomish ? effectiveWasMentioned : undefined,
-    MediaPath: media?.path,
-    MediaType: media?.contentType,
-    MediaUrl: media?.path,
+    MediaPath: effectiveMedia?.path,
+    MediaType: effectiveMedia?.contentType,
+    MediaUrl: effectiveMedia?.path,
     CommandAuthorized: commandAuthorized,
     OriginatingChannel: "slack" as const,
     OriginatingTo: slackTo,
