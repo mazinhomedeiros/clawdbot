@@ -7,7 +7,7 @@ import {
   DEFAULT_SANDBOX_IMAGE,
   resolveSandboxScope,
 } from "../agents/sandbox.js";
-import type { ClawdbotConfig } from "../config/config.js";
+import type { MoltbotConfig } from "../config/config.js";
 import { runCommandWithTimeout, runExec } from "../process/exec.js";
 import type { RuntimeEnv } from "../runtime.js";
 import { note } from "../terminal/note.js";
@@ -78,22 +78,26 @@ async function dockerImageExists(image: string): Promise<boolean> {
   try {
     await runExec("docker", ["image", "inspect", image], { timeoutMs: 5_000 });
     return true;
-  } catch {
-    return false;
+  } catch (error: any) {
+    const stderr = error?.stderr || error?.message || "";
+    if (String(stderr).includes("No such image")) {
+      return false;
+    }
+    throw error;
   }
 }
 
-function resolveSandboxDockerImage(cfg: ClawdbotConfig): string {
+function resolveSandboxDockerImage(cfg: MoltbotConfig): string {
   const image = cfg.agents?.defaults?.sandbox?.docker?.image?.trim();
   return image ? image : DEFAULT_SANDBOX_IMAGE;
 }
 
-function resolveSandboxBrowserImage(cfg: ClawdbotConfig): string {
+function resolveSandboxBrowserImage(cfg: MoltbotConfig): string {
   const image = cfg.agents?.defaults?.sandbox?.browser?.image?.trim();
   return image ? image : DEFAULT_SANDBOX_BROWSER_IMAGE;
 }
 
-function updateSandboxDockerImage(cfg: ClawdbotConfig, image: string): ClawdbotConfig {
+function updateSandboxDockerImage(cfg: MoltbotConfig, image: string): MoltbotConfig {
   return {
     ...cfg,
     agents: {
@@ -112,7 +116,7 @@ function updateSandboxDockerImage(cfg: ClawdbotConfig, image: string): ClawdbotC
   };
 }
 
-function updateSandboxBrowserImage(cfg: ClawdbotConfig, image: string): ClawdbotConfig {
+function updateSandboxBrowserImage(cfg: MoltbotConfig, image: string): MoltbotConfig {
   return {
     ...cfg,
     agents: {
@@ -166,10 +170,10 @@ async function handleMissingSandboxImage(
 }
 
 export async function maybeRepairSandboxImages(
-  cfg: ClawdbotConfig,
+  cfg: MoltbotConfig,
   runtime: RuntimeEnv,
   prompter: DoctorPrompter,
-): Promise<ClawdbotConfig> {
+): Promise<MoltbotConfig> {
   const sandbox = cfg.agents?.defaults?.sandbox;
   const mode = sandbox?.mode ?? "off";
   if (!sandbox || mode === "off") return cfg;
@@ -226,7 +230,7 @@ export async function maybeRepairSandboxImages(
   return next;
 }
 
-export function noteSandboxScopeWarnings(cfg: ClawdbotConfig) {
+export function noteSandboxScopeWarnings(cfg: MoltbotConfig) {
   const globalSandbox = cfg.agents?.defaults?.sandbox;
   const agents = Array.isArray(cfg.agents?.list) ? cfg.agents.list : [];
   const warnings: string[] = [];

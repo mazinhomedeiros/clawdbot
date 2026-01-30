@@ -1,7 +1,7 @@
 import path from "node:path";
 
 import { type Api, getEnvApiKey, type Model } from "@mariozechner/pi-ai";
-import type { ClawdbotConfig } from "../config/config.js";
+import type { MoltbotConfig } from "../config/config.js";
 import type { ModelProviderAuthMode, ModelProviderConfig } from "../config/types.js";
 import { getShellEnvAppliedKeys } from "../infra/shell-env.js";
 import { formatCliCommand } from "../cli/command-format.js";
@@ -23,7 +23,7 @@ const AWS_SECRET_KEY_ENV = "AWS_SECRET_ACCESS_KEY";
 const AWS_PROFILE_ENV = "AWS_PROFILE";
 
 function resolveProviderConfig(
-  cfg: ClawdbotConfig | undefined,
+  cfg: MoltbotConfig | undefined,
   provider: string,
 ): ModelProviderConfig | undefined {
   const providers = cfg?.models?.providers ?? {};
@@ -45,7 +45,7 @@ function resolveProviderConfig(
 }
 
 export function getCustomProviderApiKey(
-  cfg: ClawdbotConfig | undefined,
+  cfg: MoltbotConfig | undefined,
   provider: string,
 ): string | undefined {
   const entry = resolveProviderConfig(cfg, provider);
@@ -54,7 +54,7 @@ export function getCustomProviderApiKey(
 }
 
 function resolveProviderAuthOverride(
-  cfg: ClawdbotConfig | undefined,
+  cfg: MoltbotConfig | undefined,
   provider: string,
 ): ModelProviderAuthMode | undefined {
   const entry = resolveProviderConfig(cfg, provider);
@@ -75,12 +75,12 @@ function resolveEnvSourceLabel(params: {
   return `${prefix}${params.label}`;
 }
 
-export function resolveAwsSdkEnvVarName(): string | undefined {
-  if (process.env[AWS_BEARER_ENV]?.trim()) return AWS_BEARER_ENV;
-  if (process.env[AWS_ACCESS_KEY_ENV]?.trim() && process.env[AWS_SECRET_KEY_ENV]?.trim()) {
+export function resolveAwsSdkEnvVarName(env: NodeJS.ProcessEnv = process.env): string | undefined {
+  if (env[AWS_BEARER_ENV]?.trim()) return AWS_BEARER_ENV;
+  if (env[AWS_ACCESS_KEY_ENV]?.trim() && env[AWS_SECRET_KEY_ENV]?.trim()) {
     return AWS_ACCESS_KEY_ENV;
   }
-  if (process.env[AWS_PROFILE_ENV]?.trim()) return AWS_PROFILE_ENV;
+  if (env[AWS_PROFILE_ENV]?.trim()) return AWS_PROFILE_ENV;
   return undefined;
 }
 
@@ -128,7 +128,7 @@ export type ResolvedProviderAuth = {
 
 export async function resolveApiKeyForProvider(params: {
   provider: string;
-  cfg?: ClawdbotConfig;
+  cfg?: MoltbotConfig;
   profileId?: string;
   preferredProfile?: string;
   store?: AuthProfileStore;
@@ -221,7 +221,7 @@ export async function resolveApiKeyForProvider(params: {
     [
       `No API key found for provider "${provider}".`,
       `Auth store: ${authStorePath} (agentDir: ${resolvedAgentDir}).`,
-      `Configure auth for this agent (${formatCliCommand("clawdbot agents add <id>")}) or copy auth-profiles.json from the main agentDir.`,
+      `Configure auth for this agent (${formatCliCommand("moltbot agents add <id>")}) or copy auth-profiles.json from the main agentDir.`,
     ].join(" "),
   );
 }
@@ -281,7 +281,9 @@ export function resolveEnvApiKey(provider: string): EnvApiKeyResult | null {
     moonshot: "MOONSHOT_API_KEY",
     "kimi-code": "KIMICODE_API_KEY",
     minimax: "MINIMAX_API_KEY",
+    xiaomi: "XIAOMI_API_KEY",
     synthetic: "SYNTHETIC_API_KEY",
+    venice: "VENICE_API_KEY",
     mistral: "MISTRAL_API_KEY",
     opencode: "OPENCODE_API_KEY",
   };
@@ -292,7 +294,7 @@ export function resolveEnvApiKey(provider: string): EnvApiKeyResult | null {
 
 export function resolveModelAuthMode(
   provider?: string,
-  cfg?: ClawdbotConfig,
+  cfg?: MoltbotConfig,
   store?: AuthProfileStore,
 ): ModelAuthMode | undefined {
   const resolved = provider?.trim();
@@ -334,7 +336,7 @@ export function resolveModelAuthMode(
 
 export async function getApiKeyForModel(params: {
   model: Model<Api>;
-  cfg?: ClawdbotConfig;
+  cfg?: MoltbotConfig;
   profileId?: string;
   preferredProfile?: string;
   store?: AuthProfileStore;

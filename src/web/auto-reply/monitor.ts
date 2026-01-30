@@ -79,6 +79,7 @@ export async function monitorWebChannel(
         groupAllowFrom: account.groupAllowFrom,
         groupPolicy: account.groupPolicy,
         textChunkLimit: account.textChunkLimit,
+        chunkMode: account.chunkMode,
         mediaMaxMb: account.mediaMaxMb,
         blockStreaming: account.blockStreaming,
         groups: account.groups,
@@ -375,7 +376,7 @@ export async function monitorWebChannel(
 
     if (loggedOut) {
       runtime.error(
-        `WhatsApp session logged out. Run \`${formatCliCommand("clawdbot channels login --channel web")}\` to relink.`,
+        `WhatsApp session logged out. Run \`${formatCliCommand("moltbot channels login --channel web")}\` to relink.`,
       );
       await closeListener();
       break;

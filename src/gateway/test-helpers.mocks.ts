@@ -138,8 +138,10 @@ const createStubPluginRegistry = (): PluginRegistry => ({
   providers: [],
   gatewayHandlers: {},
   httpHandlers: [],
+  httpRoutes: [],
   cliRegistrars: [],
   services: [],
+  commands: [],
   diagnostics: [],
 });
 
@@ -166,6 +168,7 @@ const hoisted = vi.hoisted(() => ({
     waitCalls: [] as string[],
     waitResults: new Map<string, boolean>(),
   },
+  getReplyFromConfig: vi.fn().mockResolvedValue(undefined),
   sendWhatsAppMock: vi.fn().mockResolvedValue({ messageId: "msg-1", toJid: "jid-1" }),
 }));
 
@@ -185,18 +188,19 @@ export const resetTestPluginRegistry = () => {
 };
 
 const testConfigRoot = {
-  value: path.join(os.tmpdir(), `clawdbot-gateway-test-${process.pid}-${crypto.randomUUID()}`),
+  value: path.join(os.tmpdir(), `moltbot-gateway-test-${process.pid}-${crypto.randomUUID()}`),
 };
 
 export const setTestConfigRoot = (root: string) => {
   testConfigRoot.value = root;
-  process.env.CLAWDBOT_CONFIG_PATH = path.join(root, "clawdbot.json");
+  process.env.CLAWDBOT_CONFIG_PATH = path.join(root, "moltbot.json");
 };
 
 export const testTailnetIPv4 = hoisted.testTailnetIPv4;
 export const piSdkMock = hoisted.piSdkMock;
 export const cronIsolatedRun = hoisted.cronIsolatedRun;
 export const agentCommand = hoisted.agentCommand;
+export const getReplyFromConfig = hoisted.getReplyFromConfig;
 
 export const testState = {
   agentConfig: undefined as Record<string, unknown> | undefined,
@@ -267,7 +271,7 @@ vi.mock("../config/sessions.js", async () => {
 
 vi.mock("../config/config.js", async () => {
   const actual = await vi.importActual<typeof import("../config/config.js")>("../config/config.js");
-  const resolveConfigPath = () => path.join(testConfigRoot.value, "clawdbot.json");
+  const resolveConfigPath = () => path.join(testConfigRoot.value, "moltbot.json");
   const hashConfigRaw = (raw: string | null) =>
     crypto
       .createHash("sha256")
@@ -346,10 +350,10 @@ vi.mock("../config/config.js", async () => {
 
   return {
     ...actual,
-    get CONFIG_PATH_CLAWDBOT() {
+    get CONFIG_PATH() {
       return resolveConfigPath();
     },
-    get STATE_DIR_CLAWDBOT() {
+    get STATE_DIR() {
       return path.dirname(resolveConfigPath());
     },
     get isNixMode() {
@@ -539,6 +543,9 @@ vi.mock("../channels/web/index.js", async () => {
 });
 vi.mock("../commands/agent.js", () => ({
   agentCommand,
+}));
+vi.mock("../auto-reply/reply.js", () => ({
+  getReplyFromConfig,
 }));
 vi.mock("../cli/deps.js", async () => {
   const actual = await vi.importActual<typeof import("../cli/deps.js")>("../cli/deps.js");

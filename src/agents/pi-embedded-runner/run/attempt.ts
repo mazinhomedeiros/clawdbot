@@ -15,15 +15,17 @@ import { resolveChannelCapabilities } from "../../../config/channel-capabilities
 import { getMachineDisplayName } from "../../../infra/machine-name.js";
 import { resolveTelegramInlineButtonsScope } from "../../../telegram/inline-buttons.js";
 import { resolveTelegramReactionLevel } from "../../../telegram/reaction-level.js";
+import { resolveSignalReactionLevel } from "../../../signal/reaction-level.js";
 import { normalizeMessageChannel } from "../../../utils/message-channel.js";
 import { isReasoningTagProvider } from "../../../utils/provider-utils.js";
 import { isSubagentSessionKey } from "../../../routing/session-key.js";
 import { resolveUserPath } from "../../../utils.js";
 import { createCacheTrace } from "../../cache-trace.js";
-import { resolveClawdbotAgentDir } from "../../agent-paths.js";
+import { createAnthropicPayloadLogger } from "../../anthropic-payload-log.js";
+import { resolveMoltbotAgentDir } from "../../agent-paths.js";
 import { resolveSessionAgentIds } from "../../agent-scope.js";
 import { makeBootstrapWarn, resolveBootstrapContextForRun } from "../../bootstrap-files.js";
-import { resolveClawdbotDocsPath } from "../../docs-path.js";
+import { resolveMoltbotDocsPath } from "../../docs-path.js";
 import { resolveModelAuthMode } from "../../model-auth.js";
 import {
   isCloudCodeAssistFormatError,
@@ -36,7 +38,7 @@ import {
   ensurePiCompactionReserveTokens,
   resolveCompactionReserveTokensFloor,
 } from "../../pi-settings.js";
-import { createClawdbotCodingTools } from "../../pi-tools.js";
+import { createMoltbotCodingTools } from "../../pi-tools.js";
 import { resolveSandboxContext } from "../../sandbox.js";
 import { guardSessionManager } from "../../session-tool-result-guard-wrapper.js";
 import { resolveTranscriptPolicy } from "../../transcript-policy.js";
@@ -77,6 +79,7 @@ import { toClientToolDefinitions } from "../../pi-tool-definition-adapter.js";
 import { buildSystemPromptParams } from "../../system-prompt-params.js";
 import { describeUnknownError, mapThinkingLevel } from "../utils.js";
 import { resolveSandboxRuntimeStatus } from "../../sandbox/runtime-status.js";
+import { buildTtsSystemPromptHint } from "../../../tts/tts.js";
 import { isTimeoutError } from "../../failover-error.js";
 import { getGlobalHookRunner } from "../../../plugins/hook-runner-global.js";
 import { MAX_IMAGE_BYTES } from "../../../media/constants.js";
@@ -192,34 +195,44 @@ export async function runEmbeddedAttempt(
       ? ["Reminder: commit your changes in this workspace after edits."]
       : undefined;
 
-    const agentDir = params.agentDir ?? resolveClawdbotAgentDir();
+    const agentDir = params.agentDir ?? resolveMoltbotAgentDir();
 
     // Check if the model supports native image input
     const modelHasVision = params.model.input?.includes("image") ?? false;
-    const toolsRaw = createClawdbotCodingTools({
-      exec: {
-        ...params.execOverrides,
-        elevated: params.bashElevated,
-      },
-      sandbox,
-      messageProvider: params.messageChannel ?? params.messageProvider,
-      agentAccountId: params.agentAccountId,
-      messageTo: params.messageTo,
-      messageThreadId: params.messageThreadId,
-      sessionKey: params.sessionKey ?? params.sessionId,
-      agentDir,
-      workspaceDir: effectiveWorkspace,
-      config: params.config,
-      abortSignal: runAbortController.signal,
-      modelProvider: params.model.provider,
-      modelId: params.modelId,
-      modelAuthMode: resolveModelAuthMode(params.model.provider, params.config),
-      currentChannelId: params.currentChannelId,
-      currentThreadTs: params.currentThreadTs,
-      replyToMode: params.replyToMode,
-      hasRepliedRef: params.hasRepliedRef,
-      modelHasVision,
-    });
+    const toolsRaw = params.disableTools
+      ? []
+      : createMoltbotCodingTools({
+          exec: {
+            ...params.execOverrides,
+            elevated: params.bashElevated,
+          },
+          sandbox,
+          messageProvider: params.messageChannel ?? params.messageProvider,
+          agentAccountId: params.agentAccountId,
+          messageTo: params.messageTo,
+          messageThreadId: params.messageThreadId,
+          groupId: params.groupId,
+          groupChannel: params.groupChannel,
+          groupSpace: params.groupSpace,
+          spawnedBy: params.spawnedBy,
+          senderId: params.senderId,
+          senderName: params.senderName,
+          senderUsername: params.senderUsername,
+          senderE164: params.senderE164,
+          sessionKey: params.sessionKey ?? params.sessionId,
+          agentDir,
+          workspaceDir: effectiveWorkspace,
+          config: params.config,
+          abortSignal: runAbortController.signal,
+          modelProvider: params.model.provider,
+          modelId: params.modelId,
+          modelAuthMode: resolveModelAuthMode(params.model.provider, params.config),
+          currentChannelId: params.currentChannelId,
+          currentThreadTs: params.currentThreadTs,
+          replyToMode: params.replyToMode,
+          hasRepliedRef: params.hasRepliedRef,
+          modelHasVision,
+        });
     const tools = sanitizeToolsForGoogle({ tools: toolsRaw, provider: params.provider });
     logToolSchemasForGoogle({ tools, provider: params.provider });
 
@@ -247,14 +260,25 @@ export async function runEmbeddedAttempt(
       }
     }
     const reactionGuidance =
-      runtimeChannel === "telegram" && params.config
+      runtimeChannel && params.config
         ? (() => {
-            const resolved = resolveTelegramReactionLevel({
-              cfg: params.config,
-              accountId: params.agentAccountId ?? undefined,
-            });
-            const level = resolved.agentReactionGuidance;
-            return level ? { level, channel: "Telegram" } : undefined;
+            if (runtimeChannel === "telegram") {
+              const resolved = resolveTelegramReactionLevel({
+                cfg: params.config,
+                accountId: params.agentAccountId ?? undefined,
+              });
+              const level = resolved.agentReactionGuidance;
+              return level ? { level, channel: "Telegram" } : undefined;
+            }
+            if (runtimeChannel === "signal") {
+              const resolved = resolveSignalReactionLevel({
+                cfg: params.config,
+                accountId: params.agentAccountId ?? undefined,
+              });
+              const level = resolved.agentReactionGuidance;
+              return level ? { level, channel: "Signal" } : undefined;
+            }
+            return undefined;
           })()
         : undefined;
     const { defaultAgentId, sessionAgentId } = resolveSessionAgentIds({
@@ -302,12 +326,13 @@ export async function runEmbeddedAttempt(
     });
     const isDefaultAgent = sessionAgentId === defaultAgentId;
     const promptMode = isSubagentSessionKey(params.sessionKey) ? "minimal" : "full";
-    const docsPath = await resolveClawdbotDocsPath({
+    const docsPath = await resolveMoltbotDocsPath({
       workspaceDir: effectiveWorkspace,
       argv1: process.argv[1],
       cwd: process.cwd(),
       moduleUrl: import.meta.url,
     });
+    const ttsHint = params.config ? buildTtsSystemPromptHint(params.config) : undefined;
 
     const appendPrompt = buildEmbeddedSystemPrompt({
       workspaceDir: effectiveWorkspace,
@@ -321,6 +346,7 @@ export async function runEmbeddedAttempt(
         : undefined,
       skillsPrompt,
       docsPath: docsPath ?? undefined,
+      ttsHint,
       workspaceNotes,
       reactionGuidance,
       promptMode,
@@ -452,6 +478,16 @@ export async function runEmbeddedAttempt(
         modelApi: params.model.api,
         workspaceDir: params.workspaceDir,
       });
+      const anthropicPayloadLogger = createAnthropicPayloadLogger({
+        env: process.env,
+        runId: params.runId,
+        sessionId: activeSession.sessionId,
+        sessionKey: params.sessionKey,
+        provider: params.provider,
+        modelId: params.modelId,
+        modelApi: params.model.api,
+        workspaceDir: params.workspaceDir,
+      });
 
       // Force a stable streamFn reference so vitest can reliably mock @mariozechner/pi-ai.
       activeSession.agent.streamFn = streamSimple;
@@ -471,6 +507,11 @@ export async function runEmbeddedAttempt(
           note: "after session create",
         });
         activeSession.agent.streamFn = cacheTrace.wrapStreamFn(activeSession.agent.streamFn);
+      }
+      if (anthropicPayloadLogger) {
+        activeSession.agent.streamFn = anthropicPayloadLogger.wrapStreamFn(
+          activeSession.agent.streamFn,
+        );
       }
 
       try {
@@ -595,18 +636,23 @@ export async function runEmbeddedAttempt(
       setActiveEmbeddedRun(params.sessionId, queueHandle);
 
       let abortWarnTimer: NodeJS.Timeout | undefined;
+      const isProbeSession = params.sessionId?.startsWith("probe-") ?? false;
       const abortTimer = setTimeout(
         () => {
-          log.warn(
-            `embedded run timeout: runId=${params.runId} sessionId=${params.sessionId} timeoutMs=${params.timeoutMs}`,
-          );
+          if (!isProbeSession) {
+            log.warn(
+              `embedded run timeout: runId=${params.runId} sessionId=${params.sessionId} timeoutMs=${params.timeoutMs}`,
+            );
+          }
           abortRun(true);
           if (!abortWarnTimer) {
             abortWarnTimer = setTimeout(() => {
               if (!activeSession.isStreaming) return;
-              log.warn(
-                `embedded run abort still streaming: runId=${params.runId} sessionId=${params.sessionId}`,
-              );
+              if (!isProbeSession) {
+                log.warn(
+                  `embedded run abort still streaming: runId=${params.runId} sessionId=${params.sessionId}`,
+                );
+              }
             }, 10_000);
           }
         },
@@ -761,6 +807,7 @@ export async function runEmbeddedAttempt(
           messages: messagesSnapshot,
           note: promptError ? "prompt error" : undefined,
         });
+        anthropicPayloadLogger?.recordUsage(messagesSnapshot, promptError);
 
         // Run agent_end hooks to allow plugins to analyze the conversation
         // This is fire-and-forget, so we don't await

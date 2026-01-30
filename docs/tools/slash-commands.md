@@ -16,6 +16,8 @@ There are two related systems:
   - Directives are stripped from the message before the model sees it.
   - In normal chat messages (not directive-only), they are treated as “inline hints” and do **not** persist session settings.
   - In directive-only messages (the message contains only directives), they persist to the session and reply with an acknowledgement.
+  - Directives are only applied for **authorized senders** (channel allowlists/pairing plus `commands.useAccessGroups`).
+    Unauthorized senders see directives treated as plain text.
 
 There are also a few **inline shortcuts** (allowlisted/authorized senders only): `/help`, `/commands`, `/status`, `/whoami` (`/id`).
 They run immediately, are stripped before the model sees the message, and the remaining text continues through the normal flow.
@@ -39,7 +41,7 @@ They run immediately, are stripped before the model sees the message, and the re
 ```
 
 - `commands.text` (default `true`) enables parsing `/...` in chat messages.
-  - On surfaces without native commands (WhatsApp/WebChat/Signal/iMessage/MS Teams), text commands still work even if you set this to `false`.
+  - On surfaces without native commands (WhatsApp/WebChat/Signal/iMessage/Google Chat/MS Teams), text commands still work even if you set this to `false`.
 - `commands.native` (default `"auto"`) registers native commands.
   - Auto: on for Discord/Telegram; off for Slack (until you add slash commands); ignored for providers without native support.
   - Set `channels.discord.commands.native`, `channels.telegram.commands.native`, or `channels.slack.commands.native` to override per provider (bool or `"auto"`).
@@ -49,7 +51,7 @@ They run immediately, are stripped before the model sees the message, and the re
   - Set `channels.discord.commands.nativeSkills`, `channels.telegram.commands.nativeSkills`, or `channels.slack.commands.nativeSkills` to override per provider (bool or `"auto"`).
 - `commands.bash` (default `false`) enables `! <cmd>` to run host shell commands (`/bash <cmd>` is an alias; requires `tools.elevated` allowlists).
 - `commands.bashForegroundMs` (default `2000`) controls how long bash waits before switching to background mode (`0` backgrounds immediately).
-- `commands.config` (default `false`) enables `/config` (reads/writes `clawdbot.json`).
+- `commands.config` (default `false`) enables `/config` (reads/writes `moltbot.json`).
 - `commands.debug` (default `false`) enables `/debug` (runtime-only overrides).
 - `commands.useAccessGroups` (default `true`) enforces allowlists/policies for commands.
 
@@ -61,12 +63,15 @@ Text + native (when enabled):
 - `/skill <name> [input]` (run a skill by name)
 - `/status` (show current status; includes provider usage/quota for the current model provider when available)
 - `/allowlist` (list/add/remove allowlist entries)
+- `/approve <id> allow-once|allow-always|deny` (resolve exec approval prompts)
 - `/context [list|detail|json]` (explain “context”; `detail` shows per-file + per-tool + per-skill + system prompt size)
 - `/whoami` (show your sender id; alias: `/id`)
 - `/subagents list|stop|log|info|send` (inspect, stop, log, or message sub-agent runs for the current session)
 - `/config show|get|set|unset` (persist config to disk, owner-only; requires `commands.config: true`)
 - `/debug show|set|unset|reset` (runtime overrides, owner-only; requires `commands.debug: true`)
 - `/usage off|tokens|full|cost` (per-response usage footer or local cost summary)
+- `/tts off|always|inbound|tagged|status|provider|limit|summary|audio` (control TTS; see [/tts](/tts))
+  - Discord: native command is `/voice` (Discord reserves `/tts`); text `/tts` still works.
 - `/stop`
 - `/restart`
 - `/dock-telegram` (alias: `/dock_telegram`) (switch replies to Telegram)
@@ -93,9 +98,9 @@ Text-only:
 Notes:
 - Commands accept an optional `:` between the command and args (e.g. `/think: high`, `/send: on`, `/help:`).
 - `/new <model>` accepts a model alias, `provider/model`, or a provider name (fuzzy match); if no match, the text is treated as the message body.
-- For full provider usage breakdown, use `clawdbot status --usage`.
+- For full provider usage breakdown, use `moltbot status --usage`.
 - `/allowlist add|remove` requires `commands.config=true` and honors channel `configWrites`.
-- `/usage` controls the per-response usage footer; `/usage cost` prints a local cost summary from Clawdbot session logs.
+- `/usage` controls the per-response usage footer; `/usage cost` prints a local cost summary from Moltbot session logs.
 - `/restart` is disabled by default; set `commands.restart: true` to enable it.
 - `/verbose` is meant for debugging and extra visibility; keep it **off** in normal use.
 - `/reasoning` (and `/verbose`) are risky in group settings: they may reveal internal reasoning or tool output you did not intend to expose. Prefer leaving them off, especially in group chats.
@@ -129,7 +134,7 @@ Examples:
 /model list
 /model 3
 /model openai/gpt-5.2
-/model opus@anthropic:claude-cli
+/model opus@anthropic:default
 /model status
 ```
 
@@ -146,19 +151,19 @@ Examples:
 
 ```
 /debug show
-/debug set messages.responsePrefix="[clawdbot]"
+/debug set messages.responsePrefix="[moltbot]"
 /debug set channels.whatsapp.allowFrom=["+1555","+4477"]
 /debug unset messages.responsePrefix
 /debug reset
 ```
 
 Notes:
-- Overrides apply immediately to new config reads, but do **not** write to `clawdbot.json`.
+- Overrides apply immediately to new config reads, but do **not** write to `moltbot.json`.
 - Use `/debug reset` to clear all overrides and return to the on-disk config.
 
 ## Config updates
 
-`/config` writes to your on-disk config (`clawdbot.json`). Owner-only. Disabled by default; enable with `commands.config: true`.
+`/config` writes to your on-disk config (`moltbot.json`). Owner-only. Disabled by default; enable with `commands.config: true`.
 
 Examples:
 
@@ -166,7 +171,7 @@ Examples:
 /config show
 /config show messages.responsePrefix
 /config get messages.responsePrefix
-/config set messages.responsePrefix="[clawdbot]"
+/config set messages.responsePrefix="[moltbot]"
 /config unset messages.responsePrefix
 ```
 

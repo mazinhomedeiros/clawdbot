@@ -1,5 +1,5 @@
 import { resolveDefaultAgentId } from "../agents/agent-scope.js";
-import type { ClawdbotConfig } from "../config/config.js";
+import type { MoltbotConfig } from "../config/config.js";
 import { listBindings } from "./bindings.js";
 import {
   buildAgentMainSessionKey,
@@ -7,6 +7,7 @@ import {
   DEFAULT_ACCOUNT_ID,
   DEFAULT_MAIN_KEY,
   normalizeAgentId,
+  sanitizeAgentId,
 } from "./session-key.js";
 
 export type RoutePeerKind = "dm" | "group" | "channel";
@@ -17,7 +18,7 @@ export type RoutePeer = {
 };
 
 export type ResolveAgentRouteInput = {
-  cfg: ClawdbotConfig;
+  cfg: MoltbotConfig;
   channel: string;
   accountId?: string | null;
   peer?: RoutePeer | null;
@@ -68,9 +69,10 @@ function matchesAccountId(match: string | undefined, actual: string): boolean {
 export function buildAgentSessionKey(params: {
   agentId: string;
   channel: string;
+  accountId?: string | null;
   peer?: RoutePeer | null;
   /** DM session scope. */
-  dmScope?: "main" | "per-peer" | "per-channel-peer";
+  dmScope?: "main" | "per-peer" | "per-channel-peer" | "per-account-channel-peer";
   identityLinks?: Record<string, string[]>;
 }): string {
   const channel = normalizeToken(params.channel) || "unknown";
@@ -79,6 +81,7 @@ export function buildAgentSessionKey(params: {
     agentId: params.agentId,
     mainKey: DEFAULT_MAIN_KEY,
     channel,
+    accountId: params.accountId,
     peerKind: peer?.kind ?? "dm",
     peerId: peer ? normalizeId(peer.id) || "unknown" : null,
     dmScope: params.dmScope,
@@ -86,19 +89,20 @@ export function buildAgentSessionKey(params: {
   });
 }
 
-function listAgents(cfg: ClawdbotConfig) {
+function listAgents(cfg: MoltbotConfig) {
   const agents = cfg.agents?.list;
   return Array.isArray(agents) ? agents : [];
 }
 
-function pickFirstExistingAgentId(cfg: ClawdbotConfig, agentId: string): string {
-  const normalized = normalizeAgentId(agentId);
+function pickFirstExistingAgentId(cfg: MoltbotConfig, agentId: string): string {
+  const trimmed = (agentId ?? "").trim();
+  if (!trimmed) return sanitizeAgentId(resolveDefaultAgentId(cfg));
+  const normalized = normalizeAgentId(trimmed);
   const agents = listAgents(cfg);
-  if (agents.length === 0) return normalized;
-  if (agents.some((agent) => normalizeAgentId(agent.id) === normalized)) {
-    return normalized;
-  }
-  return normalizeAgentId(resolveDefaultAgentId(cfg));
+  if (agents.length === 0) return sanitizeAgentId(trimmed);
+  const match = agents.find((agent) => normalizeAgentId(agent.id) === normalized);
+  if (match?.id?.trim()) return sanitizeAgentId(match.id.trim());
+  return sanitizeAgentId(resolveDefaultAgentId(cfg));
 }
 
 function matchesChannel(
@@ -155,21 +159,24 @@ export function resolveAgentRoute(input: ResolveAgentRouteInput): ResolvedAgentR
 
   const choose = (agentId: string, matchedBy: ResolvedAgentRoute["matchedBy"]) => {
     const resolvedAgentId = pickFirstExistingAgentId(input.cfg, agentId);
+    const sessionKey = buildAgentSessionKey({
+      agentId: resolvedAgentId,
+      channel,
+      accountId,
+      peer,
+      dmScope,
+      identityLinks,
+    }).toLowerCase();
+    const mainSessionKey = buildAgentMainSessionKey({
+      agentId: resolvedAgentId,
+      mainKey: DEFAULT_MAIN_KEY,
+    }).toLowerCase();
     return {
       agentId: resolvedAgentId,
       channel,
       accountId,
-      sessionKey: buildAgentSessionKey({
-        agentId: resolvedAgentId,
-        channel,
-        peer,
-        dmScope,
-        identityLinks,
-      }),
-      mainSessionKey: buildAgentMainSessionKey({
-        agentId: resolvedAgentId,
-        mainKey: DEFAULT_MAIN_KEY,
-      }),
+      sessionKey,
+      mainSessionKey,
       matchedBy,
     };
   };

@@ -1,20 +1,23 @@
-import type { ClawdbotConfig } from "../config/config.js";
+import type { MoltbotConfig } from "../config/config.js";
+import type { ModelDefinitionConfig } from "../config/types.models.js";
 import {
   DEFAULT_COPILOT_API_BASE_URL,
   resolveCopilotApiToken,
 } from "../providers/github-copilot-token.js";
 import { ensureAuthProfileStore, listProfilesForProvider } from "./auth-profiles.js";
 import { resolveAwsSdkEnvVarName, resolveEnvApiKey } from "./model-auth.js";
+import { discoverBedrockModels } from "./bedrock-discovery.js";
 import {
   buildSyntheticModelDefinition,
   SYNTHETIC_BASE_URL,
   SYNTHETIC_MODEL_CATALOG,
 } from "./synthetic-models.js";
+import { discoverVeniceModels, VENICE_BASE_URL } from "./venice-models.js";
 
-type ModelsConfig = NonNullable<ClawdbotConfig["models"]>;
+type ModelsConfig = NonNullable<MoltbotConfig["models"]>;
 export type ProviderConfig = NonNullable<ModelsConfig["providers"]>[string];
 
-const MINIMAX_API_BASE_URL = "https://api.minimax.io/anthropic";
+const MINIMAX_API_BASE_URL = "https://api.minimax.chat/v1";
 const MINIMAX_DEFAULT_MODEL_ID = "MiniMax-M2.1";
 const MINIMAX_DEFAULT_VISION_MODEL_ID = "MiniMax-VL-01";
 const MINIMAX_DEFAULT_CONTEXT_WINDOW = 200000;
@@ -27,8 +30,19 @@ const MINIMAX_API_COST = {
   cacheWrite: 10,
 };
 
+const XIAOMI_BASE_URL = "https://api.xiaomimimo.com/anthropic";
+export const XIAOMI_DEFAULT_MODEL_ID = "mimo-v2-flash";
+const XIAOMI_DEFAULT_CONTEXT_WINDOW = 262144;
+const XIAOMI_DEFAULT_MAX_TOKENS = 8192;
+const XIAOMI_DEFAULT_COST = {
+  input: 0,
+  output: 0,
+  cacheRead: 0,
+  cacheWrite: 0,
+};
+
 const MOONSHOT_BASE_URL = "https://api.moonshot.ai/v1";
-const MOONSHOT_DEFAULT_MODEL_ID = "kimi-k2-0905-preview";
+const MOONSHOT_DEFAULT_MODEL_ID = "kimi-k2.5";
 const MOONSHOT_DEFAULT_CONTEXT_WINDOW = 256000;
 const MOONSHOT_DEFAULT_MAX_TOKENS = 8192;
 const MOONSHOT_DEFAULT_COST = {
@@ -60,6 +74,70 @@ const QWEN_PORTAL_DEFAULT_COST = {
   cacheRead: 0,
   cacheWrite: 0,
 };
+
+const OLLAMA_BASE_URL = "http://127.0.0.1:11434/v1";
+const OLLAMA_API_BASE_URL = "http://127.0.0.1:11434";
+const OLLAMA_DEFAULT_CONTEXT_WINDOW = 128000;
+const OLLAMA_DEFAULT_MAX_TOKENS = 8192;
+const OLLAMA_DEFAULT_COST = {
+  input: 0,
+  output: 0,
+  cacheRead: 0,
+  cacheWrite: 0,
+};
+
+interface OllamaModel {
+  name: string;
+  modified_at: string;
+  size: number;
+  digest: string;
+  details?: {
+    family?: string;
+    parameter_size?: string;
+  };
+}
+
+interface OllamaTagsResponse {
+  models: OllamaModel[];
+}
+
+async function discoverOllamaModels(): Promise<ModelDefinitionConfig[]> {
+  // Skip Ollama discovery in test environments
+  if (process.env.VITEST || process.env.NODE_ENV === "test") {
+    return [];
+  }
+  try {
+    const response = await fetch(`${OLLAMA_API_BASE_URL}/api/tags`, {
+      signal: AbortSignal.timeout(5000),
+    });
+    if (!response.ok) {
+      console.warn(`Failed to discover Ollama models: ${response.status}`);
+      return [];
+    }
+    const data = (await response.json()) as OllamaTagsResponse;
+    if (!data.models || data.models.length === 0) {
+      console.warn("No Ollama models found on local instance");
+      return [];
+    }
+    return data.models.map((model) => {
+      const modelId = model.name;
+      const isReasoning =
+        modelId.toLowerCase().includes("r1") || modelId.toLowerCase().includes("reasoning");
+      return {
+        id: modelId,
+        name: modelId,
+        reasoning: isReasoning,
+        input: ["text"],
+        cost: OLLAMA_DEFAULT_COST,
+        contextWindow: OLLAMA_DEFAULT_CONTEXT_WINDOW,
+        maxTokens: OLLAMA_DEFAULT_MAX_TOKENS,
+      };
+    });
+  } catch (error) {
+    console.warn(`Failed to discover Ollama models: ${String(error)}`);
+    return [];
+  }
+}
 
 function normalizeApiKeyConfig(value: string): string {
   const trimmed = value.trim();
@@ -177,7 +255,7 @@ export function normalizeProviders(params: {
 function buildMinimaxProvider(): ProviderConfig {
   return {
     baseUrl: MINIMAX_API_BASE_URL,
-    api: "anthropic-messages",
+    api: "openai-completions",
     models: [
       {
         id: MINIMAX_DEFAULT_MODEL_ID,
@@ -208,7 +286,7 @@ function buildMoonshotProvider(): ProviderConfig {
     models: [
       {
         id: MOONSHOT_DEFAULT_MODEL_ID,
-        name: "Kimi K2 0905 Preview",
+        name: "Kimi K2.5",
         reasoning: false,
         input: ["text"],
         cost: MOONSHOT_DEFAULT_COST,
@@ -274,7 +352,45 @@ function buildSyntheticProvider(): ProviderConfig {
   };
 }
 
-export function resolveImplicitProviders(params: { agentDir: string }): ModelsConfig["providers"] {
+export function buildXiaomiProvider(): ProviderConfig {
+  return {
+    baseUrl: XIAOMI_BASE_URL,
+    api: "anthropic-messages",
+    models: [
+      {
+        id: XIAOMI_DEFAULT_MODEL_ID,
+        name: "Xiaomi MiMo V2 Flash",
+        reasoning: false,
+        input: ["text"],
+        cost: XIAOMI_DEFAULT_COST,
+        contextWindow: XIAOMI_DEFAULT_CONTEXT_WINDOW,
+        maxTokens: XIAOMI_DEFAULT_MAX_TOKENS,
+      },
+    ],
+  };
+}
+
+async function buildVeniceProvider(): Promise<ProviderConfig> {
+  const models = await discoverVeniceModels();
+  return {
+    baseUrl: VENICE_BASE_URL,
+    api: "openai-completions",
+    models,
+  };
+}
+
+async function buildOllamaProvider(): Promise<ProviderConfig> {
+  const models = await discoverOllamaModels();
+  return {
+    baseUrl: OLLAMA_BASE_URL,
+    api: "openai-completions",
+    models,
+  };
+}
+
+export async function resolveImplicitProviders(params: {
+  agentDir: string;
+}): Promise<ModelsConfig["providers"]> {
   const providers: Record<string, ProviderConfig> = {};
   const authStore = ensureAuthProfileStore(params.agentDir, {
     allowKeychainPrompt: false,
@@ -308,12 +424,34 @@ export function resolveImplicitProviders(params: { agentDir: string }): ModelsCo
     providers.synthetic = { ...buildSyntheticProvider(), apiKey: syntheticKey };
   }
 
+  const veniceKey =
+    resolveEnvApiKeyVarName("venice") ??
+    resolveApiKeyFromProfiles({ provider: "venice", store: authStore });
+  if (veniceKey) {
+    providers.venice = { ...(await buildVeniceProvider()), apiKey: veniceKey };
+  }
+
   const qwenProfiles = listProfilesForProvider(authStore, "qwen-portal");
   if (qwenProfiles.length > 0) {
     providers["qwen-portal"] = {
       ...buildQwenPortalProvider(),
       apiKey: QWEN_PORTAL_OAUTH_PLACEHOLDER,
     };
+  }
+
+  const xiaomiKey =
+    resolveEnvApiKeyVarName("xiaomi") ??
+    resolveApiKeyFromProfiles({ provider: "xiaomi", store: authStore });
+  if (xiaomiKey) {
+    providers.xiaomi = { ...buildXiaomiProvider(), apiKey: xiaomiKey };
+  }
+
+  // Ollama provider - only add if explicitly configured
+  const ollamaKey =
+    resolveEnvApiKeyVarName("ollama") ??
+    resolveApiKeyFromProfiles({ provider: "ollama", store: authStore });
+  if (ollamaKey) {
+    providers.ollama = { ...(await buildOllamaProvider()), apiKey: ollamaKey };
   }
 
   return providers;
@@ -357,15 +495,15 @@ export async function resolveImplicitCopilotProvider(params: {
 
   // pi-coding-agent's ModelRegistry marks a model "available" only if its
   // `AuthStorage` has auth configured for that provider (via auth.json/env/etc).
-  // Our Copilot auth lives in Clawdbot's auth-profiles store instead, so we also
+  // Our Copilot auth lives in Moltbot's auth-profiles store instead, so we also
   // write a runtime-only auth.json entry for pi-coding-agent to pick up.
   //
-  // This is safe because it's (1) within Clawdbot's agent dir, (2) contains the
+  // This is safe because it's (1) within Moltbot's agent dir, (2) contains the
   // GitHub token (not the exchanged Copilot token), and (3) matches existing
   // patterns for OAuth-like providers in pi-coding-agent.
   // Note: we deliberately do not write pi-coding-agent's `auth.json` here.
-  // Clawdbot uses its own auth store and exchanges tokens at runtime.
-  // `models list` uses Clawdbot's auth heuristics for availability.
+  // Moltbot uses its own auth store and exchanges tokens at runtime.
+  // `models list` uses Moltbot's auth heuristics for availability.
 
   // We intentionally do NOT define custom models for Copilot in models.json.
   // pi-coding-agent treats providers with models as replacements requiring apiKey.
@@ -373,5 +511,29 @@ export async function resolveImplicitCopilotProvider(params: {
   return {
     baseUrl,
     models: [],
+  } satisfies ProviderConfig;
+}
+
+export async function resolveImplicitBedrockProvider(params: {
+  agentDir: string;
+  config?: MoltbotConfig;
+  env?: NodeJS.ProcessEnv;
+}): Promise<ProviderConfig | null> {
+  const env = params.env ?? process.env;
+  const discoveryConfig = params.config?.models?.bedrockDiscovery;
+  const enabled = discoveryConfig?.enabled;
+  const hasAwsCreds = resolveAwsSdkEnvVarName(env) !== undefined;
+  if (enabled === false) return null;
+  if (enabled !== true && !hasAwsCreds) return null;
+
+  const region = discoveryConfig?.region ?? env.AWS_REGION ?? env.AWS_DEFAULT_REGION ?? "us-east-1";
+  const models = await discoverBedrockModels({ region, config: discoveryConfig });
+  if (models.length === 0) return null;
+
+  return {
+    baseUrl: `https://bedrock-runtime.${region}.amazonaws.com`,
+    api: "bedrock-converse-stream",
+    auth: "aws-sdk",
+    models,
   } satisfies ProviderConfig;
 }

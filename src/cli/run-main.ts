@@ -1,3 +1,4 @@
+import fs from "node:fs";
 import path from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
@@ -5,7 +6,7 @@ import { fileURLToPath } from "node:url";
 import { loadDotEnv } from "../infra/dotenv.js";
 import { normalizeEnv } from "../infra/env.js";
 import { isMainModule } from "../infra/is-main.js";
-import { ensureClawdbotCliOnPath } from "../infra/path-env.js";
+import { ensureMoltbotCliOnPath } from "../infra/path-env.js";
 import { assertSupportedRuntime } from "../infra/runtime-guard.js";
 import { formatUncaughtError } from "../infra/errors.js";
 import { installUnhandledRejectionHandler } from "../infra/unhandled-rejections.js";
@@ -26,7 +27,7 @@ export async function runCli(argv: string[] = process.argv) {
   const normalizedArgv = stripWindowsNodeExec(argv);
   loadDotEnv({ quiet: true });
   normalizeEnv();
-  ensureClawdbotCliOnPath();
+  ensureMoltbotCliOnPath();
 
   // Enforce the minimum supported runtime before doing any work.
   assertSupportedRuntime();
@@ -44,18 +45,26 @@ export async function runCli(argv: string[] = process.argv) {
   installUnhandledRejectionHandler();
 
   process.on("uncaughtException", (error) => {
-    console.error("[clawdbot] Uncaught exception:", formatUncaughtError(error));
+    console.error("[moltbot] Uncaught exception:", formatUncaughtError(error));
     process.exit(1);
   });
 
   const parseArgv = rewriteUpdateFlagArgv(normalizedArgv);
-  if (hasHelpOrVersion(parseArgv)) {
-    const primary = getPrimaryCommand(parseArgv);
-    if (primary) {
-      const { registerSubCliByName } = await import("./program/register.subclis.js");
-      await registerSubCliByName(program, primary);
-    }
+  // Register the primary subcommand if one exists (for lazy-loading)
+  const primary = getPrimaryCommand(parseArgv);
+  if (primary) {
+    const { registerSubCliByName } = await import("./program/register.subclis.js");
+    await registerSubCliByName(program, primary);
   }
+
+  const shouldSkipPluginRegistration = !primary && hasHelpOrVersion(parseArgv);
+  if (!shouldSkipPluginRegistration) {
+    // Register plugin CLI commands before parsing
+    const { registerPluginCliCommands } = await import("../plugins/cli.js");
+    const { loadConfig } = await import("../config/config.js");
+    registerPluginCliCommands(program, loadConfig());
+  }
+
   await program.parseAsync(parseArgv);
 }
 
@@ -82,13 +91,16 @@ function stripWindowsNodeExec(argv: string[]): string[] {
   const execBase = path.basename(execPath).toLowerCase();
   const isExecPath = (value: string | undefined): boolean => {
     if (!value) return false;
-    const lower = normalizeCandidate(value).toLowerCase();
+    const normalized = normalizeCandidate(value);
+    if (!normalized) return false;
+    const lower = normalized.toLowerCase();
     return (
       lower === execPathLower ||
       path.basename(lower) === execBase ||
       lower.endsWith("\\node.exe") ||
       lower.endsWith("/node.exe") ||
-      lower.includes("node.exe")
+      lower.includes("node.exe") ||
+      (path.basename(lower) === "node.exe" && fs.existsSync(normalized))
     );
   };
   const filtered = argv.filter((arg, index) => index === 0 || !isExecPath(arg));

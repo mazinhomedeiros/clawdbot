@@ -9,39 +9,42 @@ read_when:
 
 Last updated: 2026-01-21
 
-Clawdbot ships three update channels:
+Moltbot ships three update channels:
 
-- **stable**: tagged releases (`vYYYY.M.D` or `vYYYY.M.D-<patch>`). npm dist-tag: `latest`.
-- **beta**: prerelease tags (`vYYYY.M.D-beta.N`). npm dist-tag: `beta`.
+- **stable**: npm dist-tag `latest`.
+- **beta**: npm dist-tag `beta` (builds under test).
 - **dev**: moving head of `main` (git). npm dist-tag: `dev` (when published).
+
+We ship builds to **beta**, test them, then **promote a vetted build to `latest`**
+without changing the version number — dist-tags are the source of truth for npm installs.
 
 ## Switching channels
 
 Git checkout:
 
 ```bash
-clawdbot update --channel stable
-clawdbot update --channel beta
-clawdbot update --channel dev
+moltbot update --channel stable
+moltbot update --channel beta
+moltbot update --channel dev
 ```
 
-- `stable`/`beta` check out the latest matching tag.
+- `stable`/`beta` check out the latest matching tag (often the same tag).
 - `dev` switches to `main` and rebases on the upstream.
 
 npm/pnpm global install:
 
 ```bash
-clawdbot update --channel stable
-clawdbot update --channel beta
-clawdbot update --channel dev
+moltbot update --channel stable
+moltbot update --channel beta
+moltbot update --channel dev
 ```
 
 This updates via the corresponding npm dist-tag (`latest`, `beta`, `dev`).
 
-When you **explicitly** switch channels with `--channel`, Clawdbot also aligns
+When you **explicitly** switch channels with `--channel`, Moltbot also aligns
 the install method:
 
-- `dev` ensures a git checkout (default `~/clawdbot`, override with `CLAWDBOT_GIT_DIR`),
+- `dev` ensures a git checkout (default `~/moltbot`, override with `CLAWDBOT_GIT_DIR`),
   updates it, and installs the global CLI from that checkout.
 - `stable`/`beta` installs from npm using the matching dist-tag.
 
@@ -49,19 +52,18 @@ Tip: if you want stable + dev in parallel, keep two clones and point your gatewa
 
 ## Plugins and channels
 
-When you switch channels with `clawdbot update`, Clawdbot also syncs plugin sources:
+When you switch channels with `moltbot update`, Moltbot also syncs plugin sources:
 
 - `dev` prefers bundled plugins from the git checkout.
 - `stable` and `beta` restore npm-installed plugin packages.
 
 ## Tagging best practices
 
-- Stable: tag each release (`vYYYY.M.D` or `vYYYY.M.D-<patch>`).
-- Beta: use `vYYYY.M.D-beta.N` (increment `N`).
+- Tag releases you want git checkouts to land on (`vYYYY.M.D` or `vYYYY.M.D-<patch>`).
 - Keep tags immutable: never move or reuse a tag.
-- Publish dist-tags alongside git tags:
+- npm dist-tags remain the source of truth for npm installs:
   - `latest` → stable
-  - `beta` → prerelease
+  - `beta` → candidate build
   - `dev` → main snapshot (optional)
 
 ## macOS app availability

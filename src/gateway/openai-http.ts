@@ -20,6 +20,7 @@ import { getBearerToken, resolveAgentIdForRequest, resolveSessionKey } from "./h
 type OpenAiHttpOptions = {
   auth: ResolvedGatewayAuth;
   maxBodyBytes?: number;
+  trustedProxies?: string[];
 };
 
 type OpenAiChatMessage = {
@@ -168,6 +169,7 @@ export async function handleOpenAiHttpRequest(
     auth: opts.auth,
     connectAuth: { token, password: token },
     req,
+    trustedProxies: opts.trustedProxies,
   });
   if (!authResult.ok) {
     sendUnauthorized(res);
@@ -179,7 +181,7 @@ export async function handleOpenAiHttpRequest(
 
   const payload = coerceRequest(body);
   const stream = Boolean(payload.stream);
-  const model = typeof payload.model === "string" ? payload.model : "clawdbot";
+  const model = typeof payload.model === "string" ? payload.model : "moltbot";
   const user = typeof payload.user === "string" ? payload.user : undefined;
 
   const agentId = resolveAgentIdForRequest({ req, model });
@@ -221,7 +223,7 @@ export async function handleOpenAiHttpRequest(
               .map((p) => (typeof p.text === "string" ? p.text : ""))
               .filter(Boolean)
               .join("\n\n")
-          : "No response from Clawdbot.";
+          : "No response from Moltbot.";
 
       sendJson(res, 200, {
         id: runId,
@@ -342,7 +344,7 @@ export async function handleOpenAiHttpRequest(
                 .map((p) => (typeof p.text === "string" ? p.text : ""))
                 .filter(Boolean)
                 .join("\n\n")
-            : "No response from Clawdbot.";
+            : "No response from Moltbot.";
 
         sawAssistantDelta = true;
         writeSse(res, {

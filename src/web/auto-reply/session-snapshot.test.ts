@@ -12,9 +12,9 @@ describe("getSessionSnapshot", () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date(2026, 0, 18, 5, 0, 0));
     try {
-      const root = await fs.mkdtemp(path.join(os.tmpdir(), "clawdbot-snapshot-"));
+      const root = await fs.mkdtemp(path.join(os.tmpdir(), "moltbot-snapshot-"));
       const storePath = path.join(root, "sessions.json");
-      const sessionKey = "agent:main:whatsapp:dm:S1";
+      const sessionKey = "agent:main:whatsapp:dm:s1";
 
       await saveSessionStore(storePath, {
         [sessionKey]: {

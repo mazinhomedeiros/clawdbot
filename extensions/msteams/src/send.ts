@@ -1,5 +1,5 @@
 import { loadWebMedia, resolveChannelMediaMaxBytes } from "clawdbot/plugin-sdk";
-import type { ClawdbotConfig } from "clawdbot/plugin-sdk";
+import type { MoltbotConfig } from "clawdbot/plugin-sdk";
 import { createMSTeamsConversationStoreFs } from "./conversation-store-fs.js";
 import {
   classifyMSTeamsSendError,
@@ -16,11 +16,12 @@ import {
 import { extractFilename, extractMessageId } from "./media-helpers.js";
 import { buildConversationReference, sendMSTeamsMessages } from "./messenger.js";
 import { buildMSTeamsPollCard } from "./polls.js";
+import { getMSTeamsRuntime } from "./runtime.js";
 import { resolveMSTeamsSendContext, type MSTeamsProactiveContext } from "./send-context.js";
 
 export type SendMSTeamsMessageParams = {
   /** Full config (for credentials) */
-  cfg: ClawdbotConfig;
+  cfg: MoltbotConfig;
   /** Conversation ID or user ID to send to */
   to: string;
   /** Message text */
@@ -47,7 +48,7 @@ const MSTEAMS_MAX_MEDIA_BYTES = 100 * 1024 * 1024;
 
 export type SendMSTeamsPollParams = {
   /** Full config (for credentials) */
-  cfg: ClawdbotConfig;
+  cfg: MoltbotConfig;
   /** Conversation ID or user ID to send to */
   to: string;
   /** Poll question */
@@ -66,7 +67,7 @@ export type SendMSTeamsPollResult = {
 
 export type SendMSTeamsCardParams = {
   /** Full config (for credentials) */
-  cfg: ClawdbotConfig;
+  cfg: MoltbotConfig;
   /** Conversation ID or user ID to send to */
   to: string;
   /** Adaptive Card JSON object */
@@ -93,13 +94,21 @@ export async function sendMessageMSTeams(
   params: SendMSTeamsMessageParams,
 ): Promise<SendMSTeamsMessageResult> {
   const { cfg, to, text, mediaUrl } = params;
+  const tableMode = getMSTeamsRuntime().channel.text.resolveMarkdownTableMode({
+    cfg,
+    channel: "msteams",
+  });
+  const messageText = getMSTeamsRuntime().channel.text.convertMarkdownTables(
+    text ?? "",
+    tableMode,
+  );
   const ctx = await resolveMSTeamsSendContext({ cfg, to });
   const { adapter, appId, conversationId, ref, log, conversationType, tokenProvider, sharePointSiteId } = ctx;
 
   log.debug("sending proactive message", {
     conversationId,
     conversationType,
-    textLength: text.length,
+    textLength: messageText.length,
     hasMedia: Boolean(mediaUrl),
   });
 
@@ -134,7 +143,7 @@ export async function sendMessageMSTeams(
       const { activity, uploadId } = prepareFileConsentActivity({
         media: { buffer: media.buffer, filename: fileName, contentType: media.contentType },
         conversationId,
-        description: text || undefined,
+        description: messageText || undefined,
       });
 
       log.debug("sending file consent card", { uploadId, fileName, size: media.buffer.length });
@@ -172,14 +181,14 @@ export async function sendMessageMSTeams(
       const base64 = media.buffer.toString("base64");
       const finalMediaUrl = `data:${media.contentType};base64,${base64}`;
 
-      return sendTextWithMedia(ctx, text, finalMediaUrl);
+      return sendTextWithMedia(ctx, messageText, finalMediaUrl);
     }
 
     if (isImage && !sharePointSiteId) {
       // Group chat/channel without SharePoint: send image inline (avoids OneDrive failures)
       const base64 = media.buffer.toString("base64");
       const finalMediaUrl = `data:${media.contentType};base64,${base64}`;
-      return sendTextWithMedia(ctx, text, finalMediaUrl);
+      return sendTextWithMedia(ctx, messageText, finalMediaUrl);
     }
 
     // Group chat or channel: upload to SharePoint (if siteId configured) or OneDrive
@@ -223,7 +232,7 @@ export async function sendMessageMSTeams(
         const fileCardAttachment = buildTeamsFileInfoCard(driveItem);
         const activity = {
           type: "message",
-          text: text || undefined,
+          text: messageText || undefined,
           attachments: [fileCardAttachment],
         };
 
@@ -264,7 +273,7 @@ export async function sendMessageMSTeams(
       const fileLink = `📎 [${uploaded.name}](${uploaded.shareUrl})`;
       const activity = {
         type: "message",
-        text: text ? `${text}\n\n${fileLink}` : fileLink,
+        text: messageText ? `${messageText}\n\n${fileLink}` : fileLink,
       };
 
       const baseRef = buildConversationReference(ref);
@@ -290,7 +299,7 @@ export async function sendMessageMSTeams(
   }
 
   // No media: send text only
-  return sendTextWithMedia(ctx, text, undefined);
+  return sendTextWithMedia(ctx, messageText, undefined);
 }
 
 /**

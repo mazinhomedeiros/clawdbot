@@ -1,11 +1,11 @@
 ---
-summary: "CLI reference for `clawdbot node` (headless node host)"
+summary: "CLI reference for `moltbot node` (headless node host)"
 read_when:
   - Running the headless node host
   - Pairing a non-macOS node for system.run
 ---
 
-# `clawdbot node`
+# `moltbot node`
 
 Run a **headless node host** that connects to the Gateway WebSocket and exposes
 `system.run` / `system.which` on this machine.
@@ -23,10 +23,28 @@ Common use cases:
 Execution is still guarded by **exec approvals** and per‑agent allowlists on the
 node host, so you can keep command access scoped and explicit.
 
+## Browser proxy (zero-config)
+
+Node hosts automatically advertise a browser proxy if `browser.enabled` is not
+disabled on the node. This lets the agent use browser automation on that node
+without extra configuration.
+
+Disable it on the node if needed:
+
+```json5
+{
+  nodeHost: {
+    browserProxy: {
+      enabled: false
+    }
+  }
+}
+```
+
 ## Run (foreground)
 
 ```bash
-clawdbot node run --host <gateway-host> --port 18789
+moltbot node run --host <gateway-host> --port 18789
 ```
 
 Options:
@@ -42,7 +60,7 @@ Options:
 Install a headless node host as a user service.
 
 ```bash
-clawdbot node install --host <gateway-host> --port 18789
+moltbot node install --host <gateway-host> --port 18789
 ```
 
 Options:
@@ -58,13 +76,13 @@ Options:
 Manage the service:
 
 ```bash
-clawdbot node status
-clawdbot node stop
-clawdbot node restart
-clawdbot node uninstall
+moltbot node status
+moltbot node stop
+moltbot node restart
+moltbot node uninstall
 ```
 
-Use `clawdbot node run` for a foreground node host (no service).
+Use `moltbot node run` for a foreground node host (no service).
 
 Service commands accept `--json` for machine-readable output.
 
@@ -74,8 +92,8 @@ The first connection creates a pending node pair request on the Gateway.
 Approve it via:
 
 ```bash
-clawdbot nodes pending
-clawdbot nodes approve <requestId>
+moltbot nodes pending
+moltbot nodes approve <requestId>
 ```
 
 The node host stores its node id, token, display name, and gateway connection info in
@@ -87,4 +105,4 @@ The node host stores its node id, token, display name, and gateway connection in
 
 - `~/.clawdbot/exec-approvals.json`
 - [Exec approvals](/tools/exec-approvals)
-- `clawdbot approvals --node <id|name|ip>` (edit from the Gateway)
+- `moltbot approvals --node <id|name|ip>` (edit from the Gateway)

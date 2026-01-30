@@ -22,10 +22,11 @@ vi.mock("../config/config.js", async (importOriginal) => {
 });
 
 import { emitAgentEvent } from "../infra/agent-events.js";
-import { createClawdbotTools } from "./clawdbot-tools.js";
+import "./test-helpers/fast-core-tools.js";
+import { createMoltbotTools } from "./moltbot-tools.js";
 import { resetSubagentRegistryForTests } from "./subagent-registry.js";
 
-describe("clawdbot-tools: subagents", () => {
+describe("moltbot-tools: subagents", () => {
   beforeEach(() => {
     configOverride = {
       session: {
@@ -94,7 +95,7 @@ describe("clawdbot-tools: subagents", () => {
       return {};
     });
 
-    const tool = createClawdbotTools({
+    const tool = createMoltbotTools({
       agentSessionKey: "main",
       agentChannel: "whatsapp",
     }).find((candidate) => candidate.name === "sessions_spawn");
@@ -154,7 +155,7 @@ describe("clawdbot-tools: subagents", () => {
     resetSubagentRegistryForTests();
     callGatewayMock.mockReset();
 
-    const tool = createClawdbotTools({
+    const tool = createMoltbotTools({
       agentSessionKey: "main",
       agentChannel: "whatsapp",
     }).find((candidate) => candidate.name === "sessions_spawn");

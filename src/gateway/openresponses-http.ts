@@ -1,7 +1,7 @@
 /**
  * OpenResponses HTTP Handler
  *
- * Implements the OpenResponses `/v1/responses` endpoint for Clawdbot Gateway.
+ * Implements the OpenResponses `/v1/responses` endpoint for Moltbot Gateway.
  *
  * @see https://www.open-responses.com/
  */
@@ -60,6 +60,7 @@ type OpenResponsesHttpOptions = {
   auth: ResolvedGatewayAuth;
   maxBodyBytes?: number;
   config?: GatewayHttpResponsesConfig;
+  trustedProxies?: string[];
 };
 
 const DEFAULT_BODY_BYTES = 20 * 1024 * 1024;
@@ -331,6 +332,7 @@ export async function handleOpenResponsesHttpRequest(
     auth: opts.auth,
     connectAuth: { token, password: token },
     req,
+    trustedProxies: opts.trustedProxies,
   });
   if (!authResult.ok) {
     sendUnauthorized(res);
@@ -550,7 +552,7 @@ export async function handleOpenResponsesHttpRequest(
               .map((p) => (typeof p.text === "string" ? p.text : ""))
               .filter(Boolean)
               .join("\n\n")
-          : "No response from Clawdbot.";
+          : "No response from Moltbot.";
 
       const response = createResponseResource({
         id: responseId,
@@ -704,7 +706,7 @@ export async function handleOpenResponsesHttpRequest(
     if (evt.stream === "lifecycle") {
       const phase = evt.data?.phase;
       if (phase === "end" || phase === "error") {
-        const finalText = accumulatedText || "No response from Clawdbot.";
+        const finalText = accumulatedText || "No response from Moltbot.";
         const finalStatus = phase === "error" ? "failed" : "completed";
         requestFinalize(finalStatus, finalText);
       }
@@ -829,7 +831,7 @@ export async function handleOpenResponsesHttpRequest(
                 .map((p) => (typeof p.text === "string" ? p.text : ""))
                 .filter(Boolean)
                 .join("\n\n")
-            : "No response from Clawdbot.";
+            : "No response from Moltbot.";
 
         accumulatedText = content;
         sawAssistantDelta = true;

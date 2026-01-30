@@ -1,30 +1,31 @@
 ---
-summary: "CLI reference for `clawdbot message` (send + channel actions)"
+summary: "CLI reference for `moltbot message` (send + channel actions)"
 read_when:
   - Adding or modifying message CLI actions
   - Changing outbound channel behavior
 ---
 
-# `clawdbot message`
+# `moltbot message`
 
 Single outbound command for sending messages and channel actions
-(Discord/Slack/Mattermost (plugin)/Telegram/WhatsApp/Signal/iMessage/MS Teams).
+(Discord/Google Chat/Slack/Mattermost (plugin)/Telegram/WhatsApp/Signal/iMessage/MS Teams).
 
 ## Usage
 
 ```
-clawdbot message <subcommand> [flags]
+moltbot message <subcommand> [flags]
 ```
 
 Channel selection:
 - `--channel` required if more than one channel is configured.
 - If exactly one channel is configured, it becomes the default.
-- Values: `whatsapp|telegram|discord|slack|mattermost|signal|imessage|msteams` (Mattermost requires plugin)
+- Values: `whatsapp|telegram|discord|googlechat|slack|mattermost|signal|imessage|msteams` (Mattermost requires plugin)
 
 Target formats (`--target`):
 - WhatsApp: E.164 or group JID
 - Telegram: chat id or `@username`
 - Discord: `channel:<id>` or `user:<id>` (or `<@id>` mention; raw numeric ids are treated as channels)
+- Google Chat: `spaces/<spaceId>` or `users/<userId>`
 - Slack: `channel:<id>` or `user:<id>` (raw channel id is accepted)
 - Mattermost (plugin): `channel:<id>`, `user:<id>`, or `@username` (bare ids are treated as channels)
 - Signal: `+E.164`, `group:<id>`, `signal:+E.164`, `signal:group:<id>`, or `username:<name>`/`u:<name>`
@@ -33,7 +34,7 @@ Target formats (`--target`):
 
 Name lookup:
 - For supported providers (Discord/Slack/etc), channel names like `Help` or `#help` are resolved via the directory cache.
-- On cache miss, Clawdbot will attempt a live directory lookup when the provider supports it.
+- On cache miss, Moltbot will attempt a live directory lookup when the provider supports it.
 
 ## Common flags
 
@@ -50,7 +51,7 @@ Name lookup:
 ### Core
 
 - `send`
-  - Channels: WhatsApp/Telegram/Discord/Slack/Mattermost (plugin)/Signal/iMessage/MS Teams
+  - Channels: WhatsApp/Telegram/Discord/Google Chat/Slack/Mattermost (plugin)/Signal/iMessage/MS Teams
   - Required: `--target`, plus `--message` or `--media`
   - Optional: `--media`, `--reply-to`, `--thread-id`, `--gif-playback`
   - Telegram only: `--buttons` (requires `channels.telegram.capabilities.inlineButtons` to allow it)
@@ -65,14 +66,15 @@ Name lookup:
   - Discord only: `--poll-duration-hours`, `--message`
 
 - `react`
-  - Channels: Discord/Slack/Telegram/WhatsApp
+  - Channels: Discord/Google Chat/Slack/Telegram/WhatsApp/Signal
   - Required: `--message-id`, `--target`
-  - Optional: `--emoji`, `--remove`, `--participant`, `--from-me`
+  - Optional: `--emoji`, `--remove`, `--participant`, `--from-me`, `--target-author`, `--target-author-uuid`
   - Note: `--remove` requires `--emoji` (omit `--emoji` to clear own reactions where supported; see /tools/reactions)
   - WhatsApp only: `--participant`, `--from-me`
+  - Signal group reactions: `--target-author` or `--target-author-uuid` required
 
 - `reactions`
-  - Channels: Discord/Slack
+  - Channels: Discord/Google Chat/Slack
   - Required: `--message-id`, `--target`
   - Optional: `--limit`
 
@@ -179,13 +181,13 @@ Name lookup:
 
 Send a Discord reply:
 ```
-clawdbot message send --channel discord \
+moltbot message send --channel discord \
   --target channel:123 --message "hi" --reply-to 456
 ```
 
 Create a Discord poll:
 ```
-clawdbot message poll --channel discord \
+moltbot message poll --channel discord \
   --target channel:123 \
   --poll-question "Snack?" \
   --poll-option Pizza --poll-option Sushi \
@@ -194,13 +196,13 @@ clawdbot message poll --channel discord \
 
 Send a Teams proactive message:
 ```
-clawdbot message send --channel msteams \
+moltbot message send --channel msteams \
   --target conversation:19:abc@thread.tacv2 --message "hi"
 ```
 
 Create a Teams poll:
 ```
-clawdbot message poll --channel msteams \
+moltbot message poll --channel msteams \
   --target conversation:19:abc@thread.tacv2 \
   --poll-question "Lunch?" \
   --poll-option Pizza --poll-option Sushi
@@ -208,12 +210,19 @@ clawdbot message poll --channel msteams \
 
 React in Slack:
 ```
-clawdbot message react --channel slack \
+moltbot message react --channel slack \
   --target C123 --message-id 456 --emoji "✅"
+```
+
+React in a Signal group:
+```
+moltbot message react --channel signal \
+  --target signal:group:abc123 --message-id 1737630212345 \
+  --emoji "✅" --target-author-uuid 123e4567-e89b-12d3-a456-426614174000
 ```
 
 Send Telegram inline buttons:
 ```
-clawdbot message send --channel telegram --target @mychat --message "Choose:" \
+moltbot message send --channel telegram --target @mychat --message "Choose:" \
   --buttons '[ [{"text":"Yes","callback_data":"cmd:yes"}], [{"text":"No","callback_data":"cmd:no"}] ]'
 ```

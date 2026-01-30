@@ -1,7 +1,7 @@
 import type { SkillEligibilityContext, SkillEntry } from "../agents/skills.js";
 import { loadWorkspaceSkillEntries } from "../agents/skills.js";
 import { resolveAgentWorkspaceDir, resolveDefaultAgentId } from "../agents/agent-scope.js";
-import type { ClawdbotConfig } from "../config/config.js";
+import type { MoltbotConfig } from "../config/config.js";
 import { listNodePairing, updatePairedNodeMetadata } from "./node-pairing.js";
 import { createSubsystemLogger } from "../logging/subsystem.js";
 import { bumpSkillsSnapshotVersion } from "../agents/skills/refresh.js";
@@ -55,10 +55,10 @@ function extractErrorMessage(err: unknown): string | undefined {
 function logRemoteBinProbeFailure(nodeId: string, err: unknown) {
   const message = extractErrorMessage(err);
   const label = describeNode(nodeId);
-  if (message?.includes("node not connected")) {
-    log.info(
-      `remote bin probe skipped: node not connected (${label}); check nodes list/status for ${label}`,
-    );
+  // Node unavailable errors (not connected or disconnected mid-operation) are expected
+  // when nodes have transient connections - log at info level instead of warn
+  if (message?.includes("node not connected") || message?.includes("node disconnected")) {
+    log.info(`remote bin probe skipped: node unavailable (${label})`);
     return;
   }
   if (message?.includes("invoke timed out") || message?.includes("timeout")) {
@@ -156,7 +156,7 @@ export function recordRemoteNodeBins(nodeId: string, bins: string[]) {
   upsertNode({ nodeId, bins });
 }
 
-function listWorkspaceDirs(cfg: ClawdbotConfig): string[] {
+function listWorkspaceDirs(cfg: MoltbotConfig): string[] {
   const dirs = new Set<string>();
   const list = cfg.agents?.list;
   if (Array.isArray(list)) {
@@ -173,10 +173,10 @@ function listWorkspaceDirs(cfg: ClawdbotConfig): string[] {
 function collectRequiredBins(entries: SkillEntry[], targetPlatform: string): string[] {
   const bins = new Set<string>();
   for (const entry of entries) {
-    const os = entry.clawdbot?.os ?? [];
+    const os = entry.metadata?.os ?? [];
     if (os.length > 0 && !os.includes(targetPlatform)) continue;
-    const required = entry.clawdbot?.requires?.bins ?? [];
-    const anyBins = entry.clawdbot?.requires?.anyBins ?? [];
+    const required = entry.metadata?.requires?.bins ?? [];
+    const anyBins = entry.metadata?.requires?.anyBins ?? [];
     for (const bin of required) {
       if (bin.trim()) bins.add(bin.trim());
     }
@@ -213,12 +213,21 @@ function parseBinProbePayload(payloadJSON: string | null | undefined, payload?: 
   return [];
 }
 
+function areBinSetsEqual(a: Set<string> | undefined, b: Set<string>): boolean {
+  if (!a) return false;
+  if (a.size !== b.size) return false;
+  for (const bin of b) {
+    if (!a.has(bin)) return false;
+  }
+  return true;
+}
+
 export async function refreshRemoteNodeBins(params: {
   nodeId: string;
   platform?: string;
   deviceFamily?: string;
   commands?: string[];
-  cfg: ClawdbotConfig;
+  cfg: MoltbotConfig;
   timeoutMs?: number;
 }) {
   if (!remoteRegistry) return;
@@ -261,7 +270,11 @@ export async function refreshRemoteNodeBins(params: {
       return;
     }
     const bins = parseBinProbePayload(res.payloadJSON, res.payload);
+    const existingBins = remoteNodes.get(params.nodeId)?.bins;
+    const nextBins = new Set(bins);
+    const hasChanged = !areBinSetsEqual(existingBins, nextBins);
     recordRemoteNodeBins(params.nodeId, bins);
+    if (!hasChanged) return;
     await updatePairedNodeMetadata(params.nodeId, { bins });
     bumpSkillsSnapshotVersion({ reason: "remote-node" });
   } catch (err) {
@@ -291,7 +304,7 @@ export function getRemoteSkillEligibility(): SkillEligibilityContext["remote"] |
   };
 }
 
-export async function refreshRemoteBinsForConnectedNodes(cfg: ClawdbotConfig) {
+export async function refreshRemoteBinsForConnectedNodes(cfg: MoltbotConfig) {
   if (!remoteRegistry) return;
   const connected = remoteRegistry.listConnected();
   for (const node of connected) {

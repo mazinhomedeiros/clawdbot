@@ -1,18 +1,25 @@
 import type { AssistantMessage } from "@mariozechner/pi-ai";
 
-import type { ClawdbotConfig } from "../../config/config.js";
+import type { MoltbotConfig } from "../../config/config.js";
 import { formatSandboxToolPolicyBlockedMessage } from "../sandbox.js";
 import type { FailoverReason } from "./types.js";
 
 export function isContextOverflowError(errorMessage?: string): boolean {
   if (!errorMessage) return false;
   const lower = errorMessage.toLowerCase();
+  const hasRequestSizeExceeds = lower.includes("request size exceeds");
+  const hasContextWindow =
+    lower.includes("context window") ||
+    lower.includes("context length") ||
+    lower.includes("maximum context length");
   return (
     lower.includes("request_too_large") ||
     lower.includes("request exceeds the maximum size") ||
     lower.includes("context length exceeded") ||
     lower.includes("maximum context length") ||
     lower.includes("prompt is too long") ||
+    lower.includes("exceeds model context window") ||
+    (hasRequestSizeExceeds && hasContextWindow) ||
     lower.includes("context overflow") ||
     (lower.includes("413") && lower.includes("too large"))
   );
@@ -68,6 +75,29 @@ const HTTP_ERROR_HINTS = [
 function stripFinalTagsFromText(text: string): string {
   if (!text) return text;
   return text.replace(FINAL_TAG_RE, "");
+}
+
+function collapseConsecutiveDuplicateBlocks(text: string): string {
+  const trimmed = text.trim();
+  if (!trimmed) return text;
+  const blocks = trimmed.split(/\n{2,}/);
+  if (blocks.length < 2) return text;
+
+  const normalizeBlock = (value: string) => value.trim().replace(/\s+/g, " ");
+  const result: string[] = [];
+  let lastNormalized: string | null = null;
+
+  for (const block of blocks) {
+    const normalized = normalizeBlock(block);
+    if (lastNormalized && normalized === lastNormalized) {
+      continue;
+    }
+    result.push(block.trim());
+    lastNormalized = normalized;
+  }
+
+  if (result.length === blocks.length) return text;
+  return result.join("\n\n");
 }
 
 function isLikelyHttpErrorText(raw: string): boolean {
@@ -222,7 +252,7 @@ export function formatRawAssistantErrorForUi(raw?: string): string {
 
 export function formatAssistantErrorText(
   msg: AssistantMessage,
-  opts?: { cfg?: ClawdbotConfig; sessionKey?: string },
+  opts?: { cfg?: MoltbotConfig; sessionKey?: string },
 ): string | undefined {
   // Also format errors if errorMessage is present, even if stopReason isn't "error"
   const raw = (msg.errorMessage ?? "").trim();
@@ -314,7 +344,7 @@ export function sanitizeUserFacingText(text: string): string {
     return formatRawAssistantErrorForUi(trimmed);
   }
 
-  return stripped;
+  return collapseConsecutiveDuplicateBlocks(stripped);
 }
 
 export function isRateLimitAssistantError(msg: AssistantMessage | undefined): boolean {
@@ -371,6 +401,7 @@ const ERROR_PATTERNS = {
 const IMAGE_DIMENSION_ERROR_RE =
   /image dimensions exceed max allowed size for many-image requests:\s*(\d+)\s*pixels/i;
 const IMAGE_DIMENSION_PATH_RE = /messages\.(\d+)\.content\.(\d+)\.image/i;
+const IMAGE_SIZE_ERROR_RE = /image exceeds\s*(\d+(?:\.\d+)?)\s*mb/i;
 
 function matchesErrorPatterns(raw: string, patterns: readonly ErrorPattern[]): boolean {
   if (!raw) return false;
@@ -437,6 +468,25 @@ export function isImageDimensionErrorMessage(raw: string): boolean {
   return Boolean(parseImageDimensionError(raw));
 }
 
+export function parseImageSizeError(raw: string): {
+  maxMb?: number;
+  raw: string;
+} | null {
+  if (!raw) return null;
+  const lower = raw.toLowerCase();
+  if (!lower.includes("image exceeds") || !lower.includes("mb")) return null;
+  const match = raw.match(IMAGE_SIZE_ERROR_RE);
+  return {
+    maxMb: match?.[1] ? Number.parseFloat(match[1]) : undefined,
+    raw,
+  };
+}
+
+export function isImageSizeError(errorMessage?: string): boolean {
+  if (!errorMessage) return false;
+  return Boolean(parseImageSizeError(errorMessage));
+}
+
 export function isCloudCodeAssistFormatError(raw: string): boolean {
   return !isImageDimensionErrorMessage(raw) && matchesErrorPatterns(raw, ERROR_PATTERNS.format);
 }
@@ -448,6 +498,7 @@ export function isAuthAssistantError(msg: AssistantMessage | undefined): boolean
 
 export function classifyFailoverReason(raw: string): FailoverReason | null {
   if (isImageDimensionErrorMessage(raw)) return null;
+  if (isImageSizeError(raw)) return null;
   if (isRateLimitErrorMessage(raw)) return "rate_limit";
   if (isOverloadedErrorMessage(raw)) return "rate_limit";
   if (isCloudCodeAssistFormatError(raw)) return "format";

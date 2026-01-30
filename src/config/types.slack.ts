@@ -2,9 +2,12 @@ import type {
   BlockStreamingCoalesceConfig,
   DmPolicy,
   GroupPolicy,
+  MarkdownConfig,
   ReplyToMode,
 } from "./types.base.js";
+import type { ChannelHeartbeatVisibilityConfig } from "./types.channels.js";
 import type { DmConfig, ProviderCommandsConfig } from "./types.messages.js";
+import type { GroupToolPolicyBySenderConfig, GroupToolPolicyConfig } from "./types.tools.js";
 
 export type SlackDmConfig = {
   /** If false, ignore all incoming Slack DMs. Default: true. */
@@ -28,6 +31,9 @@ export type SlackChannelConfig = {
   allow?: boolean;
   /** Require mentioning the bot to trigger replies. */
   requireMention?: boolean;
+  /** Optional tool policy overrides for this channel. */
+  tools?: GroupToolPolicyConfig;
+  toolsBySender?: GroupToolPolicyBySenderConfig;
   /** Allow bot-authored messages to trigger replies (default: false). */
   allowBots?: boolean;
   /** Allowlist of users that can invoke the bot in this channel. */
@@ -80,6 +86,8 @@ export type SlackAccountConfig = {
   webhookPath?: string;
   /** Optional provider capability tags used for agent/runtime guidance. */
   capabilities?: string[];
+  /** Markdown formatting overrides (tables). */
+  markdown?: MarkdownConfig;
   /** Override native command registration for Slack (bool or "auto"). */
   commands?: ProviderCommandsConfig;
   /** Allow channel-initiated config writes (default: true). */
@@ -109,6 +117,8 @@ export type SlackAccountConfig = {
   /** Per-DM config overrides keyed by user ID. */
   dms?: Record<string, DmConfig>;
   textChunkLimit?: number;
+  /** Chunking mode: "length" (default) splits by size; "newline" splits on every newline. */
+  chunkMode?: "length" | "newline";
   blockStreaming?: boolean;
   /** Merge streamed block replies before sending. */
   blockStreamingCoalesce?: BlockStreamingCoalesceConfig;
@@ -130,6 +140,8 @@ export type SlackAccountConfig = {
   slashCommand?: SlackSlashCommandConfig;
   dm?: SlackDmConfig;
   channels?: Record<string, SlackChannelConfig>;
+  /** Heartbeat visibility settings for this channel. */
+  heartbeat?: ChannelHeartbeatVisibilityConfig;
 };
 
 export type SlackConfig = {

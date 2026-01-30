@@ -1,4 +1,9 @@
-import type { ClawdbotConfig, RuntimeEnv } from "clawdbot/plugin-sdk";
+import {
+  logInboundDrop,
+  resolveControlCommandGate,
+  type MoltbotConfig,
+  type RuntimeEnv,
+} from "clawdbot/plugin-sdk";
 
 import type { ResolvedNextcloudTalkAccount } from "./accounts.js";
 import {
@@ -109,7 +114,7 @@ export async function handleNextcloudTalkInbound(params: {
   const effectiveGroupAllowFrom = [...baseGroupAllowFrom, ...storeAllowList].filter(Boolean);
 
   const allowTextCommands = core.channel.commands.shouldHandleTextCommands({
-    cfg: config as ClawdbotConfig,
+    cfg: config as MoltbotConfig,
     surface: CHANNEL_ID,
   });
   const useAccessGroups = config.commands?.useAccessGroups !== false;
@@ -118,7 +123,11 @@ export async function handleNextcloudTalkInbound(params: {
     senderId,
     senderName,
   }).allowed;
-  const commandAuthorized = core.channel.commands.resolveCommandAuthorizedFromAuthorizers({
+  const hasControlCommand = core.channel.text.hasControlCommand(
+    rawBody,
+    config as MoltbotConfig,
+  );
+  const commandGate = resolveControlCommandGate({
     useAccessGroups,
     authorizers: [
       {
@@ -127,7 +136,10 @@ export async function handleNextcloudTalkInbound(params: {
         allowed: senderAllowedForCommands,
       },
     ],
+    allowTextCommands,
+    hasControlCommand,
   });
+  const commandAuthorized = commandGate.commandAuthorized;
 
   if (isGroup) {
     const groupAllow = resolveNextcloudTalkGroupAllow({
@@ -188,20 +200,18 @@ export async function handleNextcloudTalkInbound(params: {
     }
   }
 
-  if (
-    isGroup &&
-    allowTextCommands &&
-    core.channel.text.hasControlCommand(rawBody, config as ClawdbotConfig) &&
-    commandAuthorized !== true
-  ) {
-    runtime.log?.(
-      `nextcloud-talk: drop control command from unauthorized sender ${senderId}`,
-    );
+  if (isGroup && commandGate.shouldBlock) {
+    logInboundDrop({
+      log: (message) => runtime.log?.(message),
+      channel: CHANNEL_ID,
+      reason: "control command (unauthorized)",
+      target: senderId,
+    });
     return;
   }
 
   const mentionRegexes = core.channel.mentions.buildMentionRegexes(
-    config as ClawdbotConfig,
+    config as MoltbotConfig,
   );
   const wasMentioned = mentionRegexes.length
     ? core.channel.mentions.matchesMentionPatterns(rawBody, mentionRegexes)
@@ -212,10 +222,6 @@ export async function handleNextcloudTalkInbound(params: {
         wildcardConfig: roomMatch.wildcardConfig,
       })
     : false;
-  const hasControlCommand = core.channel.text.hasControlCommand(
-    rawBody,
-    config as ClawdbotConfig,
-  );
   const mentionGate = resolveNextcloudTalkMentionGate({
     isGroup,
     requireMention: shouldRequireMention,
@@ -230,7 +236,7 @@ export async function handleNextcloudTalkInbound(params: {
   }
 
   const route = core.channel.routing.resolveAgentRoute({
-    cfg: config as ClawdbotConfig,
+    cfg: config as MoltbotConfig,
     channel: CHANNEL_ID,
     accountId: account.accountId,
     peer: {
@@ -246,7 +252,7 @@ export async function handleNextcloudTalkInbound(params: {
     agentId: route.agentId,
   });
   const envelopeOptions = core.channel.reply.resolveEnvelopeFormatOptions(
-    config as ClawdbotConfig,
+    config as MoltbotConfig,
   );
   const previousTimestamp = core.channel.session.readSessionUpdatedAt({
     storePath,
@@ -287,19 +293,18 @@ export async function handleNextcloudTalkInbound(params: {
     CommandAuthorized: commandAuthorized,
   });
 
-  void core.channel.session
-    .recordSessionMetaFromInbound({
-      storePath,
-      sessionKey: ctxPayload.SessionKey ?? route.sessionKey,
-      ctx: ctxPayload,
-    })
-    .catch((err) => {
+  await core.channel.session.recordInboundSession({
+    storePath,
+    sessionKey: ctxPayload.SessionKey ?? route.sessionKey,
+    ctx: ctxPayload,
+    onRecordError: (err) => {
       runtime.error?.(`nextcloud-talk: failed updating session meta: ${String(err)}`);
-    });
+    },
+  });
 
   await core.channel.reply.dispatchReplyWithBufferedBlockDispatcher({
     ctx: ctxPayload,
-    cfg: config as ClawdbotConfig,
+    cfg: config as MoltbotConfig,
     dispatcherOptions: {
       deliver: async (payload) => {
         await deliverNextcloudTalkReply({

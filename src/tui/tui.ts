@@ -90,6 +90,7 @@ export async function runTui(opts: TuiOptions) {
   let activeChatRunId: string | null = null;
   let historyLoaded = false;
   let isConnected = false;
+  let wasDisconnected = false;
   let toolsExpanded = false;
   let showThinking = false;
 
@@ -245,6 +246,7 @@ export async function runTui(opts: TuiOptions) {
     editor.setAutocompleteProvider(
       new CombinedAutocompleteProvider(
         getSlashCommands({
+          cfg: config,
           provider: sessionInfo.modelProvider,
           model: sessionInfo.model,
         }),
@@ -288,7 +290,7 @@ export async function runTui(opts: TuiOptions) {
     const agentLabel = formatAgentLabel(currentAgentId);
     header.setText(
       theme.header(
-        `clawdbot tui - ${client.connection.url} - agent ${agentLabel} - session ${sessionLabel}`,
+        `moltbot tui - ${client.connection.url} - agent ${agentLabel} - session ${sessionLabel}`,
       ),
     );
   };
@@ -583,20 +585,18 @@ export async function runTui(opts: TuiOptions) {
 
   client.onConnected = () => {
     isConnected = true;
+    const reconnected = wasDisconnected;
+    wasDisconnected = false;
     setConnectionStatus("connected");
     void (async () => {
       await refreshAgents();
       updateHeader();
-      if (!historyLoaded) {
-        await loadHistory();
-        setConnectionStatus("gateway connected", 4000);
-        tui.requestRender();
-        if (!autoMessageSent && autoMessage) {
-          autoMessageSent = true;
-          await sendMessage(autoMessage);
-        }
-      } else {
-        setConnectionStatus("gateway reconnected", 4000);
+      await loadHistory();
+      setConnectionStatus(reconnected ? "gateway reconnected" : "gateway connected", 4000);
+      tui.requestRender();
+      if (!autoMessageSent && autoMessage) {
+        autoMessageSent = true;
+        await sendMessage(autoMessage);
       }
       updateFooter();
       tui.requestRender();
@@ -605,6 +605,8 @@ export async function runTui(opts: TuiOptions) {
 
   client.onDisconnected = (reason) => {
     isConnected = false;
+    wasDisconnected = true;
+    historyLoaded = false;
     const reasonLabel = reason?.trim() ? reason.trim() : "closed";
     setConnectionStatus(`gateway disconnected: ${reasonLabel}`, 5000);
     setActivityStatus("idle");

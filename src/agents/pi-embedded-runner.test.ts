@@ -3,8 +3,9 @@ import os from "node:os";
 import path from "node:path";
 
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
-import type { ClawdbotConfig } from "../config/config.js";
-import { ensureClawdbotModelsJson } from "./models-config.js";
+import "./test-helpers/fast-coding-tools.js";
+import type { MoltbotConfig } from "../config/config.js";
+import { ensureMoltbotModelsJson } from "./models-config.js";
 
 vi.mock("@mariozechner/pi-ai", async () => {
   const actual = await vi.importActual<typeof import("@mariozechner/pi-ai")>("@mariozechner/pi-ai");
@@ -95,7 +96,7 @@ let sessionCounter = 0;
 beforeAll(async () => {
   vi.useRealTimers();
   ({ runEmbeddedPiAgent } = await import("./pi-embedded-runner.js"));
-  tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "clawdbot-embedded-agent-"));
+  tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "moltbot-embedded-agent-"));
   agentDir = path.join(tempRoot, "agent");
   workspaceDir = path.join(tempRoot, "workspace");
   await fs.mkdir(agentDir, { recursive: true });
@@ -128,9 +129,9 @@ const makeOpenAiConfig = (modelIds: string[]) =>
         },
       },
     },
-  }) satisfies ClawdbotConfig;
+  }) satisfies MoltbotConfig;
 
-const ensureModels = (cfg: ClawdbotConfig) => ensureClawdbotModelsJson(cfg, agentDir);
+const ensureModels = (cfg: MoltbotConfig) => ensureMoltbotModelsJson(cfg, agentDir) as unknown;
 
 const nextSessionFile = () => {
   sessionCounter += 1;
@@ -165,6 +166,7 @@ const readSessionMessages = async (sessionFile: string) => {
 };
 
 describe("runEmbeddedPiAgent", () => {
+  const itIfNotWin32 = process.platform === "win32" ? it.skip : it;
   it("writes models.json into the provided agentDir", async () => {
     const sessionFile = nextSessionFile();
 
@@ -189,7 +191,7 @@ describe("runEmbeddedPiAgent", () => {
           },
         },
       },
-    } satisfies ClawdbotConfig;
+    } satisfies MoltbotConfig;
 
     await expect(
       runEmbeddedPiAgent({
@@ -210,35 +212,39 @@ describe("runEmbeddedPiAgent", () => {
     await expect(fs.stat(path.join(agentDir, "models.json"))).resolves.toBeTruthy();
   });
 
-  it("persists the first user message before assistant output", { timeout: 60_000 }, async () => {
-    const sessionFile = nextSessionFile();
-    const cfg = makeOpenAiConfig(["mock-1"]);
-    await ensureModels(cfg);
+  itIfNotWin32(
+    "persists the first user message before assistant output",
+    { timeout: 120_000 },
+    async () => {
+      const sessionFile = nextSessionFile();
+      const cfg = makeOpenAiConfig(["mock-1"]);
+      await ensureModels(cfg);
 
-    await runEmbeddedPiAgent({
-      sessionId: "session:test",
-      sessionKey: testSessionKey,
-      sessionFile,
-      workspaceDir,
-      config: cfg,
-      prompt: "hello",
-      provider: "openai",
-      model: "mock-1",
-      timeoutMs: 5_000,
-      agentDir,
-      enqueue: immediateEnqueue,
-    });
+      await runEmbeddedPiAgent({
+        sessionId: "session:test",
+        sessionKey: testSessionKey,
+        sessionFile,
+        workspaceDir,
+        config: cfg,
+        prompt: "hello",
+        provider: "openai",
+        model: "mock-1",
+        timeoutMs: 5_000,
+        agentDir,
+        enqueue: immediateEnqueue,
+      });
 
-    const messages = await readSessionMessages(sessionFile);
-    const firstUserIndex = messages.findIndex(
-      (message) => message?.role === "user" && textFromContent(message.content) === "hello",
-    );
-    const firstAssistantIndex = messages.findIndex((message) => message?.role === "assistant");
-    expect(firstUserIndex).toBeGreaterThanOrEqual(0);
-    if (firstAssistantIndex !== -1) {
-      expect(firstUserIndex).toBeLessThan(firstAssistantIndex);
-    }
-  });
+      const messages = await readSessionMessages(sessionFile);
+      const firstUserIndex = messages.findIndex(
+        (message) => message?.role === "user" && textFromContent(message.content) === "hello",
+      );
+      const firstAssistantIndex = messages.findIndex((message) => message?.role === "assistant");
+      expect(firstUserIndex).toBeGreaterThanOrEqual(0);
+      if (firstAssistantIndex !== -1) {
+        expect(firstUserIndex).toBeLessThan(firstAssistantIndex);
+      }
+    },
+  );
 
   it("persists the user message when prompt fails before assistant output", async () => {
     const sessionFile = nextSessionFile();

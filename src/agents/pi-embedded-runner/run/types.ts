@@ -3,7 +3,7 @@ import type { Api, AssistantMessage, ImageContent, Model } from "@mariozechner/p
 import type { discoverAuthStorage, discoverModels } from "@mariozechner/pi-coding-agent";
 
 import type { ReasoningLevel, ThinkLevel, VerboseLevel } from "../../../auto-reply/thinking.js";
-import type { ClawdbotConfig } from "../../../config/config.js";
+import type { MoltbotConfig } from "../../../config/config.js";
 import type { AgentStreamParams } from "../../../commands/agent/types.js";
 import type { ExecElevatedDefaults, ExecToolDefaults } from "../../bash-tools.js";
 import type { MessagingToolSend } from "../../pi-embedded-messaging.js";
@@ -23,6 +23,18 @@ export type EmbeddedRunAttemptParams = {
   agentAccountId?: string;
   messageTo?: string;
   messageThreadId?: string | number;
+  /** Group id for channel-level tool policy resolution. */
+  groupId?: string | null;
+  /** Group channel label (e.g. #general) for channel-level tool policy resolution. */
+  groupChannel?: string | null;
+  /** Group space label (e.g. guild/team id) for channel-level tool policy resolution. */
+  groupSpace?: string | null;
+  /** Parent session key for subagent policy inheritance. */
+  spawnedBy?: string | null;
+  senderId?: string | null;
+  senderName?: string | null;
+  senderUsername?: string | null;
+  senderE164?: string | null;
   currentChannelId?: string;
   currentThreadTs?: string;
   replyToMode?: "off" | "first" | "all";
@@ -30,12 +42,14 @@ export type EmbeddedRunAttemptParams = {
   sessionFile: string;
   workspaceDir: string;
   agentDir?: string;
-  config?: ClawdbotConfig;
+  config?: MoltbotConfig;
   skillsSnapshot?: SkillSnapshot;
   prompt: string;
   images?: ImageContent[];
   /** Optional client-provided tools (OpenResponses hosted tools). */
   clientTools?: ClientToolDefinition[];
+  /** Disable built-in tools for this run (LLM-only mode). */
+  disableTools?: boolean;
   provider: string;
   modelId: string;
   model: Model<Api>;

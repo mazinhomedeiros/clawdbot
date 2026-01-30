@@ -2,6 +2,7 @@ import { resolveCommitHash } from "../infra/git-commit.js";
 import { visibleWidth } from "../terminal/ansi.js";
 import { isRich, theme } from "../terminal/theme.js";
 import { pickTagline, type TaglineOptions } from "./tagline.js";
+import { resolveCliName } from "./cli-name.js";
 
 type BannerOptions = TaglineOptions & {
   argv?: string[];
@@ -37,7 +38,8 @@ export function formatCliBannerLine(version: string, options: BannerOptions = {}
   const commitLabel = commit ?? "unknown";
   const tagline = pickTagline(options);
   const rich = options.richTty ?? isRich();
-  const title = "🦞 Clawdbot";
+  const cliName = resolveCliName(options.argv ?? process.argv, options.env);
+  const title = cliName === "moltbot" ? "🦞 Moltbot" : "🦞 Moltbot";
   const prefix = "🦞 ";
   const columns = options.columns ?? process.stdout.columns ?? 120;
   const plainFullLine = `${title} ${version} (${commitLabel}) — ${tagline}`;
@@ -51,24 +53,25 @@ export function formatCliBannerLine(version: string, options: BannerOptions = {}
     const line1 = `${theme.heading(title)} ${theme.info(version)} ${theme.muted(
       `(${commitLabel})`,
     )}`;
-    const line2 = `${" ".repeat(prefix.length)}${theme.muted("—")} ${theme.accentDim(tagline)}`;
+    const line2 = `${" ".repeat(prefix.length)}${theme.accentDim(tagline)}`;
     return `${line1}\n${line2}`;
   }
   if (fitsOnOneLine) {
     return plainFullLine;
   }
   const line1 = `${title} ${version} (${commitLabel})`;
-  const line2 = `${" ".repeat(prefix.length)}— ${tagline}`;
+  const line2 = `${" ".repeat(prefix.length)}${tagline}`;
   return `${line1}\n${line2}`;
 }
 
 const LOBSTER_ASCII = [
-  "░████░█░░░░░█████░█░░░█░███░░████░░████░░▀█▀",
-  "█░░░░░█░░░░░█░░░█░█░█░█░█░░█░█░░░█░█░░░█░░█░",
-  "█░░░░░█░░░░░█████░█░█░█░█░░█░████░░█░░░█░░█░",
-  "█░░░░░█░░░░░█░░░█░█░█░█░█░░█░█░░█░░█░░░█░░█░",
-  "░████░█████░█░░░█░░█░█░░███░░████░░░███░░░█░",
-  "              🦞 FRESH DAILY 🦞",
+  "▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄",
+  "██░▄▀▄░██░▄▄▄░██░████▄▄░▄▄██░▄▄▀██░▄▄▄░█▄▄░▄▄██",
+  "██░█░█░██░███░██░██████░████░▄▄▀██░███░███░████",
+  "██░███░██░▀▀▀░██░▀▀░███░████░▀▀░██░▀▀▀░███░████",
+  "▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀",
+  "               🦞 FRESH DAILY 🦞               ",
+  " ",
 ];
 
 export function formatCliBannerArt(options: BannerOptions = {}): string {

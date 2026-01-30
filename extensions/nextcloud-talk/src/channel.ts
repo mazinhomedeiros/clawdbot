@@ -7,7 +7,7 @@ import {
   normalizeAccountId,
   setAccountEnabledInConfigSection,
   type ChannelPlugin,
-  type ClawdbotConfig,
+  type MoltbotConfig,
   type ChannelSetupInput,
 } from "clawdbot/plugin-sdk";
 
@@ -24,6 +24,7 @@ import { nextcloudTalkOnboardingAdapter } from "./onboarding.js";
 import { getNextcloudTalkRuntime } from "./runtime.js";
 import { sendMessageNextcloudTalk } from "./send.js";
 import type { CoreConfig } from "./types.js";
+import { resolveNextcloudTalkGroupToolPolicy } from "./policy.js";
 
 const meta = {
   id: "nextcloud-talk",
@@ -159,6 +160,7 @@ export const nextcloudTalkPlugin: ChannelPlugin<ResolvedNextcloudTalkAccount> = 
 
       return true;
     },
+    resolveToolPolicy: resolveNextcloudTalkGroupToolPolicy,
   },
   messaging: {
     normalizeTarget: normalizeNextcloudTalkMessagingTarget,
@@ -171,7 +173,7 @@ export const nextcloudTalkPlugin: ChannelPlugin<ResolvedNextcloudTalkAccount> = 
     resolveAccountId: ({ accountId }) => normalizeAccountId(accountId),
     applyAccountName: ({ cfg, accountId, name }) =>
       applyAccountNameToChannelSection({
-        cfg: cfg as ClawdbotConfig,
+        cfg: cfg as MoltbotConfig,
         channelKey: "nextcloud-talk",
         accountId,
         name,
@@ -192,7 +194,7 @@ export const nextcloudTalkPlugin: ChannelPlugin<ResolvedNextcloudTalkAccount> = 
     applyAccountConfig: ({ cfg, accountId, input }) => {
       const setupInput = input as NextcloudSetupInput;
       const namedConfig = applyAccountNameToChannelSection({
-        cfg: cfg as ClawdbotConfig,
+        cfg: cfg as MoltbotConfig,
         channelKey: "nextcloud-talk",
         accountId,
         name: setupInput.name,
@@ -215,7 +217,7 @@ export const nextcloudTalkPlugin: ChannelPlugin<ResolvedNextcloudTalkAccount> = 
                     : {}),
             },
           },
-        } as ClawdbotConfig;
+        } as MoltbotConfig;
       }
       return {
         ...namedConfig,
@@ -239,12 +241,13 @@ export const nextcloudTalkPlugin: ChannelPlugin<ResolvedNextcloudTalkAccount> = 
             },
           },
         },
-      } as ClawdbotConfig;
+      } as MoltbotConfig;
     },
   },
   outbound: {
     deliveryMode: "direct",
     chunker: (text, limit) => getNextcloudTalkRuntime().channel.text.chunkMarkdownText(text, limit),
+    chunkerMode: "markdown",
     textChunkLimit: 4000,
     sendText: async ({ to, text, accountId, replyToId }) => {
       const result = await sendMessageNextcloudTalk(to, text, {
@@ -320,7 +323,7 @@ export const nextcloudTalkPlugin: ChannelPlugin<ResolvedNextcloudTalkAccount> = 
       return { stop };
     },
     logoutAccount: async ({ accountId, cfg }) => {
-      const nextCfg = { ...cfg } as ClawdbotConfig;
+      const nextCfg = { ...cfg } as MoltbotConfig;
       const nextSection = cfg.channels?.["nextcloud-talk"]
         ? { ...cfg.channels["nextcloud-talk"] }
         : undefined;
@@ -374,7 +377,7 @@ export const nextcloudTalkPlugin: ChannelPlugin<ResolvedNextcloudTalkAccount> = 
           const nextChannels = { ...nextCfg.channels } as Record<string, unknown>;
           delete nextChannels["nextcloud-talk"];
           if (Object.keys(nextChannels).length > 0) {
-            nextCfg.channels = nextChannels as ClawdbotConfig["channels"];
+            nextCfg.channels = nextChannels as MoltbotConfig["channels"];
           } else {
             delete nextCfg.channels;
           }

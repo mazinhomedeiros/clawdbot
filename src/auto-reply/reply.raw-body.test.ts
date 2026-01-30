@@ -27,7 +27,7 @@ async function withTempHome<T>(fn: (home: string) => Promise<T>): Promise<T> {
         CLAWDBOT_AGENT_DIR: (home) => path.join(home, ".clawdbot", "agent"),
         PI_CODING_AGENT_DIR: (home) => path.join(home, ".clawdbot", "agent"),
       },
-      prefix: "clawdbot-rawbody-",
+      prefix: "moltbot-rawbody-",
     },
   );
 }
@@ -159,7 +159,7 @@ describe("RawBody directive parsing", () => {
         ChatType: "group",
         From: "+1222",
         To: "+1222",
-        SessionKey: "agent:main:whatsapp:group:G1",
+        SessionKey: "agent:main:whatsapp:group:g1",
         Provider: "whatsapp",
         Surface: "whatsapp",
         SenderE164: "+1222",
@@ -182,7 +182,7 @@ describe("RawBody directive parsing", () => {
       );
 
       const text = Array.isArray(res) ? res[0]?.text : res?.text;
-      expect(text).toContain("Session: agent:main:whatsapp:group:G1");
+      expect(text).toContain("Session: agent:main:whatsapp:group:g1");
       expect(text).toContain("anthropic/claude-opus-4-5");
       expect(runEmbeddedPiAgent).not.toHaveBeenCalled();
     });

@@ -3,8 +3,11 @@ summary: "Cron jobs + wakeups for the Gateway scheduler"
 read_when:
   - Scheduling background jobs or wakeups
   - Wiring automation that should run with or alongside heartbeats
+  - Deciding between heartbeat and cron for scheduled tasks
 ---
 # Cron jobs (Gateway scheduler)
+
+> **Cron vs Heartbeat?** See [Cron vs Heartbeat](/automation/cron-vs-heartbeat) for guidance on when to use each.
 
 Cron is the Gateway’s built-in scheduler. It persists jobs, wakes the agent at
 the right time, and can optionally deliver output back to a chat.
@@ -172,7 +175,7 @@ Disable cron entirely:
 
 One-shot reminder (UTC ISO, auto-delete after success):
 ```bash
-clawdbot cron add \
+moltbot cron add \
   --name "Send reminder" \
   --at "2026-01-12T18:00:00Z" \
   --session main \
@@ -183,7 +186,7 @@ clawdbot cron add \
 
 One-shot reminder (main session, wake immediately):
 ```bash
-clawdbot cron add \
+moltbot cron add \
   --name "Calendar check" \
   --at "20m" \
   --session main \
@@ -193,7 +196,7 @@ clawdbot cron add \
 
 Recurring isolated job (deliver to WhatsApp):
 ```bash
-clawdbot cron add \
+moltbot cron add \
   --name "Morning status" \
   --cron "0 7 * * *" \
   --tz "America/Los_Angeles" \
@@ -206,7 +209,7 @@ clawdbot cron add \
 
 Recurring isolated job (deliver to a Telegram topic):
 ```bash
-clawdbot cron add \
+moltbot cron add \
   --name "Nightly summary (topic)" \
   --cron "0 22 * * *" \
   --tz "America/Los_Angeles" \
@@ -219,7 +222,7 @@ clawdbot cron add \
 
 Isolated job with model and thinking override:
 ```bash
-clawdbot cron add \
+moltbot cron add \
   --name "Deep analysis" \
   --cron "0 6 * * 1" \
   --tz "America/Los_Angeles" \
@@ -234,22 +237,22 @@ clawdbot cron add \
 Agent selection (multi-agent setups):
 ```bash
 # Pin a job to agent "ops" (falls back to default if that agent is missing)
-clawdbot cron add --name "Ops sweep" --cron "0 6 * * *" --session isolated --message "Check ops queue" --agent ops
+moltbot cron add --name "Ops sweep" --cron "0 6 * * *" --session isolated --message "Check ops queue" --agent ops
 
 # Switch or clear the agent on an existing job
-clawdbot cron edit <jobId> --agent ops
-clawdbot cron edit <jobId> --clear-agent
+moltbot cron edit <jobId> --agent ops
+moltbot cron edit <jobId> --clear-agent
 ```
 ```
 
 Manual run (debug):
 ```bash
-clawdbot cron run <jobId> --force
+moltbot cron run <jobId> --force
 ```
 
 Edit an existing job (patch fields):
 ```bash
-clawdbot cron edit <jobId> \
+moltbot cron edit <jobId> \
   --message "Updated prompt" \
   --model "opus" \
   --thinking low
@@ -257,18 +260,18 @@ clawdbot cron edit <jobId> \
 
 Run history:
 ```bash
-clawdbot cron runs --id <jobId> --limit 50
+moltbot cron runs --id <jobId> --limit 50
 ```
 
-Immediate wake without creating a job:
+Immediate system event without creating a job:
 ```bash
-clawdbot wake --mode now --text "Next heartbeat: check battery."
+moltbot system event --mode now --text "Next heartbeat: check battery."
 ```
 
 ## Gateway API surface
 - `cron.list`, `cron.status`, `cron.add`, `cron.update`, `cron.remove`
 - `cron.run` (force or due), `cron.runs`
-- `wake` (enqueue system event + optional heartbeat)
+For immediate system events without a job, use [`moltbot system event`](/cli/system).
 
 ## Troubleshooting
 

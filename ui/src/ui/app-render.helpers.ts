@@ -3,7 +3,9 @@ import { repeat } from "lit/directives/repeat.js";
 
 import type { AppViewState } from "./app-view-state";
 import { iconForTab, pathForTab, titleForTab, type Tab } from "./navigation";
+import { icons } from "./icons";
 import { loadChatHistory } from "./controllers/chat";
+import { refreshChat } from "./app-chat";
 import { syncUrlWithSessionKey } from "./app-settings";
 import type { SessionsListResult } from "./types";
 import type { ThemeMode } from "./theme";
@@ -31,14 +33,19 @@ export function renderTab(state: AppViewState, tab: Tab) {
       }}
       title=${titleForTab(tab)}
     >
-      <span class="nav-item__icon" aria-hidden="true">${iconForTab(tab)}</span>
+      <span class="nav-item__icon" aria-hidden="true">${icons[iconForTab(tab)]}</span>
       <span class="nav-item__text">${titleForTab(tab)}</span>
     </a>
   `;
 }
 
 export function renderChatControls(state: AppViewState) {
-  const sessionOptions = resolveSessionOptions(state.sessionKey, state.sessionsResult);
+  const mainSessionKey = resolveMainSessionKey(state.hello, state.sessionsResult);
+  const sessionOptions = resolveSessionOptions(
+    state.sessionKey,
+    state.sessionsResult,
+    mainSessionKey,
+  );
   const disableThinkingToggle = state.onboarding;
   const disableFocusToggle = state.onboarding;
   const showThinking = state.onboarding ? false : state.settings.chatShowThinking;
@@ -86,9 +93,9 @@ export function renderChatControls(state: AppViewState) {
         ?disabled=${state.chatLoading || !state.connected}
         @click=${() => {
           state.resetToolStream();
-          void loadChatHistory(state);
+          void refreshChat(state as unknown as Parameters<typeof refreshChat>[0]);
         }}
-        title="Refresh chat history"
+        title="Refresh chat data"
       >
         ${refreshIcon}
       </button>
@@ -108,7 +115,7 @@ export function renderChatControls(state: AppViewState) {
           ? "Disabled during onboarding"
           : "Toggle assistant thinking/working output"}
       >
-        🧠
+        ${icons.brain}
       </button>
       <button
         class="btn btn--sm btn--icon ${focusActive ? "active" : ""}"
@@ -131,15 +138,47 @@ export function renderChatControls(state: AppViewState) {
   `;
 }
 
-function resolveSessionOptions(sessionKey: string, sessions: SessionsListResult | null) {
+type SessionDefaultsSnapshot = {
+  mainSessionKey?: string;
+  mainKey?: string;
+};
+
+function resolveMainSessionKey(
+  hello: AppViewState["hello"],
+  sessions: SessionsListResult | null,
+): string | null {
+  const snapshot = hello?.snapshot as { sessionDefaults?: SessionDefaultsSnapshot } | undefined;
+  const mainSessionKey = snapshot?.sessionDefaults?.mainSessionKey?.trim();
+  if (mainSessionKey) return mainSessionKey;
+  const mainKey = snapshot?.sessionDefaults?.mainKey?.trim();
+  if (mainKey) return mainKey;
+  if (sessions?.sessions?.some((row) => row.key === "main")) return "main";
+  return null;
+}
+
+function resolveSessionOptions(
+  sessionKey: string,
+  sessions: SessionsListResult | null,
+  mainSessionKey?: string | null,
+) {
   const seen = new Set<string>();
   const options: Array<{ key: string; displayName?: string }> = [];
 
+  const resolvedMain =
+    mainSessionKey && sessions?.sessions?.find((s) => s.key === mainSessionKey);
   const resolvedCurrent = sessions?.sessions?.find((s) => s.key === sessionKey);
 
-  // Add current session key first
-  seen.add(sessionKey);
-  options.push({ key: sessionKey, displayName: resolvedCurrent?.displayName });
+  // Add main session key first
+  if (mainSessionKey) {
+    seen.add(mainSessionKey);
+    options.push({ key: mainSessionKey, displayName: resolvedMain?.displayName });
+  }
+
+  // Add current session key next
+  if (!seen.has(sessionKey)) {
+    seen.add(sessionKey);
+    options.push({ key: sessionKey, displayName: resolvedCurrent?.displayName });
+  }
 
   // Add sessions from the result
   if (sessions?.sessions) {

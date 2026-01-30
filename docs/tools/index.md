@@ -1,19 +1,19 @@
 ---
-summary: "Agent tool surface for Clawdbot (browser, canvas, nodes, message, cron) replacing legacy `clawdbot-*` skills"
+summary: "Agent tool surface for Moltbot (browser, canvas, nodes, message, cron) replacing legacy `moltbot-*` skills"
 read_when:
   - Adding or modifying agent tools
-  - Retiring or changing `clawdbot-*` skills
+  - Retiring or changing `moltbot-*` skills
 ---
 
-# Tools (Clawdbot)
+# Tools (Moltbot)
 
-Clawdbot exposes **first-class agent tools** for browser, canvas, nodes, and cron.
-These replace the old `clawdbot-*` skills: the tools are typed, no shelling,
+Moltbot exposes **first-class agent tools** for browser, canvas, nodes, and cron.
+These replace the old `moltbot-*` skills: the tools are typed, no shelling,
 and the agent should rely on them directly.
 
 ## Disabling tools
 
-You can globally allow/deny tools via `tools.allow` / `tools.deny` in `clawdbot.json`
+You can globally allow/deny tools via `tools.allow` / `tools.deny` in `moltbot.json`
 (deny wins). This prevents disallowed tools from being sent to model providers.
 
 ```json5
@@ -21,6 +21,11 @@ You can globally allow/deny tools via `tools.allow` / `tools.deny` in `clawdbot.
   tools: { deny: ["browser"] }
 }
 ```
+
+Notes:
+- Matching is case-insensitive.
+- `*` wildcards are supported (`"*"` means all tools).
+- If `tools.allow` only references unknown or unloaded plugin tool names, Moltbot logs a warning and ignores the allowlist so core tools stay available.
 
 ## Tool profiles (base allowlist)
 
@@ -136,7 +141,7 @@ Available groups:
 - `group:automation`: `cron`, `gateway`
 - `group:messaging`: `message`
 - `group:nodes`: `nodes`
-- `group:clawdbot`: all built-in Clawdbot tools (excludes provider plugins)
+- `group:moltbot`: all built-in Moltbot tools (excludes provider plugins)
 
 Example (allow only file tools + browser):
 ```json5
@@ -156,6 +161,7 @@ alongside tools (for example, the voice-call plugin).
 
 Optional plugin tools:
 - [Lobster](/tools/lobster): typed workflow runtime with resumable approvals (requires the Lobster CLI on the gateway host).
+- [LLM Task](/tools/llm-task): JSON-only LLM step for structured workflow output (optional schema validation).
 
 ## Tool inventory
 
@@ -184,7 +190,7 @@ Notes:
 - If `process` is disallowed, `exec` runs synchronously and ignores `yieldMs`/`background`.
 - `elevated` is gated by `tools.elevated` plus any `agents.list[].tools.elevated` override (both must allow) and is an alias for `host=gateway` + `security=full`.
 - `elevated` only changes behavior when the agent is sandboxed (otherwise it’s a no-op).
-- `host=node` can target a macOS companion app or a headless node host (`clawdbot node run`).
+- `host=node` can target a macOS companion app or a headless node host (`moltbot node run`).
 - gateway/node approvals and allowlists: [Exec approvals](/tools/exec-approvals).
 
 ### `process`
@@ -206,7 +212,7 @@ Core parameters:
 - `count` (1–10; default from `tools.web.search.maxResults`)
 
 Notes:
-- Requires a Brave API key (recommended: `clawdbot configure --section web`, or set `BRAVE_API_KEY`).
+- Requires a Brave API key (recommended: `moltbot configure --section web`, or set `BRAVE_API_KEY`).
 - Enable via `tools.web.search.enabled`.
 - Responses are cached (default 15 min).
 - See [Web tools](/tools/web) for setup.
@@ -243,16 +249,17 @@ Profile management:
 - `reset-profile` — kill orphan process on profile's port (local only)
 
 Common parameters:
-- `controlUrl` (defaults from config)
 - `profile` (optional; defaults to `browser.defaultProfile`)
+- `target` (`sandbox` | `host` | `node`)
+- `node` (optional; picks a specific node id/name)
 Notes:
 - Requires `browser.enabled=true` (default is `true`; set `false` to disable).
-- Uses `browser.controlUrl` unless `controlUrl` is passed explicitly.
 - All actions accept optional `profile` parameter for multi-instance support.
 - When `profile` is omitted, uses `browser.defaultProfile` (defaults to "chrome").
 - Profile names: lowercase alphanumeric + hyphens only (max 64 chars).
 - Port range: 18800-18899 (~100 profiles max).
 - Remote profiles are attach-only (no start/stop/reset).
+- If a browser-capable node is connected, the tool may auto-route to it (unless you pin `target`).
 - `snapshot` defaults to `ai` when Playwright is installed; use `aria` for the accessibility tree.
 - `snapshot` also supports role-snapshot options (`interactive`, `compact`, `depth`, `selector`) which return refs like `e12`.
 - `act` requires `ref` from `snapshot` (numeric `12` from AI snapshots, or `e12` from role snapshots); use `evaluate` for rare CSS selector needs.
@@ -272,7 +279,7 @@ Notes:
 - Uses gateway `node.invoke` under the hood.
 - If no `node` is provided, the tool picks a default (single connected node or local mac node).
 - A2UI is v0.8 only (no `createSurface`); the CLI rejects v0.9 JSONL with line errors.
-- Quick smoke: `clawdbot nodes canvas a2ui push --node <id> --text "Hello from A2UI"`.
+- Quick smoke: `moltbot nodes canvas a2ui push --node <id> --text "Hello from A2UI"`.
 
 ### `nodes`
 Discover and target paired nodes; send notifications; capture camera/screen.
@@ -319,7 +326,7 @@ Notes:
 - Uses the image model directly (independent of the main chat model).
 
 ### `message`
-Send messages and channel actions across Discord/Slack/Telegram/WhatsApp/Signal/iMessage/MS Teams.
+Send messages and channel actions across Discord/Google Chat/Slack/Telegram/WhatsApp/Signal/iMessage/MS Teams.
 
 Core actions:
 - `send` (text + optional media; MS Teams also supports `card` for Adaptive Cards)
@@ -359,9 +366,10 @@ Notes:
 Restart or apply updates to the running Gateway process (in-place).
 
 Core actions:
-- `restart` (authorizes + sends `SIGUSR1` for in-process restart; `clawdbot gateway` restart in-place)
+- `restart` (authorizes + sends `SIGUSR1` for in-process restart; `moltbot gateway` restart in-place)
 - `config.get` / `config.schema`
 - `config.apply` (validate + write config + restart + wake)
+- `config.patch` (merge partial update + restart + wake)
 - `update.run` (run update + restart + wake)
 
 Notes:
@@ -373,10 +381,10 @@ List sessions, inspect transcript history, or send to another session.
 
 Core parameters:
 - `sessions_list`: `kinds?`, `limit?`, `activeMinutes?`, `messageLimit?` (0 = none)
-- `sessions_history`: `sessionKey`, `limit?`, `includeTools?`
-- `sessions_send`: `sessionKey`, `message`, `timeoutSeconds?` (0 = fire-and-forget)
+- `sessions_history`: `sessionKey` (or `sessionId`), `limit?`, `includeTools?`
+- `sessions_send`: `sessionKey` (or `sessionId`), `message`, `timeoutSeconds?` (0 = fire-and-forget)
 - `sessions_spawn`: `task`, `label?`, `agentId?`, `model?`, `runTimeoutSeconds?`, `cleanup?`
-- `session_status`: `sessionKey?` (default current), `model?` (`default` clears override)
+- `session_status`: `sessionKey?` (default current; accepts `sessionId`), `model?` (`default` clears override)
 
 Notes:
 - `main` is the canonical direct-chat key; global/unknown are hidden.
@@ -403,7 +411,9 @@ Gateway-backed tools (`canvas`, `nodes`, `cron`):
 - `timeoutMs`
 
 Browser tool:
-- `controlUrl` (defaults from config)
+- `profile` (optional; defaults to `browser.defaultProfile`)
+- `target` (`sandbox` | `host` | `node`)
+- `node` (optional; pin a specific node id/name)
 
 ## Recommended agent flows
 

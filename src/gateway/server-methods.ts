@@ -1,6 +1,7 @@
 import { ErrorCodes, errorShape } from "./protocol/index.js";
 import { agentHandlers } from "./server-methods/agent.js";
 import { agentsHandlers } from "./server-methods/agents.js";
+import { browserHandlers } from "./server-methods/browser.js";
 import { channelsHandlers } from "./server-methods/channels.js";
 import { chatHandlers } from "./server-methods/chat.js";
 import { configHandlers } from "./server-methods/config.js";
@@ -17,6 +18,7 @@ import { sessionsHandlers } from "./server-methods/sessions.js";
 import { skillsHandlers } from "./server-methods/skills.js";
 import { systemHandlers } from "./server-methods/system.js";
 import { talkHandlers } from "./server-methods/talk.js";
+import { ttsHandlers } from "./server-methods/tts.js";
 import type { GatewayRequestHandlers, GatewayRequestOptions } from "./server-methods/types.js";
 import { updateHandlers } from "./server-methods/update.js";
 import { usageHandlers } from "./server-methods/usage.js";
@@ -53,6 +55,8 @@ const READ_METHODS = new Set([
   "status",
   "usage.status",
   "usage.cost",
+  "tts.status",
+  "tts.providers",
   "models.list",
   "agents.list",
   "agent.identity.get",
@@ -75,10 +79,15 @@ const WRITE_METHODS = new Set([
   "agent.wait",
   "wake",
   "talk.mode",
+  "tts.enable",
+  "tts.disable",
+  "tts.convert",
+  "tts.setProvider",
   "voicewake.set",
   "node.invoke",
   "chat.send",
   "chat.abort",
+  "browser.request",
 ]);
 
 function authorizeGatewayMethod(method: string, client: GatewayRequestOptions["client"]) {
@@ -151,6 +160,7 @@ export const coreGatewayHandlers: GatewayRequestHandlers = {
   ...configHandlers,
   ...wizardHandlers,
   ...talkHandlers,
+  ...ttsHandlers,
   ...skillsHandlers,
   ...sessionsHandlers,
   ...systemHandlers,
@@ -160,6 +170,7 @@ export const coreGatewayHandlers: GatewayRequestHandlers = {
   ...usageHandlers,
   ...agentHandlers,
   ...agentsHandlers,
+  ...browserHandlers,
 };
 
 export async function handleGatewayRequest(

@@ -1,4 +1,4 @@
-import type { ClawdbotConfig } from "../config/types.js";
+import type { MoltbotConfig } from "../config/types.js";
 import type { SkillCommandSpec } from "../agents/skills.js";
 import { getChatCommands, getNativeCommandSurfaces } from "./commands-registry.data.js";
 import { DEFAULT_MODEL, DEFAULT_PROVIDER } from "../agents/defaults.js";
@@ -89,7 +89,7 @@ export function listChatCommands(params?: {
   return [...commands, ...buildSkillCommandDefinitions(params.skillCommands)];
 }
 
-export function isCommandEnabled(cfg: ClawdbotConfig, commandKey: string): boolean {
+export function isCommandEnabled(cfg: MoltbotConfig, commandKey: string): boolean {
   if (commandKey === "config") return cfg.commands?.config === true;
   if (commandKey === "debug") return cfg.commands?.debug === true;
   if (commandKey === "bash") return cfg.commands?.bash === true;
@@ -97,7 +97,7 @@ export function isCommandEnabled(cfg: ClawdbotConfig, commandKey: string): boole
 }
 
 export function listChatCommandsForConfig(
-  cfg: ClawdbotConfig,
+  cfg: MoltbotConfig,
   params?: { skillCommands?: SkillCommandSpec[] },
 ): ChatCommandDefinition[] {
   const base = getChatCommands().filter((command) => isCommandEnabled(cfg, command.key));
@@ -105,13 +105,29 @@ export function listChatCommandsForConfig(
   return [...base, ...buildSkillCommandDefinitions(params.skillCommands)];
 }
 
+const NATIVE_NAME_OVERRIDES: Record<string, Record<string, string>> = {
+  discord: {
+    tts: "voice",
+  },
+};
+
+function resolveNativeName(command: ChatCommandDefinition, provider?: string): string | undefined {
+  if (!command.nativeName) return undefined;
+  if (provider) {
+    const override = NATIVE_NAME_OVERRIDES[provider]?.[command.key];
+    if (override) return override;
+  }
+  return command.nativeName;
+}
+
 export function listNativeCommandSpecs(params?: {
   skillCommands?: SkillCommandSpec[];
+  provider?: string;
 }): NativeCommandSpec[] {
   return listChatCommands({ skillCommands: params?.skillCommands })
     .filter((command) => command.scope !== "text" && command.nativeName)
     .map((command) => ({
-      name: command.nativeName ?? command.key,
+      name: resolveNativeName(command, params?.provider) ?? command.key,
       description: command.description,
       acceptsArgs: Boolean(command.acceptsArgs),
       args: command.args,
@@ -119,23 +135,28 @@ export function listNativeCommandSpecs(params?: {
 }
 
 export function listNativeCommandSpecsForConfig(
-  cfg: ClawdbotConfig,
-  params?: { skillCommands?: SkillCommandSpec[] },
+  cfg: MoltbotConfig,
+  params?: { skillCommands?: SkillCommandSpec[]; provider?: string },
 ): NativeCommandSpec[] {
   return listChatCommandsForConfig(cfg, params)
     .filter((command) => command.scope !== "text" && command.nativeName)
     .map((command) => ({
-      name: command.nativeName ?? command.key,
+      name: resolveNativeName(command, params?.provider) ?? command.key,
       description: command.description,
       acceptsArgs: Boolean(command.acceptsArgs),
       args: command.args,
     }));
 }
 
-export function findCommandByNativeName(name: string): ChatCommandDefinition | undefined {
+export function findCommandByNativeName(
+  name: string,
+  provider?: string,
+): ChatCommandDefinition | undefined {
   const normalized = name.trim().toLowerCase();
   return getChatCommands().find(
-    (command) => command.scope !== "text" && command.nativeName?.toLowerCase() === normalized,
+    (command) =>
+      command.scope !== "text" &&
+      resolveNativeName(command, provider)?.toLowerCase() === normalized,
   );
 }
 
@@ -219,12 +240,12 @@ export function buildCommandTextFromArgs(
   return buildCommandText(commandName, serializeCommandArgs(command, args));
 }
 
-function resolveDefaultCommandContext(cfg?: ClawdbotConfig): {
+function resolveDefaultCommandContext(cfg?: MoltbotConfig): {
   provider: string;
   model: string;
 } {
   const resolved = resolveConfiguredModelRef({
-    cfg: cfg ?? ({} as ClawdbotConfig),
+    cfg: cfg ?? ({} as MoltbotConfig),
     defaultProvider: DEFAULT_PROVIDER,
     defaultModel: DEFAULT_MODEL,
   });
@@ -234,33 +255,41 @@ function resolveDefaultCommandContext(cfg?: ClawdbotConfig): {
   };
 }
 
+export type ResolvedCommandArgChoice = { value: string; label: string };
+
 export function resolveCommandArgChoices(params: {
   command: ChatCommandDefinition;
   arg: CommandArgDefinition;
-  cfg?: ClawdbotConfig;
+  cfg?: MoltbotConfig;
   provider?: string;
   model?: string;
-}): string[] {
+}): ResolvedCommandArgChoice[] {
   const { command, arg, cfg } = params;
   if (!arg.choices) return [];
   const provided = arg.choices;
-  if (Array.isArray(provided)) return provided;
-  const defaults = resolveDefaultCommandContext(cfg);
-  const context: CommandArgChoiceContext = {
-    cfg,
-    provider: params.provider ?? defaults.provider,
-    model: params.model ?? defaults.model,
-    command,
-    arg,
-  };
-  return provided(context);
+  const raw = Array.isArray(provided)
+    ? provided
+    : (() => {
+        const defaults = resolveDefaultCommandContext(cfg);
+        const context: CommandArgChoiceContext = {
+          cfg,
+          provider: params.provider ?? defaults.provider,
+          model: params.model ?? defaults.model,
+          command,
+          arg,
+        };
+        return provided(context);
+      })();
+  return raw.map((choice) =>
+    typeof choice === "string" ? { value: choice, label: choice } : choice,
+  );
 }
 
 export function resolveCommandArgMenu(params: {
   command: ChatCommandDefinition;
   args?: CommandArgs;
-  cfg?: ClawdbotConfig;
-}): { arg: CommandArgDefinition; choices: string[]; title?: string } | null {
+  cfg?: MoltbotConfig;
+}): { arg: CommandArgDefinition; choices: ResolvedCommandArgChoice[]; title?: string } | null {
   const { command, args, cfg } = params;
   if (!command.args || !command.argsMenu) return null;
   if (command.argsParsing === "none") return null;
@@ -326,7 +355,7 @@ export function isCommandMessage(raw: string): boolean {
   return trimmed.startsWith("/");
 }
 
-export function getCommandDetection(_cfg?: ClawdbotConfig): CommandDetection {
+export function getCommandDetection(_cfg?: MoltbotConfig): CommandDetection {
   const commands = getChatCommands();
   if (cachedDetection && cachedDetectionCommands === commands) return cachedDetection;
   const exact = new Set<string>();
@@ -353,7 +382,7 @@ export function getCommandDetection(_cfg?: ClawdbotConfig): CommandDetection {
   return cachedDetection;
 }
 
-export function maybeResolveTextAlias(raw: string, cfg?: ClawdbotConfig) {
+export function maybeResolveTextAlias(raw: string, cfg?: MoltbotConfig) {
   const trimmed = normalizeCommandBody(raw).trim();
   if (!trimmed.startsWith("/")) return null;
   const detection = getCommandDetection(cfg);
@@ -368,7 +397,7 @@ export function maybeResolveTextAlias(raw: string, cfg?: ClawdbotConfig) {
 
 export function resolveTextCommand(
   raw: string,
-  cfg?: ClawdbotConfig,
+  cfg?: MoltbotConfig,
 ): {
   command: ChatCommandDefinition;
   args?: string;

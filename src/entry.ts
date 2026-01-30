@@ -5,9 +5,11 @@ import process from "node:process";
 
 import { applyCliProfileEnv, parseCliProfileArgs } from "./cli/profile.js";
 import { isTruthyEnvValue } from "./infra/env.js";
+import { installProcessWarningFilter } from "./infra/warnings.js";
 import { attachChildProcessBridge } from "./process/child-process-bridge.js";
 
-process.title = "clawdbot";
+process.title = "moltbot";
+installProcessWarningFilter();
 
 if (process.argv.includes("--no-color")) {
   process.env.NO_COLOR = "1";
@@ -47,7 +49,7 @@ function ensureExperimentalWarningSuppressed(): boolean {
 
   child.once("error", (error) => {
     console.error(
-      "[clawdbot] Failed to respawn CLI:",
+      "[moltbot] Failed to respawn CLI:",
       error instanceof Error ? (error.stack ?? error.message) : error,
     );
     process.exit(1);
@@ -122,7 +124,7 @@ if (!ensureExperimentalWarningSuppressed()) {
   const parsed = parseCliProfileArgs(process.argv);
   if (!parsed.ok) {
     // Keep it simple; Commander will handle rich help/errors after we strip flags.
-    console.error(`[clawdbot] ${parsed.error}`);
+    console.error(`[moltbot] ${parsed.error}`);
     process.exit(2);
   }
 
@@ -136,7 +138,7 @@ if (!ensureExperimentalWarningSuppressed()) {
     .then(({ runCli }) => runCli(process.argv))
     .catch((error) => {
       console.error(
-        "[clawdbot] Failed to start CLI:",
+        "[moltbot] Failed to start CLI:",
         error instanceof Error ? (error.stack ?? error.message) : error,
       );
       process.exitCode = 1;

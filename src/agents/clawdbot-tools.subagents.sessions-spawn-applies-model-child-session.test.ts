@@ -21,10 +21,11 @@ vi.mock("../config/config.js", async (importOriginal) => {
   };
 });
 
-import { createClawdbotTools } from "./clawdbot-tools.js";
+import "./test-helpers/fast-core-tools.js";
+import { createMoltbotTools } from "./moltbot-tools.js";
 import { resetSubagentRegistryForTests } from "./subagent-registry.js";
 
-describe("clawdbot-tools: subagents", () => {
+describe("moltbot-tools: subagents", () => {
   beforeEach(() => {
     configOverride = {
       session: {
@@ -64,7 +65,7 @@ describe("clawdbot-tools: subagents", () => {
       return {};
     });
 
-    const tool = createClawdbotTools({
+    const tool = createMoltbotTools({
       agentSessionKey: "discord:group:req",
       agentSurface: "discord",
     }).find((candidate) => candidate.name === "sessions_spawn");
@@ -107,7 +108,7 @@ describe("clawdbot-tools: subagents", () => {
       return {};
     });
 
-    const tool = createClawdbotTools({
+    const tool = createMoltbotTools({
       agentSessionKey: "discord:group:req",
       agentChannel: "discord",
     }).find((candidate) => candidate.name === "sessions_spawn");
@@ -138,7 +139,7 @@ describe("clawdbot-tools: subagents", () => {
       return {};
     });
 
-    const tool = createClawdbotTools({
+    const tool = createMoltbotTools({
       agentSessionKey: "discord:group:req",
       agentChannel: "discord",
     }).find((candidate) => candidate.name === "sessions_spawn");
@@ -175,7 +176,7 @@ describe("clawdbot-tools: subagents", () => {
       return {};
     });
 
-    const tool = createClawdbotTools({
+    const tool = createMoltbotTools({
       agentSessionKey: "agent:main:main",
       agentChannel: "discord",
     }).find((candidate) => candidate.name === "sessions_spawn");

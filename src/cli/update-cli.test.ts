@@ -22,8 +22,8 @@ vi.mock("../infra/update-runner.js", () => ({
   runGatewayUpdate: vi.fn(),
 }));
 
-vi.mock("../infra/clawdbot-root.js", () => ({
-  resolveClawdbotPackageRoot: vi.fn(),
+vi.mock("../infra/moltbot-root.js", () => ({
+  resolveMoltbotPackageRoot: vi.fn(),
 }));
 
 vi.mock("../config/config.js", () => ({
@@ -88,12 +88,12 @@ describe("update-cli", () => {
 
   beforeEach(async () => {
     vi.clearAllMocks();
-    const { resolveClawdbotPackageRoot } = await import("../infra/clawdbot-root.js");
+    const { resolveMoltbotPackageRoot } = await import("../infra/moltbot-root.js");
     const { readConfigFileSnapshot } = await import("../config/config.js");
     const { checkUpdateStatus, fetchNpmTagVersion, resolveNpmChannelTag } =
       await import("../infra/update-check.js");
     const { runCommandWithTimeout } = await import("../process/exec.js");
-    vi.mocked(resolveClawdbotPackageRoot).mockResolvedValue(process.cwd());
+    vi.mocked(resolveMoltbotPackageRoot).mockResolvedValue(process.cwd());
     vi.mocked(readConfigFileSnapshot).mockResolvedValue(baseSnapshot);
     vi.mocked(fetchNpmTagVersion).mockResolvedValue({
       tag: "latest",
@@ -185,7 +185,7 @@ describe("update-cli", () => {
     await updateStatusCommand({ json: false });
 
     const logs = vi.mocked(defaultRuntime.log).mock.calls.map((call) => call[0]);
-    expect(logs.join("\n")).toContain("Clawdbot update status");
+    expect(logs.join("\n")).toContain("Moltbot update status");
   });
 
   it("updateStatusCommand emits JSON", async () => {
@@ -218,20 +218,20 @@ describe("update-cli", () => {
   });
 
   it("defaults to stable channel for package installs when unset", async () => {
-    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "clawdbot-update-"));
+    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "moltbot-update-"));
     try {
       await fs.writeFile(
         path.join(tempDir, "package.json"),
-        JSON.stringify({ name: "clawdbot", version: "1.0.0" }),
+        JSON.stringify({ name: "moltbot", version: "1.0.0" }),
         "utf-8",
       );
 
-      const { resolveClawdbotPackageRoot } = await import("../infra/clawdbot-root.js");
+      const { resolveMoltbotPackageRoot } = await import("../infra/moltbot-root.js");
       const { runGatewayUpdate } = await import("../infra/update-runner.js");
       const { checkUpdateStatus } = await import("../infra/update-check.js");
       const { updateCommand } = await import("./update-cli.js");
 
-      vi.mocked(resolveClawdbotPackageRoot).mockResolvedValue(tempDir);
+      vi.mocked(resolveMoltbotPackageRoot).mockResolvedValue(tempDir);
       vi.mocked(checkUpdateStatus).mockResolvedValue({
         root: tempDir,
         installKind: "package",
@@ -283,22 +283,22 @@ describe("update-cli", () => {
   });
 
   it("falls back to latest when beta tag is older than release", async () => {
-    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "clawdbot-update-"));
+    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "moltbot-update-"));
     try {
       await fs.writeFile(
         path.join(tempDir, "package.json"),
-        JSON.stringify({ name: "clawdbot", version: "1.0.0" }),
+        JSON.stringify({ name: "moltbot", version: "1.0.0" }),
         "utf-8",
       );
 
-      const { resolveClawdbotPackageRoot } = await import("../infra/clawdbot-root.js");
+      const { resolveMoltbotPackageRoot } = await import("../infra/moltbot-root.js");
       const { readConfigFileSnapshot } = await import("../config/config.js");
       const { resolveNpmChannelTag } = await import("../infra/update-check.js");
       const { runGatewayUpdate } = await import("../infra/update-runner.js");
       const { updateCommand } = await import("./update-cli.js");
       const { checkUpdateStatus } = await import("../infra/update-check.js");
 
-      vi.mocked(resolveClawdbotPackageRoot).mockResolvedValue(tempDir);
+      vi.mocked(resolveMoltbotPackageRoot).mockResolvedValue(tempDir);
       vi.mocked(readConfigFileSnapshot).mockResolvedValue({
         ...baseSnapshot,
         config: { update: { channel: "beta" } },
@@ -336,19 +336,19 @@ describe("update-cli", () => {
   });
 
   it("honors --tag override", async () => {
-    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "clawdbot-update-"));
+    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "moltbot-update-"));
     try {
       await fs.writeFile(
         path.join(tempDir, "package.json"),
-        JSON.stringify({ name: "clawdbot", version: "1.0.0" }),
+        JSON.stringify({ name: "moltbot", version: "1.0.0" }),
         "utf-8",
       );
 
-      const { resolveClawdbotPackageRoot } = await import("../infra/clawdbot-root.js");
+      const { resolveMoltbotPackageRoot } = await import("../infra/moltbot-root.js");
       const { runGatewayUpdate } = await import("../infra/update-runner.js");
       const { updateCommand } = await import("./update-cli.js");
 
-      vi.mocked(resolveClawdbotPackageRoot).mockResolvedValue(tempDir);
+      vi.mocked(resolveMoltbotPackageRoot).mockResolvedValue(tempDir);
       vi.mocked(runGatewayUpdate).mockResolvedValue({
         status: "ok",
         mode: "npm",
@@ -415,7 +415,7 @@ describe("update-cli", () => {
     expect(defaultRuntime.exit).toHaveBeenCalledWith(1);
   });
 
-  it("updateCommand restarts daemon when --restart is set", async () => {
+  it("updateCommand restarts daemon by default", async () => {
     const { runGatewayUpdate } = await import("../infra/update-runner.js");
     const { runDaemonRestart } = await import("./daemon-cli.js");
     const { updateCommand } = await import("./update-cli.js");
@@ -430,9 +430,28 @@ describe("update-cli", () => {
     vi.mocked(runGatewayUpdate).mockResolvedValue(mockResult);
     vi.mocked(runDaemonRestart).mockResolvedValue(true);
 
-    await updateCommand({ restart: true });
+    await updateCommand({});
 
     expect(runDaemonRestart).toHaveBeenCalled();
+  });
+
+  it("updateCommand skips restart when --no-restart is set", async () => {
+    const { runGatewayUpdate } = await import("../infra/update-runner.js");
+    const { runDaemonRestart } = await import("./daemon-cli.js");
+    const { updateCommand } = await import("./update-cli.js");
+
+    const mockResult: UpdateRunResult = {
+      status: "ok",
+      mode: "git",
+      steps: [],
+      durationMs: 100,
+    };
+
+    vi.mocked(runGatewayUpdate).mockResolvedValue(mockResult);
+
+    await updateCommand({ restart: false });
+
+    expect(runDaemonRestart).not.toHaveBeenCalled();
   });
 
   it("updateCommand skips success message when restart does not run", async () => {
@@ -495,23 +514,23 @@ describe("update-cli", () => {
   });
 
   it("requires confirmation on downgrade when non-interactive", async () => {
-    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "clawdbot-update-"));
+    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "moltbot-update-"));
     try {
       setTty(false);
       await fs.writeFile(
         path.join(tempDir, "package.json"),
-        JSON.stringify({ name: "clawdbot", version: "2.0.0" }),
+        JSON.stringify({ name: "moltbot", version: "2.0.0" }),
         "utf-8",
       );
 
-      const { resolveClawdbotPackageRoot } = await import("../infra/clawdbot-root.js");
+      const { resolveMoltbotPackageRoot } = await import("../infra/moltbot-root.js");
       const { resolveNpmChannelTag } = await import("../infra/update-check.js");
       const { runGatewayUpdate } = await import("../infra/update-runner.js");
       const { defaultRuntime } = await import("../runtime.js");
       const { updateCommand } = await import("./update-cli.js");
       const { checkUpdateStatus } = await import("../infra/update-check.js");
 
-      vi.mocked(resolveClawdbotPackageRoot).mockResolvedValue(tempDir);
+      vi.mocked(resolveMoltbotPackageRoot).mockResolvedValue(tempDir);
       vi.mocked(checkUpdateStatus).mockResolvedValue({
         root: tempDir,
         installKind: "package",
@@ -548,23 +567,23 @@ describe("update-cli", () => {
   });
 
   it("allows downgrade with --yes in non-interactive mode", async () => {
-    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "clawdbot-update-"));
+    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "moltbot-update-"));
     try {
       setTty(false);
       await fs.writeFile(
         path.join(tempDir, "package.json"),
-        JSON.stringify({ name: "clawdbot", version: "2.0.0" }),
+        JSON.stringify({ name: "moltbot", version: "2.0.0" }),
         "utf-8",
       );
 
-      const { resolveClawdbotPackageRoot } = await import("../infra/clawdbot-root.js");
+      const { resolveMoltbotPackageRoot } = await import("../infra/moltbot-root.js");
       const { resolveNpmChannelTag } = await import("../infra/update-check.js");
       const { runGatewayUpdate } = await import("../infra/update-runner.js");
       const { defaultRuntime } = await import("../runtime.js");
       const { updateCommand } = await import("./update-cli.js");
       const { checkUpdateStatus } = await import("../infra/update-check.js");
 
-      vi.mocked(resolveClawdbotPackageRoot).mockResolvedValue(tempDir);
+      vi.mocked(resolveMoltbotPackageRoot).mockResolvedValue(tempDir);
       vi.mocked(checkUpdateStatus).mockResolvedValue({
         root: tempDir,
         installKind: "package",
@@ -617,7 +636,7 @@ describe("update-cli", () => {
   });
 
   it("updateWizardCommand offers dev checkout and forwards selections", async () => {
-    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "clawdbot-update-wizard-"));
+    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "moltbot-update-wizard-"));
     const previousGitDir = process.env.CLAWDBOT_GIT_DIR;
     try {
       setTty(true);

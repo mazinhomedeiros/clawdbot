@@ -1,6 +1,4 @@
 import type { AuthProfileStore } from "../agents/auth-profiles.js";
-import { CLAUDE_CLI_PROFILE_ID, CODEX_CLI_PROFILE_ID } from "../agents/auth-profiles.js";
-import { colorize, isRich, theme } from "../terminal/theme.js";
 import type { AuthChoice } from "./onboard-types.js";
 
 export type AuthChoiceOption = {
@@ -18,9 +16,11 @@ export type AuthChoiceGroupId =
   | "ai-gateway"
   | "moonshot"
   | "zai"
+  | "xiaomi"
   | "opencode-zen"
   | "minimax"
   | "synthetic"
+  | "venice"
   | "qwen";
 
 export type AuthChoiceGroup = {
@@ -40,13 +40,13 @@ const AUTH_CHOICE_GROUP_DEFS: {
     value: "openai",
     label: "OpenAI",
     hint: "Codex OAuth + API key",
-    choices: ["codex-cli", "openai-codex", "openai-api-key"],
+    choices: ["openai-codex", "openai-api-key"],
   },
   {
     value: "anthropic",
     label: "Anthropic",
-    hint: "Claude Code CLI + API key",
-    choices: ["token", "claude-cli", "apiKey"],
+    hint: "setup-token + API key",
+    choices: ["token", "apiKey"],
   },
   {
     value: "minimax",
@@ -65,6 +65,12 @@ const AUTH_CHOICE_GROUP_DEFS: {
     label: "Synthetic",
     hint: "Anthropic-compatible (multi-model)",
     choices: ["synthetic-api-key"],
+  },
+  {
+    value: "venice",
+    label: "Venice AI",
+    hint: "Privacy-focused (uncensored models)",
+    choices: ["venice-api-key"],
   },
   {
     value: "google",
@@ -103,6 +109,12 @@ const AUTH_CHOICE_GROUP_DEFS: {
     choices: ["zai-api-key"],
   },
   {
+    value: "xiaomi",
+    label: "Xiaomi",
+    hint: "API key",
+    choices: ["xiaomi-api-key"],
+  },
+  {
     value: "opencode-zen",
     label: "OpenCode Zen",
     hint: "API key",
@@ -110,65 +122,12 @@ const AUTH_CHOICE_GROUP_DEFS: {
   },
 ];
 
-function formatOAuthHint(expires?: number, opts?: { allowStale?: boolean }): string {
-  const rich = isRich();
-  if (!expires) {
-    return colorize(rich, theme.muted, "token unavailable");
-  }
-  const now = Date.now();
-  const remaining = expires - now;
-  if (remaining <= 0) {
-    if (opts?.allowStale) {
-      return colorize(rich, theme.warn, "token present · refresh on use");
-    }
-    return colorize(rich, theme.error, "token expired");
-  }
-  const minutes = Math.round(remaining / (60 * 1000));
-  const duration =
-    minutes >= 120
-      ? `${Math.round(minutes / 60)}h`
-      : minutes >= 60
-        ? "1h"
-        : `${Math.max(minutes, 1)}m`;
-  const label = `token ok · expires in ${duration}`;
-  if (minutes <= 10) {
-    return colorize(rich, theme.warn, label);
-  }
-  return colorize(rich, theme.success, label);
-}
-
 export function buildAuthChoiceOptions(params: {
   store: AuthProfileStore;
   includeSkip: boolean;
-  includeClaudeCliIfMissing?: boolean;
-  platform?: NodeJS.Platform;
 }): AuthChoiceOption[] {
+  void params.store;
   const options: AuthChoiceOption[] = [];
-  const platform = params.platform ?? process.platform;
-
-  const codexCli = params.store.profiles[CODEX_CLI_PROFILE_ID];
-  if (codexCli?.type === "oauth") {
-    options.push({
-      value: "codex-cli",
-      label: "OpenAI Codex OAuth (Codex CLI)",
-      hint: formatOAuthHint(codexCli.expires, { allowStale: true }),
-    });
-  }
-
-  const claudeCli = params.store.profiles[CLAUDE_CLI_PROFILE_ID];
-  if (claudeCli?.type === "oauth" || claudeCli?.type === "token") {
-    options.push({
-      value: "claude-cli",
-      label: "Anthropic token (Claude Code CLI)",
-      hint: `reuses existing Claude Code auth · ${formatOAuthHint(claudeCli.expires)}`,
-    });
-  } else if (params.includeClaudeCliIfMissing && platform === "darwin") {
-    options.push({
-      value: "claude-cli",
-      label: "Anthropic token (Claude Code CLI)",
-      hint: "reuses existing Claude Code auth · requires Keychain access",
-    });
-  }
 
   options.push({
     value: "token",
@@ -191,6 +150,11 @@ export function buildAuthChoiceOptions(params: {
   options.push({ value: "kimi-code-api-key", label: "Kimi Code API key" });
   options.push({ value: "synthetic-api-key", label: "Synthetic API key" });
   options.push({
+    value: "venice-api-key",
+    label: "Venice AI API key",
+    hint: "Privacy-focused inference (uncensored models)",
+  });
+  options.push({
     value: "github-copilot",
     label: "GitHub Copilot (GitHub device login)",
     hint: "Uses GitHub device flow",
@@ -207,6 +171,10 @@ export function buildAuthChoiceOptions(params: {
     hint: "Uses the bundled Gemini CLI auth plugin",
   });
   options.push({ value: "zai-api-key", label: "Z.AI (GLM 4.7) API key" });
+  options.push({
+    value: "xiaomi-api-key",
+    label: "Xiaomi API key",
+  });
   options.push({ value: "qwen-portal", label: "Qwen OAuth" });
   options.push({
     value: "copilot-proxy",
@@ -233,12 +201,7 @@ export function buildAuthChoiceOptions(params: {
   return options;
 }
 
-export function buildAuthChoiceGroups(params: {
-  store: AuthProfileStore;
-  includeSkip: boolean;
-  includeClaudeCliIfMissing?: boolean;
-  platform?: NodeJS.Platform;
-}): {
+export function buildAuthChoiceGroups(params: { store: AuthProfileStore; includeSkip: boolean }): {
   groups: AuthChoiceGroup[];
   skipOption?: AuthChoiceOption;
 } {

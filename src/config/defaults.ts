@@ -1,7 +1,9 @@
+import { DEFAULT_CONTEXT_TOKENS } from "../agents/defaults.js";
 import { parseModelRef } from "../agents/model-selection.js";
 import { resolveTalkApiKey } from "./talk.js";
-import type { ClawdbotConfig } from "./types.js";
+import type { MoltbotConfig } from "./types.js";
 import { DEFAULT_AGENT_MAX_CONCURRENT, DEFAULT_SUBAGENT_MAX_CONCURRENT } from "./agent-limits.js";
+import type { ModelDefinitionConfig } from "./types.models.js";
 
 type WarnState = { warned: boolean };
 
@@ -23,7 +25,35 @@ const DEFAULT_MODEL_ALIASES: Readonly<Record<string, string>> = {
   "gemini-flash": "google/gemini-3-flash-preview",
 };
 
-function resolveAnthropicDefaultAuthMode(cfg: ClawdbotConfig): AnthropicAuthDefaultsMode | null {
+const DEFAULT_MODEL_COST: ModelDefinitionConfig["cost"] = {
+  input: 0,
+  output: 0,
+  cacheRead: 0,
+  cacheWrite: 0,
+};
+const DEFAULT_MODEL_INPUT: ModelDefinitionConfig["input"] = ["text"];
+const DEFAULT_MODEL_MAX_TOKENS = 8192;
+
+type ModelDefinitionLike = Partial<ModelDefinitionConfig> &
+  Pick<ModelDefinitionConfig, "id" | "name">;
+
+function isPositiveNumber(value: unknown): value is number {
+  return typeof value === "number" && Number.isFinite(value) && value > 0;
+}
+
+function resolveModelCost(
+  raw?: Partial<ModelDefinitionConfig["cost"]>,
+): ModelDefinitionConfig["cost"] {
+  return {
+    input: typeof raw?.input === "number" ? raw.input : DEFAULT_MODEL_COST.input,
+    output: typeof raw?.output === "number" ? raw.output : DEFAULT_MODEL_COST.output,
+    cacheRead: typeof raw?.cacheRead === "number" ? raw.cacheRead : DEFAULT_MODEL_COST.cacheRead,
+    cacheWrite:
+      typeof raw?.cacheWrite === "number" ? raw.cacheWrite : DEFAULT_MODEL_COST.cacheWrite,
+  };
+}
+
+function resolveAnthropicDefaultAuthMode(cfg: MoltbotConfig): AnthropicAuthDefaultsMode | null {
   const profiles = cfg.auth?.profiles ?? {};
   const anthropicProfiles = Object.entries(profiles).filter(
     ([, profile]) => profile?.provider === "anthropic",
@@ -62,7 +92,7 @@ export type SessionDefaultsOptions = {
   warnState?: WarnState;
 };
 
-export function applyMessageDefaults(cfg: ClawdbotConfig): ClawdbotConfig {
+export function applyMessageDefaults(cfg: MoltbotConfig): MoltbotConfig {
   const messages = cfg.messages;
   const hasAckScope = messages?.ackReactionScope !== undefined;
   if (hasAckScope) return cfg;
@@ -76,9 +106,9 @@ export function applyMessageDefaults(cfg: ClawdbotConfig): ClawdbotConfig {
 }
 
 export function applySessionDefaults(
-  cfg: ClawdbotConfig,
+  cfg: MoltbotConfig,
   options: SessionDefaultsOptions = {},
-): ClawdbotConfig {
+): MoltbotConfig {
   const session = cfg.session;
   if (!session || session.mainKey === undefined) return cfg;
 
@@ -86,7 +116,7 @@ export function applySessionDefaults(
   const warn = options.warn ?? console.warn;
   const warnState = options.warnState ?? defaultWarnState;
 
-  const next: ClawdbotConfig = {
+  const next: MoltbotConfig = {
     ...cfg,
     session: { ...session, mainKey: "main" },
   };
@@ -99,7 +129,7 @@ export function applySessionDefaults(
   return next;
 }
 
-export function applyTalkApiKey(config: ClawdbotConfig): ClawdbotConfig {
+export function applyTalkApiKey(config: MoltbotConfig): MoltbotConfig {
   const resolved = resolveTalkApiKey();
   if (!resolved) return config;
   const existing = config.talk?.apiKey?.trim();
@@ -113,13 +143,78 @@ export function applyTalkApiKey(config: ClawdbotConfig): ClawdbotConfig {
   };
 }
 
-export function applyModelDefaults(cfg: ClawdbotConfig): ClawdbotConfig {
-  const existingAgent = cfg.agents?.defaults;
-  if (!existingAgent) return cfg;
-  const existingModels = existingAgent.models ?? {};
-  if (Object.keys(existingModels).length === 0) return cfg;
-
+export function applyModelDefaults(cfg: MoltbotConfig): MoltbotConfig {
   let mutated = false;
+  let nextCfg = cfg;
+
+  const providerConfig = nextCfg.models?.providers;
+  if (providerConfig) {
+    const nextProviders = { ...providerConfig };
+    for (const [providerId, provider] of Object.entries(providerConfig)) {
+      const models = provider.models;
+      if (!Array.isArray(models) || models.length === 0) continue;
+      let providerMutated = false;
+      const nextModels = models.map((model) => {
+        const raw = model as ModelDefinitionLike;
+        let modelMutated = false;
+
+        const reasoning = typeof raw.reasoning === "boolean" ? raw.reasoning : false;
+        if (raw.reasoning !== reasoning) modelMutated = true;
+
+        const input = raw.input ?? [...DEFAULT_MODEL_INPUT];
+        if (raw.input === undefined) modelMutated = true;
+
+        const cost = resolveModelCost(raw.cost);
+        const costMutated =
+          !raw.cost ||
+          raw.cost.input !== cost.input ||
+          raw.cost.output !== cost.output ||
+          raw.cost.cacheRead !== cost.cacheRead ||
+          raw.cost.cacheWrite !== cost.cacheWrite;
+        if (costMutated) modelMutated = true;
+
+        const contextWindow = isPositiveNumber(raw.contextWindow)
+          ? raw.contextWindow
+          : DEFAULT_CONTEXT_TOKENS;
+        if (raw.contextWindow !== contextWindow) modelMutated = true;
+
+        const defaultMaxTokens = Math.min(DEFAULT_MODEL_MAX_TOKENS, contextWindow);
+        const maxTokens = isPositiveNumber(raw.maxTokens) ? raw.maxTokens : defaultMaxTokens;
+        if (raw.maxTokens !== maxTokens) modelMutated = true;
+
+        if (!modelMutated) return model;
+        providerMutated = true;
+        return {
+          ...raw,
+          reasoning,
+          input,
+          cost,
+          contextWindow,
+          maxTokens,
+        } as ModelDefinitionConfig;
+      });
+
+      if (!providerMutated) continue;
+      nextProviders[providerId] = { ...provider, models: nextModels };
+      mutated = true;
+    }
+
+    if (mutated) {
+      nextCfg = {
+        ...nextCfg,
+        models: {
+          ...nextCfg.models,
+          providers: nextProviders,
+        },
+      };
+    }
+  }
+
+  const existingAgent = nextCfg.agents?.defaults;
+  if (!existingAgent) return mutated ? nextCfg : cfg;
+  const existingModels = existingAgent.models ?? {};
+  if (Object.keys(existingModels).length === 0) return mutated ? nextCfg : cfg;
+
   const nextModels: Record<string, { alias?: string }> = {
     ...existingModels,
   };
@@ -135,15 +230,15 @@ export function applyModelDefaults(cfg: ClawdbotConfig): ClawdbotConfig {
   if (!mutated) return cfg;
 
   return {
-    ...cfg,
+    ...nextCfg,
     agents: {
-      ...cfg.agents,
+      ...nextCfg.agents,
       defaults: { ...existingAgent, models: nextModels },
     },
   };
 }
 
-export function applyAgentDefaults(cfg: ClawdbotConfig): ClawdbotConfig {
+export function applyAgentDefaults(cfg: MoltbotConfig): MoltbotConfig {
   const agents = cfg.agents;
   const defaults = agents?.defaults;
   const hasMax =
@@ -180,7 +275,7 @@ export function applyAgentDefaults(cfg: ClawdbotConfig): ClawdbotConfig {
   };
 }
 
-export function applyLoggingDefaults(cfg: ClawdbotConfig): ClawdbotConfig {
+export function applyLoggingDefaults(cfg: MoltbotConfig): MoltbotConfig {
   const logging = cfg.logging;
   if (!logging) return cfg;
   if (logging.redactSensitive) return cfg;
@@ -193,7 +288,7 @@ export function applyLoggingDefaults(cfg: ClawdbotConfig): ClawdbotConfig {
   };
 }
 
-export function applyContextPruningDefaults(cfg: ClawdbotConfig): ClawdbotConfig {
+export function applyContextPruningDefaults(cfg: MoltbotConfig): MoltbotConfig {
   const defaults = cfg.agents?.defaults;
   if (!defaults) return cfg;
 
@@ -274,7 +369,7 @@ export function applyContextPruningDefaults(cfg: ClawdbotConfig): ClawdbotConfig
   };
 }
 
-export function applyCompactionDefaults(cfg: ClawdbotConfig): ClawdbotConfig {
+export function applyCompactionDefaults(cfg: MoltbotConfig): MoltbotConfig {
   const defaults = cfg.agents?.defaults;
   if (!defaults) return cfg;
   const compaction = defaults?.compaction;

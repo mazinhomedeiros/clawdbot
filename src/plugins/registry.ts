@@ -8,15 +8,17 @@ import type {
 import { registerInternalHook } from "../hooks/internal-hooks.js";
 import { resolveUserPath } from "../utils.js";
 import type {
-  ClawdbotPluginApi,
-  ClawdbotPluginChannelRegistration,
-  ClawdbotPluginCliRegistrar,
-  ClawdbotPluginHttpHandler,
-  ClawdbotPluginHookOptions,
+  MoltbotPluginApi,
+  MoltbotPluginChannelRegistration,
+  MoltbotPluginCliRegistrar,
+  MoltbotPluginCommandDefinition,
+  MoltbotPluginHttpHandler,
+  MoltbotPluginHttpRouteHandler,
+  MoltbotPluginHookOptions,
   ProviderPlugin,
-  ClawdbotPluginService,
-  ClawdbotPluginToolContext,
-  ClawdbotPluginToolFactory,
+  MoltbotPluginService,
+  MoltbotPluginToolContext,
+  MoltbotPluginToolFactory,
   PluginConfigUiHint,
   PluginDiagnostic,
   PluginLogger,
@@ -26,13 +28,15 @@ import type {
   PluginHookHandlerMap,
   PluginHookRegistration as TypedPluginHookRegistration,
 } from "./types.js";
+import { registerPluginCommand } from "./commands.js";
 import type { PluginRuntime } from "./runtime/types.js";
 import type { HookEntry } from "../hooks/types.js";
 import path from "node:path";
+import { normalizePluginHttpPath } from "./http-path.js";
 
 export type PluginToolRegistration = {
   pluginId: string;
-  factory: ClawdbotPluginToolFactory;
+  factory: MoltbotPluginToolFactory;
   names: string[];
   optional: boolean;
   source: string;
@@ -40,15 +44,22 @@ export type PluginToolRegistration = {
 
 export type PluginCliRegistration = {
   pluginId: string;
-  register: ClawdbotPluginCliRegistrar;
+  register: MoltbotPluginCliRegistrar;
   commands: string[];
   source: string;
 };
 
 export type PluginHttpRegistration = {
   pluginId: string;
-  handler: ClawdbotPluginHttpHandler;
+  handler: MoltbotPluginHttpHandler;
   source: string;
+};
+
+export type PluginHttpRouteRegistration = {
+  pluginId?: string;
+  path: string;
+  handler: MoltbotPluginHttpRouteHandler;
+  source?: string;
 };
 
 export type PluginChannelRegistration = {
@@ -73,7 +84,13 @@ export type PluginHookRegistration = {
 
 export type PluginServiceRegistration = {
   pluginId: string;
-  service: ClawdbotPluginService;
+  service: MoltbotPluginService;
+  source: string;
+};
+
+export type PluginCommandRegistration = {
+  pluginId: string;
+  command: MoltbotPluginCommandDefinition;
   source: string;
 };
 
@@ -96,6 +113,7 @@ export type PluginRecord = {
   gatewayMethods: string[];
   cliCommands: string[];
   services: string[];
+  commands: string[];
   httpHandlers: number;
   hookCount: number;
   configSchema: boolean;
@@ -112,8 +130,10 @@ export type PluginRegistry = {
   providers: PluginProviderRegistration[];
   gatewayHandlers: GatewayRequestHandlers;
   httpHandlers: PluginHttpRegistration[];
+  httpRoutes: PluginHttpRouteRegistration[];
   cliRegistrars: PluginCliRegistration[];
   services: PluginServiceRegistration[];
+  commands: PluginCommandRegistration[];
   diagnostics: PluginDiagnostic[];
 };
 
@@ -133,8 +153,10 @@ export function createPluginRegistry(registryParams: PluginRegistryParams) {
     providers: [],
     gatewayHandlers: {},
     httpHandlers: [],
+    httpRoutes: [],
     cliRegistrars: [],
     services: [],
+    commands: [],
     diagnostics: [],
   };
   const coreGatewayMethods = new Set(Object.keys(registryParams.coreGatewayHandlers ?? {}));
@@ -145,13 +167,13 @@ export function createPluginRegistry(registryParams: PluginRegistryParams) {
 
   const registerTool = (
     record: PluginRecord,
-    tool: AnyAgentTool | ClawdbotPluginToolFactory,
+    tool: AnyAgentTool | MoltbotPluginToolFactory,
     opts?: { name?: string; names?: string[]; optional?: boolean },
   ) => {
     const names = opts?.names ?? (opts?.name ? [opts.name] : []);
     const optional = opts?.optional === true;
-    const factory: ClawdbotPluginToolFactory =
-      typeof tool === "function" ? tool : (_ctx: ClawdbotPluginToolContext) => tool;
+    const factory: MoltbotPluginToolFactory =
+      typeof tool === "function" ? tool : (_ctx: MoltbotPluginToolContext) => tool;
 
     if (typeof tool !== "function") {
       names.push(tool.name);
@@ -174,8 +196,8 @@ export function createPluginRegistry(registryParams: PluginRegistryParams) {
     record: PluginRecord,
     events: string | string[],
     handler: Parameters<typeof registerInternalHook>[1],
-    opts: ClawdbotPluginHookOptions | undefined,
-    config: ClawdbotPluginApi["config"],
+    opts: MoltbotPluginHookOptions | undefined,
+    config: MoltbotPluginApi["config"],
   ) => {
     const eventList = Array.isArray(events) ? events : [events];
     const normalizedEvents = eventList.map((event) => event.trim()).filter(Boolean);
@@ -199,11 +221,11 @@ export function createPluginRegistry(registryParams: PluginRegistryParams) {
             ...entry.hook,
             name,
             description,
-            source: "clawdbot-plugin",
+            source: "moltbot-plugin",
             pluginId: record.id,
           },
-          clawdbot: {
-            ...entry.clawdbot,
+          metadata: {
+            ...entry.metadata,
             events: normalizedEvents,
           },
         }
@@ -211,14 +233,14 @@ export function createPluginRegistry(registryParams: PluginRegistryParams) {
           hook: {
             name,
             description,
-            source: "clawdbot-plugin",
+            source: "moltbot-plugin",
             pluginId: record.id,
             filePath: record.source,
             baseDir: path.dirname(record.source),
             handlerPath: record.source,
           },
           frontmatter: {},
-          clawdbot: { events: normalizedEvents },
+          metadata: { events: normalizedEvents },
           invocation: { enabled: true },
         };
 
@@ -260,7 +282,7 @@ export function createPluginRegistry(registryParams: PluginRegistryParams) {
     record.gatewayMethods.push(trimmed);
   };
 
-  const registerHttpHandler = (record: PluginRecord, handler: ClawdbotPluginHttpHandler) => {
+  const registerHttpHandler = (record: PluginRecord, handler: MoltbotPluginHttpHandler) => {
     record.httpHandlers += 1;
     registry.httpHandlers.push({
       pluginId: record.id,
@@ -269,13 +291,45 @@ export function createPluginRegistry(registryParams: PluginRegistryParams) {
     });
   };
 
+  const registerHttpRoute = (
+    record: PluginRecord,
+    params: { path: string; handler: MoltbotPluginHttpRouteHandler },
+  ) => {
+    const normalizedPath = normalizePluginHttpPath(params.path);
+    if (!normalizedPath) {
+      pushDiagnostic({
+        level: "warn",
+        pluginId: record.id,
+        source: record.source,
+        message: "http route registration missing path",
+      });
+      return;
+    }
+    if (registry.httpRoutes.some((entry) => entry.path === normalizedPath)) {
+      pushDiagnostic({
+        level: "error",
+        pluginId: record.id,
+        source: record.source,
+        message: `http route already registered: ${normalizedPath}`,
+      });
+      return;
+    }
+    record.httpHandlers += 1;
+    registry.httpRoutes.push({
+      pluginId: record.id,
+      path: normalizedPath,
+      handler: params.handler,
+      source: record.source,
+    });
+  };
+
   const registerChannel = (
     record: PluginRecord,
-    registration: ClawdbotPluginChannelRegistration | ChannelPlugin,
+    registration: MoltbotPluginChannelRegistration | ChannelPlugin,
   ) => {
     const normalized =
-      typeof (registration as ClawdbotPluginChannelRegistration).plugin === "object"
-        ? (registration as ClawdbotPluginChannelRegistration)
+      typeof (registration as MoltbotPluginChannelRegistration).plugin === "object"
+        ? (registration as MoltbotPluginChannelRegistration)
         : { plugin: registration as ChannelPlugin };
     const plugin = normalized.plugin;
     const id = typeof plugin?.id === "string" ? plugin.id.trim() : String(plugin?.id ?? "").trim();
@@ -328,7 +382,7 @@ export function createPluginRegistry(registryParams: PluginRegistryParams) {
 
   const registerCli = (
     record: PluginRecord,
-    registrar: ClawdbotPluginCliRegistrar,
+    registrar: MoltbotPluginCliRegistrar,
     opts?: { commands?: string[] },
   ) => {
     const commands = (opts?.commands ?? []).map((cmd) => cmd.trim()).filter(Boolean);
@@ -341,13 +395,45 @@ export function createPluginRegistry(registryParams: PluginRegistryParams) {
     });
   };
 
-  const registerService = (record: PluginRecord, service: ClawdbotPluginService) => {
+  const registerService = (record: PluginRecord, service: MoltbotPluginService) => {
     const id = service.id.trim();
     if (!id) return;
     record.services.push(id);
     registry.services.push({
       pluginId: record.id,
       service,
+      source: record.source,
+    });
+  };
+
+  const registerCommand = (record: PluginRecord, command: MoltbotPluginCommandDefinition) => {
+    const name = command.name.trim();
+    if (!name) {
+      pushDiagnostic({
+        level: "error",
+        pluginId: record.id,
+        source: record.source,
+        message: "command registration missing name",
+      });
+      return;
+    }
+
+    // Register with the plugin command system (validates name and checks for duplicates)
+    const result = registerPluginCommand(record.id, command);
+    if (!result.ok) {
+      pushDiagnostic({
+        level: "error",
+        pluginId: record.id,
+        source: record.source,
+        message: `command registration failed: ${result.error}`,
+      });
+      return;
+    }
+
+    record.commands.push(name);
+    registry.commands.push({
+      pluginId: record.id,
+      command,
       source: record.source,
     });
   };
@@ -378,10 +464,10 @@ export function createPluginRegistry(registryParams: PluginRegistryParams) {
   const createApi = (
     record: PluginRecord,
     params: {
-      config: ClawdbotPluginApi["config"];
+      config: MoltbotPluginApi["config"];
       pluginConfig?: Record<string, unknown>;
     },
-  ): ClawdbotPluginApi => {
+  ): MoltbotPluginApi => {
     return {
       id: record.id,
       name: record.name,
@@ -396,11 +482,13 @@ export function createPluginRegistry(registryParams: PluginRegistryParams) {
       registerHook: (events, handler, opts) =>
         registerHook(record, events, handler, opts, params.config),
       registerHttpHandler: (handler) => registerHttpHandler(record, handler),
+      registerHttpRoute: (params) => registerHttpRoute(record, params),
       registerChannel: (registration) => registerChannel(record, registration),
       registerProvider: (provider) => registerProvider(record, provider),
       registerGatewayMethod: (method, handler) => registerGatewayMethod(record, method, handler),
       registerCli: (registrar, opts) => registerCli(record, registrar, opts),
       registerService: (service) => registerService(record, service),
+      registerCommand: (command) => registerCommand(record, command),
       resolvePath: (input: string) => resolveUserPath(input),
       on: (hookName, handler, opts) => registerTypedHook(record, hookName, handler, opts),
     };
@@ -416,6 +504,7 @@ export function createPluginRegistry(registryParams: PluginRegistryParams) {
     registerGatewayMethod,
     registerCli,
     registerService,
+    registerCommand,
     registerHook,
     registerTypedHook,
   };

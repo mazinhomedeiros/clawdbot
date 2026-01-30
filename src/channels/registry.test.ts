@@ -9,6 +9,8 @@ import {
 describe("channel registry", () => {
   it("normalizes aliases", () => {
     expect(normalizeChatChannelId("imsg")).toBe("imessage");
+    expect(normalizeChatChannelId("gchat")).toBe("googlechat");
+    expect(normalizeChatChannelId("google-chat")).toBe("googlechat");
     expect(normalizeChatChannelId("web")).toBeNull();
   });
 
@@ -31,6 +33,6 @@ describe("channel registry", () => {
     );
     expect(line).not.toContain("Docs:");
     expect(line).toContain("/channels/telegram");
-    expect(line).toContain("https://clawd.bot");
+    expect(line).toContain("https://molt.bot");
   });
 });

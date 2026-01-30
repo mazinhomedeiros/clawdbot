@@ -5,6 +5,7 @@ import {
   InboundDebounceSchema,
   NativeCommandsSettingSchema,
   QueueSchema,
+  TtsConfigSchema,
 } from "./zod-schema.core.js";
 
 const SessionResetConfigSchema = z
@@ -19,7 +20,12 @@ export const SessionSchema = z
   .object({
     scope: z.union([z.literal("per-sender"), z.literal("global")]).optional(),
     dmScope: z
-      .union([z.literal("main"), z.literal("per-peer"), z.literal("per-channel-peer")])
+      .union([
+        z.literal("main"),
+        z.literal("per-peer"),
+        z.literal("per-channel-peer"),
+        z.literal("per-account-channel-peer"),
+      ])
       .optional(),
     identityLinks: z.record(z.string(), z.array(z.string())).optional(),
     resetTriggers: z.array(z.string()).optional(),
@@ -90,6 +96,7 @@ export const MessagesSchema = z
     ackReaction: z.string().optional(),
     ackReactionScope: z.enum(["group-mentions", "group-all", "direct", "all"]).optional(),
     removeAckAfterReply: z.boolean().optional(),
+    tts: TtsConfigSchema,
   })
   .strict()
   .optional();

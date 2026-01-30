@@ -1,6 +1,6 @@
 import { resolveAgentWorkspaceDir, resolveDefaultAgentId } from "../../agents/agent-scope.js";
 import {
-  CONFIG_PATH_CLAWDBOT,
+  CONFIG_PATH,
   loadConfig,
   parseConfigJson5,
   readConfigFileSnapshot,
@@ -18,7 +18,7 @@ import {
   writeRestartSentinel,
 } from "../../infra/restart-sentinel.js";
 import { listChannelPlugins } from "../../channels/plugins/index.js";
-import { loadClawdbotPlugins } from "../../plugins/loader.js";
+import { loadMoltbotPlugins } from "../../plugins/loader.js";
 import {
   ErrorCodes,
   errorShape,
@@ -112,7 +112,7 @@ export const configHandlers: GatewayRequestHandlers = {
     }
     const cfg = loadConfig();
     const workspaceDir = resolveAgentWorkspaceDir(cfg, resolveDefaultAgentId(cfg));
-    const pluginRegistry = loadClawdbotPlugins({
+    const pluginRegistry = loadMoltbotPlugins({
       config: cfg,
       workspaceDir,
       logger: {
@@ -186,7 +186,7 @@ export const configHandlers: GatewayRequestHandlers = {
       true,
       {
         ok: true,
-        path: CONFIG_PATH_CLAWDBOT,
+        path: CONFIG_PATH,
         config: validated.config,
       },
       undefined,
@@ -260,12 +260,54 @@ export const configHandlers: GatewayRequestHandlers = {
       return;
     }
     await writeConfigFile(validated.config);
+
+    const sessionKey =
+      typeof (params as { sessionKey?: unknown }).sessionKey === "string"
+        ? (params as { sessionKey?: string }).sessionKey?.trim() || undefined
+        : undefined;
+    const note =
+      typeof (params as { note?: unknown }).note === "string"
+        ? (params as { note?: string }).note?.trim() || undefined
+        : undefined;
+    const restartDelayMsRaw = (params as { restartDelayMs?: unknown }).restartDelayMs;
+    const restartDelayMs =
+      typeof restartDelayMsRaw === "number" && Number.isFinite(restartDelayMsRaw)
+        ? Math.max(0, Math.floor(restartDelayMsRaw))
+        : undefined;
+
+    const payload: RestartSentinelPayload = {
+      kind: "config-apply",
+      status: "ok",
+      ts: Date.now(),
+      sessionKey,
+      message: note ?? null,
+      doctorHint: formatDoctorNonInteractiveHint(),
+      stats: {
+        mode: "config.patch",
+        root: CONFIG_PATH,
+      },
+    };
+    let sentinelPath: string | null = null;
+    try {
+      sentinelPath = await writeRestartSentinel(payload);
+    } catch {
+      sentinelPath = null;
+    }
+    const restart = scheduleGatewaySigusr1Restart({
+      delayMs: restartDelayMs,
+      reason: "config.patch",
+    });
     respond(
       true,
       {
         ok: true,
-        path: CONFIG_PATH_CLAWDBOT,
+        path: CONFIG_PATH,
         config: validated.config,
+        restart,
+        sentinel: {
+          path: sentinelPath,
+          payload,
+        },
       },
       undefined,
     );
@@ -339,7 +381,7 @@ export const configHandlers: GatewayRequestHandlers = {
       doctorHint: formatDoctorNonInteractiveHint(),
       stats: {
         mode: "config.apply",
-        root: CONFIG_PATH_CLAWDBOT,
+        root: CONFIG_PATH,
       },
     };
     let sentinelPath: string | null = null;
@@ -356,7 +398,7 @@ export const configHandlers: GatewayRequestHandlers = {
       true,
       {
         ok: true,
-        path: CONFIG_PATH_CLAWDBOT,
+        path: CONFIG_PATH,
         config: validated.config,
         restart,
         sentinel: {

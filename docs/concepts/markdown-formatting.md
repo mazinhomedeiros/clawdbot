@@ -7,7 +7,7 @@ read_when:
 ---
 # Markdown formatting
 
-Clawdbot formats outbound Markdown by converting it into a shared intermediate
+Moltbot formats outbound Markdown by converting it into a shared intermediate
 representation (IR) before rendering channel-specific output. The IR keeps the
 source text intact while carrying style/link spans so chunking and rendering can
 stay consistent across channels.
@@ -25,6 +25,7 @@ stay consistent across channels.
 1. **Parse Markdown -> IR**
    - IR is plain text plus style spans (bold/italic/strike/code/spoiler) and link spans.
    - Offsets are UTF-16 code units so Signal style ranges align with its API.
+   - Tables are parsed only when a channel opts into table conversion.
 2. **Chunk IR (format-first)**
    - Chunking happens on the IR text before rendering.
    - Inline formatting does not split across chunks; spans are sliced per chunk.
@@ -38,7 +39,7 @@ stay consistent across channels.
 Input Markdown:
 
 ```markdown
-Hello **world** — see [docs](https://docs.clawd.bot).
+Hello **world** — see [docs](https://docs.molt.bot).
 ```
 
 IR (schematic):
@@ -50,7 +51,7 @@ IR (schematic):
     { "start": 6, "end": 11, "style": "bold" }
   ],
   "links": [
-    { "start": 19, "end": 23, "href": "https://docs.clawd.bot" }
+    { "start": 19, "end": 23, "href": "https://docs.molt.bot" }
   ]
 }
 ```
@@ -59,7 +60,30 @@ IR (schematic):
 
 - Slack, Telegram, and Signal outbound adapters render from the IR.
 - Other channels (WhatsApp, iMessage, MS Teams, Discord) still use plain text or
-  their own formatting rules.
+  their own formatting rules, with Markdown table conversion applied before
+  chunking when enabled.
+
+## Table handling
+
+Markdown tables are not consistently supported across chat clients. Use
+`markdown.tables` to control conversion per channel (and per account).
+
+- `code`: render tables as code blocks (default for most channels).
+- `bullets`: convert each row into bullet points (default for Signal + WhatsApp).
+- `off`: disable table parsing and conversion; raw table text passes through.
+
+Config keys:
+
+```yaml
+channels:
+  discord:
+    markdown:
+      tables: code
+    accounts:
+      work:
+        markdown:
+          tables: off
+```
 
 ## Chunking rules
 

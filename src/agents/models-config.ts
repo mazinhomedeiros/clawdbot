@@ -1,16 +1,17 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 
-import { type ClawdbotConfig, loadConfig } from "../config/config.js";
-import { resolveClawdbotAgentDir } from "./agent-paths.js";
+import { type MoltbotConfig, loadConfig } from "../config/config.js";
+import { resolveMoltbotAgentDir } from "./agent-paths.js";
 import {
   normalizeProviders,
   type ProviderConfig,
+  resolveImplicitBedrockProvider,
   resolveImplicitCopilotProvider,
   resolveImplicitProviders,
 } from "./models-config.providers.js";
 
-type ModelsConfig = NonNullable<ClawdbotConfig["models"]>;
+type ModelsConfig = NonNullable<MoltbotConfig["models"]>;
 
 const DEFAULT_MODE: NonNullable<ModelsConfig["mode"]> = "merge";
 
@@ -71,19 +72,26 @@ async function readJson(pathname: string): Promise<unknown> {
   }
 }
 
-export async function ensureClawdbotModelsJson(
-  config?: ClawdbotConfig,
+export async function ensureMoltbotModelsJson(
+  config?: MoltbotConfig,
   agentDirOverride?: string,
 ): Promise<{ agentDir: string; wrote: boolean }> {
   const cfg = config ?? loadConfig();
-  const agentDir = agentDirOverride?.trim() ? agentDirOverride.trim() : resolveClawdbotAgentDir();
+  const agentDir = agentDirOverride?.trim() ? agentDirOverride.trim() : resolveMoltbotAgentDir();
 
   const explicitProviders = (cfg.models?.providers ?? {}) as Record<string, ProviderConfig>;
-  const implicitProviders = resolveImplicitProviders({ agentDir });
+  const implicitProviders = await resolveImplicitProviders({ agentDir });
   const providers: Record<string, ProviderConfig> = mergeProviders({
     implicit: implicitProviders,
     explicit: explicitProviders,
   });
+  const implicitBedrock = await resolveImplicitBedrockProvider({ agentDir, config: cfg });
+  if (implicitBedrock) {
+    const existing = providers["amazon-bedrock"];
+    providers["amazon-bedrock"] = existing
+      ? mergeProviderModels(implicitBedrock, existing)
+      : implicitBedrock;
+  }
   const implicitCopilot = await resolveImplicitCopilotProvider({ agentDir });
   if (implicitCopilot && !providers["github-copilot"]) {
     providers["github-copilot"] = implicitCopilot;

@@ -78,7 +78,7 @@ export async function agentCommand(
     const knownAgents = listAgentIds(cfg);
     if (!knownAgents.includes(agentIdOverride)) {
       throw new Error(
-        `Unknown agent id "${agentIdOverrideRaw}". Use "${formatCliCommand("clawdbot agents list")}" to see configured agents.`,
+        `Unknown agent id "${agentIdOverrideRaw}". Use "${formatCliCommand("moltbot agents list")}" to see configured agents.`,
       );
     }
   }
@@ -377,10 +377,12 @@ export async function agentCommand(
         runContext.messageChannel,
         opts.replyChannel ?? opts.channel,
       );
+      const spawnedBy = opts.spawnedBy ?? sessionEntry?.spawnedBy;
       const fallbackResult = await runWithModelFallback({
         cfg,
         provider,
         model,
+        agentDir,
         fallbacksOverride: resolveAgentModelFallbacksOverride(cfg, sessionAgentId),
         run: (providerOverride, modelOverride) => {
           if (isCliProvider(providerOverride, cfg)) {
@@ -412,6 +414,10 @@ export async function agentCommand(
             agentAccountId: runContext.accountId,
             messageTo: opts.replyTo ?? opts.to,
             messageThreadId: opts.threadId,
+            groupId: runContext.groupId,
+            groupChannel: runContext.groupChannel,
+            groupSpace: runContext.groupSpace,
+            spawnedBy,
             currentChannelId: runContext.currentChannelId,
             currentThreadTs: runContext.currentThreadTs,
             replyToMode: runContext.replyToMode,

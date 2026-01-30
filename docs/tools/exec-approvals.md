@@ -12,6 +12,7 @@ Exec approvals are the **companion app / node host guardrail** for letting a san
 commands on a real host (`gateway` or `node`). Think of it like a safety interlock:
 commands are allowed only when policy + allowlist + (optional) user approval all agree.
 Exec approvals are **in addition** to tool policy and elevated gating (unless elevated is set to `full`, which skips approvals).
+Effective policy is the **stricter** of `tools.exec.*` and approvals defaults; if an approvals field is omitted, the `tools.exec` value is used.
 
 If the companion app UI is **not available**, any request that requires a prompt is
 resolved by the **ask fallback** (default: deny).
@@ -19,7 +20,7 @@ resolved by the **ask fallback** (default: deny).
 ## Where it applies
 
 Exec approvals are enforced locally on the execution host:
-- **gateway host** → `clawdbot` process on the gateway machine
+- **gateway host** → `moltbot` process on the gateway machine
 - **node host** → node runner (macOS companion app or headless node host)
 
 macOS split:
@@ -54,6 +55,7 @@ Example schema:
       "autoAllowSkills": true,
       "allowlist": [
         {
+          "id": "B0C8C0B3-2C2D-4F8A-9A3C-5A4B3C2D1E0F",
           "pattern": "~/Projects/**/bin/rg",
           "lastUsedAt": 1737150000000,
           "lastUsedCommand": "rg -n TODO",
@@ -96,6 +98,7 @@ Examples:
 - `/opt/homebrew/bin/rg`
 
 Each allowlist entry tracks:
+- **id** stable UUID used for UI identity (optional)
 - **last used** timestamp
 - **last used command**
 - **last resolved path**
@@ -130,7 +133,7 @@ must advertise `system.execApprovals.get/set` (macOS app or headless node host).
 If a node does not advertise exec approvals yet, edit its local
 `~/.clawdbot/exec-approvals.json` directly.
 
-CLI: `clawdbot approvals` supports gateway or node editing (see [Approvals CLI](/cli/approvals)).
+CLI: `moltbot approvals` supports gateway or node editing (see [Approvals CLI](/cli/approvals)).
 
 ## Approval flow
 
@@ -153,6 +156,36 @@ Actions:
 - **Allow once** → run now
 - **Always allow** → add to allowlist + run
 - **Deny** → block
+
+## Approval forwarding to chat channels
+
+You can forward exec approval prompts to any chat channel (including plugin channels) and approve
+them with `/approve`. This uses the normal outbound delivery pipeline.
+
+Config:
+```json5
+{
+  approvals: {
+    exec: {
+      enabled: true,
+      mode: "session", // "session" | "targets" | "both"
+      agentFilter: ["main"],
+      sessionFilter: ["discord"], // substring or regex
+      targets: [
+        { channel: "slack", to: "U12345678" },
+        { channel: "telegram", to: "123456789" }
+      ]
+    }
+  }
+}
+```
+
+Reply in chat:
+```
+/approve <id> allow-once
+/approve <id> allow-always
+/approve <id> deny
+```
 
 ### macOS IPC flow
 ```
@@ -183,6 +216,9 @@ Approval-gated execs reuse the approval id as the `runId` in these messages for 
 - **full** is powerful; prefer allowlists when possible.
 - **ask** keeps you in the loop while still allowing fast approvals.
 - Per-agent allowlists prevent one agent’s approvals from leaking into others.
+- Approvals only apply to host exec requests from **authorized senders**. Unauthorized senders cannot issue `/exec`.
+- `/exec security=full` is a session-level convenience for authorized operators and skips approvals by design.
+  To hard-block host exec, set approvals security to `deny` or deny the `exec` tool via tool policy.
 
 Related:
 - [Exec tool](/tools/exec)

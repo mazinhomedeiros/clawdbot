@@ -2,6 +2,7 @@ export {
   SYNTHETIC_DEFAULT_MODEL_ID,
   SYNTHETIC_DEFAULT_MODEL_REF,
 } from "../agents/synthetic-models.js";
+export { VENICE_DEFAULT_MODEL_ID, VENICE_DEFAULT_MODEL_REF } from "../agents/venice-models.js";
 export {
   applyAuthProfileConfig,
   applyKimiCodeConfig,
@@ -12,8 +13,12 @@ export {
   applyOpenrouterProviderConfig,
   applySyntheticConfig,
   applySyntheticProviderConfig,
+  applyVeniceConfig,
+  applyVeniceProviderConfig,
   applyVercelAiGatewayConfig,
   applyVercelAiGatewayProviderConfig,
+  applyXiaomiConfig,
+  applyXiaomiProviderConfig,
   applyZaiConfig,
 } from "./onboard-auth.config-core.js";
 export {
@@ -39,10 +44,13 @@ export {
   setOpencodeZenApiKey,
   setOpenrouterApiKey,
   setSyntheticApiKey,
+  setVeniceApiKey,
   setVercelAiGatewayApiKey,
+  setXiaomiApiKey,
   setZaiApiKey,
   writeOAuthCredentials,
   VERCEL_AI_GATEWAY_DEFAULT_MODEL_REF,
+  XIAOMI_DEFAULT_MODEL_REF,
   ZAI_DEFAULT_MODEL_REF,
 } from "./onboard-auth.credentials.js";
 export {

@@ -1,6 +1,8 @@
 import type {
   AllowlistMatch,
+  ChannelGroupContext,
   GroupPolicy,
+  GroupToolPolicyConfig,
   MSTeamsChannelConfig,
   MSTeamsConfig,
   MSTeamsReplyStyle,
@@ -9,6 +11,7 @@ import type {
 import {
   buildChannelKeyCandidates,
   normalizeChannelSlug,
+  resolveToolsBySender,
   resolveChannelEntryMatchWithFallback,
   resolveNestedAllowlistDecision,
 } from "clawdbot/plugin-sdk";
@@ -84,6 +87,94 @@ export function resolveMSTeamsRouteConfig(params: {
         ? channelMatch.matchSource
         : undefined,
   };
+}
+
+export function resolveMSTeamsGroupToolPolicy(
+  params: ChannelGroupContext,
+): GroupToolPolicyConfig | undefined {
+  const cfg = params.cfg.channels?.msteams;
+  if (!cfg) return undefined;
+  const groupId = params.groupId?.trim();
+  const groupChannel = params.groupChannel?.trim();
+  const groupSpace = params.groupSpace?.trim();
+
+  const resolved = resolveMSTeamsRouteConfig({
+    cfg,
+    teamId: groupSpace,
+    teamName: groupSpace,
+    conversationId: groupId,
+    channelName: groupChannel,
+  });
+
+  if (resolved.channelConfig) {
+    const senderPolicy = resolveToolsBySender({
+      toolsBySender: resolved.channelConfig.toolsBySender,
+      senderId: params.senderId,
+      senderName: params.senderName,
+      senderUsername: params.senderUsername,
+      senderE164: params.senderE164,
+    });
+    if (senderPolicy) return senderPolicy;
+    if (resolved.channelConfig.tools) return resolved.channelConfig.tools;
+    const teamSenderPolicy = resolveToolsBySender({
+      toolsBySender: resolved.teamConfig?.toolsBySender,
+      senderId: params.senderId,
+      senderName: params.senderName,
+      senderUsername: params.senderUsername,
+      senderE164: params.senderE164,
+    });
+    if (teamSenderPolicy) return teamSenderPolicy;
+    return resolved.teamConfig?.tools;
+  }
+  if (resolved.teamConfig) {
+    const teamSenderPolicy = resolveToolsBySender({
+      toolsBySender: resolved.teamConfig.toolsBySender,
+      senderId: params.senderId,
+      senderName: params.senderName,
+      senderUsername: params.senderUsername,
+      senderE164: params.senderE164,
+    });
+    if (teamSenderPolicy) return teamSenderPolicy;
+    if (resolved.teamConfig.tools) return resolved.teamConfig.tools;
+  }
+
+  if (!groupId) return undefined;
+
+  const channelCandidates = buildChannelKeyCandidates(
+    groupId,
+    groupChannel,
+    groupChannel ? normalizeChannelSlug(groupChannel) : undefined,
+  );
+  for (const teamConfig of Object.values(cfg.teams ?? {})) {
+    const match = resolveChannelEntryMatchWithFallback({
+      entries: teamConfig?.channels ?? {},
+      keys: channelCandidates,
+      wildcardKey: "*",
+      normalizeKey: normalizeChannelSlug,
+    });
+    if (match.entry) {
+      const senderPolicy = resolveToolsBySender({
+        toolsBySender: match.entry.toolsBySender,
+        senderId: params.senderId,
+        senderName: params.senderName,
+        senderUsername: params.senderUsername,
+        senderE164: params.senderE164,
+      });
+      if (senderPolicy) return senderPolicy;
+      if (match.entry.tools) return match.entry.tools;
+      const teamSenderPolicy = resolveToolsBySender({
+        toolsBySender: teamConfig?.toolsBySender,
+        senderId: params.senderId,
+        senderName: params.senderName,
+        senderUsername: params.senderUsername,
+        senderE164: params.senderE164,
+      });
+      if (teamSenderPolicy) return teamSenderPolicy;
+      return teamConfig?.tools;
+    }
+  }
+
+  return undefined;
 }
 
 export type MSTeamsReplyPolicy = {
