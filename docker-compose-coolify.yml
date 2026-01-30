@@ -12,6 +12,7 @@ services:
       TERM: xterm-256color
       CLAWDBOT_GATEWAY_TOKEN: ${CLAWDBOT_GATEWAY_TOKEN}
       OPENCLAW_STATE_DIR: /home/node/.openclaw
+      OPENCLAW_CONFIG_PATH: /home/node/.openclaw/moltbot.json
 
     volumes:
       - clawdbot_config:/home/node/.openclaw
@@ -29,8 +30,7 @@ services:
         "--bind",
         "lan",
         "--port",
-        "18789",
-        "--allow-unconfigured"
+        "18789"
       ]
 
 
