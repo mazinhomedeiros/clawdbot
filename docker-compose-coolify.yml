@@ -11,6 +11,7 @@ services:
       HOME: /home/node
       TERM: xterm-256color
       CLAWDBOT_GATEWAY_TOKEN: ${CLAWDBOT_GATEWAY_TOKEN}
+      OPENCLAW_GATEWAY_TOKEN: ${CLAWDBOT_GATEWAY_TOKEN}
       OPENCLAW_STATE_DIR: /home/node/.openclaw
       OPENCLAW_CONFIG_PATH: /home/node/.openclaw/moltbot.json
 
@@ -22,24 +23,15 @@ services:
       - '127.0.0.1:18789:18789'
     #  - '127.0.0.1:18790:18790'
 
-    command:
-      [
-        "node",
-        "dist/index.js",
-        "gateway",
-        "--bind",
-        "lan",
-        "--port",
-        "18789"
-      ]
-
+    command: ["node","dist/index.js","gateway"]
 
 volumes:
   clawdbot_config:
   clawdbot_workspace:
 
 
-# # Expose a "clawdbot" command in PATH
-#   RUN printf '#!/usr/bin/env sh\nexec node dist/index.js "$@"\n' > /usr/local/bin/clawdbot \
-#     && chmod +x /usr/local/bin/clawdbot
+# # Expose a "moltbot" command in PATH
+  # RUN printf '#!/usr/bin/env sh\nexec node /app/dist/index.js "$@"\n' > /usr/local/bin/moltbot \
+  #   && chmod +x /usr/local/bin/moltbot
+
 
