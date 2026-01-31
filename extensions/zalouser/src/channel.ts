@@ -4,9 +4,9 @@ import type {
   ChannelDock,
   ChannelGroupContext,
   ChannelPlugin,
-  MoltbotConfig,
+  OpenClawConfig,
   GroupToolPolicyConfig,
-} from "clawdbot/plugin-sdk";
+} from "openclaw/plugin-sdk";
 import {
   applyAccountNameToChannelSection,
   buildChannelConfigSchema,
@@ -16,7 +16,7 @@ import {
   migrateBaseNameToDefaultAccount,
   normalizeAccountId,
   setAccountEnabledInConfigSection,
-} from "clawdbot/plugin-sdk";
+} from "openclaw/plugin-sdk";
 import {
   listZalouserAccountIds,
   resolveDefaultZalouserAccountId,
@@ -85,14 +85,14 @@ function resolveZalouserGroupToolPolicy(
   params: ChannelGroupContext,
 ): GroupToolPolicyConfig | undefined {
   const account = resolveZalouserAccountSync({
-    cfg: params.cfg as MoltbotConfig,
+    cfg: params.cfg as OpenClawConfig,
     accountId: params.accountId ?? undefined,
   });
   const groups = account.config.groups ?? {};
   const groupId = params.groupId?.trim();
   const groupChannel = params.groupChannel?.trim();
-  const candidates = [groupId, groupChannel, "*"].filter(
-    (value): value is string => Boolean(value),
+  const candidates = [groupId, groupChannel, "*"].filter((value): value is string =>
+    Boolean(value),
   );
   for (const key of candidates) {
     const entry = groups[key];
@@ -111,9 +111,9 @@ export const zalouserDock: ChannelDock = {
   outbound: { textChunkLimit: 2000 },
   config: {
     resolveAllowFrom: ({ cfg, accountId }) =>
-      (resolveZalouserAccountSync({ cfg: cfg as MoltbotConfig, accountId }).config.allowFrom ?? []).map(
-        (entry) => String(entry),
-      ),
+      (
+        resolveZalouserAccountSync({ cfg: cfg as OpenClawConfig, accountId }).config.allowFrom ?? []
+      ).map((entry) => String(entry)),
     formatAllowFrom: ({ allowFrom }) =>
       allowFrom
         .map((entry) => String(entry).trim())
@@ -146,13 +146,13 @@ export const zalouserPlugin: ChannelPlugin<ResolvedZalouserAccount> = {
   reload: { configPrefixes: ["channels.zalouser"] },
   configSchema: buildChannelConfigSchema(ZalouserConfigSchema),
   config: {
-    listAccountIds: (cfg) => listZalouserAccountIds(cfg as MoltbotConfig),
+    listAccountIds: (cfg) => listZalouserAccountIds(cfg as OpenClawConfig),
     resolveAccount: (cfg, accountId) =>
-      resolveZalouserAccountSync({ cfg: cfg as MoltbotConfig, accountId }),
-    defaultAccountId: (cfg) => resolveDefaultZalouserAccountId(cfg as MoltbotConfig),
+      resolveZalouserAccountSync({ cfg: cfg as OpenClawConfig, accountId }),
+    defaultAccountId: (cfg) => resolveDefaultZalouserAccountId(cfg as OpenClawConfig),
     setAccountEnabled: ({ cfg, accountId, enabled }) =>
       setAccountEnabledInConfigSection({
-        cfg: cfg as MoltbotConfig,
+        cfg: cfg as OpenClawConfig,
         sectionKey: "zalouser",
         accountId,
         enabled,
@@ -160,10 +160,18 @@ export const zalouserPlugin: ChannelPlugin<ResolvedZalouserAccount> = {
       }),
     deleteAccount: ({ cfg, accountId }) =>
       deleteAccountFromConfigSection({
-        cfg: cfg as MoltbotConfig,
+        cfg: cfg as OpenClawConfig,
         sectionKey: "zalouser",
         accountId,
-        clearBaseFields: ["profile", "name", "dmPolicy", "allowFrom", "groupPolicy", "groups", "messagePrefix"],
+        clearBaseFields: [
+          "profile",
+          "name",
+          "dmPolicy",
+          "allowFrom",
+          "groupPolicy",
+          "groups",
+          "messagePrefix",
+        ],
       }),
     isConfigured: async (account) => {
       // Check if zca auth status is OK for this profile
@@ -180,9 +188,9 @@ export const zalouserPlugin: ChannelPlugin<ResolvedZalouserAccount> = {
       configured: undefined,
     }),
     resolveAllowFrom: ({ cfg, accountId }) =>
-      (resolveZalouserAccountSync({ cfg: cfg as MoltbotConfig, accountId }).config.allowFrom ?? []).map(
-        (entry) => String(entry),
-      ),
+      (
+        resolveZalouserAccountSync({ cfg: cfg as OpenClawConfig, accountId }).config.allowFrom ?? []
+      ).map((entry) => String(entry)),
     formatAllowFrom: ({ allowFrom }) =>
       allowFrom
         .map((entry) => String(entry).trim())
@@ -194,7 +202,7 @@ export const zalouserPlugin: ChannelPlugin<ResolvedZalouserAccount> = {
     resolveDmPolicy: ({ cfg, accountId, account }) => {
       const resolvedAccountId = accountId ?? account.accountId ?? DEFAULT_ACCOUNT_ID;
       const useAccountPath = Boolean(
-        (cfg as MoltbotConfig).channels?.zalouser?.accounts?.[resolvedAccountId],
+        (cfg as OpenClawConfig).channels?.zalouser?.accounts?.[resolvedAccountId],
       );
       const basePath = useAccountPath
         ? `channels.zalouser.accounts.${resolvedAccountId}.`
@@ -220,7 +228,7 @@ export const zalouserPlugin: ChannelPlugin<ResolvedZalouserAccount> = {
     resolveAccountId: ({ accountId }) => normalizeAccountId(accountId),
     applyAccountName: ({ cfg, accountId, name }) =>
       applyAccountNameToChannelSection({
-        cfg: cfg as MoltbotConfig,
+        cfg: cfg as OpenClawConfig,
         channelKey: "zalouser",
         accountId,
         name,
@@ -228,7 +236,7 @@ export const zalouserPlugin: ChannelPlugin<ResolvedZalouserAccount> = {
     validateInput: () => null,
     applyAccountConfig: ({ cfg, accountId, input }) => {
       const namedConfig = applyAccountNameToChannelSection({
-        cfg: cfg as MoltbotConfig,
+        cfg: cfg as OpenClawConfig,
         channelKey: "zalouser",
         accountId,
         name: input.name,
@@ -250,7 +258,7 @@ export const zalouserPlugin: ChannelPlugin<ResolvedZalouserAccount> = {
               enabled: true,
             },
           },
-        } as MoltbotConfig;
+        } as OpenClawConfig;
       }
       return {
         ...next,
@@ -268,7 +276,7 @@ export const zalouserPlugin: ChannelPlugin<ResolvedZalouserAccount> = {
             },
           },
         },
-      } as MoltbotConfig;
+      } as OpenClawConfig;
     },
   },
   messaging: {
@@ -290,8 +298,11 @@ export const zalouserPlugin: ChannelPlugin<ResolvedZalouserAccount> = {
     self: async ({ cfg, accountId, runtime }) => {
       const ok = await checkZcaInstalled();
       if (!ok) throw new Error("Missing dependency: `zca` not found in PATH");
-      const account = resolveZalouserAccountSync({ cfg: cfg as MoltbotConfig, accountId });
-      const result = await runZca(["me", "info", "-j"], { profile: account.profile, timeout: 10000 });
+      const account = resolveZalouserAccountSync({ cfg: cfg as OpenClawConfig, accountId });
+      const result = await runZca(["me", "info", "-j"], {
+        profile: account.profile,
+        timeout: 10000,
+      });
       if (!result.ok) {
         runtime.error(result.stderr || "Failed to fetch profile");
         return null;
@@ -308,10 +319,8 @@ export const zalouserPlugin: ChannelPlugin<ResolvedZalouserAccount> = {
     listPeers: async ({ cfg, accountId, query, limit }) => {
       const ok = await checkZcaInstalled();
       if (!ok) throw new Error("Missing dependency: `zca` not found in PATH");
-      const account = resolveZalouserAccountSync({ cfg: cfg as MoltbotConfig, accountId });
-      const args = query?.trim()
-        ? ["friend", "find", query.trim()]
-        : ["friend", "list", "-j"];
+      const account = resolveZalouserAccountSync({ cfg: cfg as OpenClawConfig, accountId });
+      const args = query?.trim() ? ["friend", "find", query.trim()] : ["friend", "list", "-j"];
       const result = await runZca(args, { profile: account.profile, timeout: 15000 });
       if (!result.ok) {
         throw new Error(result.stderr || "Failed to list peers");
@@ -332,8 +341,11 @@ export const zalouserPlugin: ChannelPlugin<ResolvedZalouserAccount> = {
     listGroups: async ({ cfg, accountId, query, limit }) => {
       const ok = await checkZcaInstalled();
       if (!ok) throw new Error("Missing dependency: `zca` not found in PATH");
-      const account = resolveZalouserAccountSync({ cfg: cfg as MoltbotConfig, accountId });
-      const result = await runZca(["group", "list", "-j"], { profile: account.profile, timeout: 15000 });
+      const account = resolveZalouserAccountSync({ cfg: cfg as OpenClawConfig, accountId });
+      const result = await runZca(["group", "list", "-j"], {
+        profile: account.profile,
+        timeout: 15000,
+      });
       if (!result.ok) {
         throw new Error(result.stderr || "Failed to list groups");
       }
@@ -356,7 +368,7 @@ export const zalouserPlugin: ChannelPlugin<ResolvedZalouserAccount> = {
     listGroupMembers: async ({ cfg, accountId, groupId, limit }) => {
       const ok = await checkZcaInstalled();
       if (!ok) throw new Error("Missing dependency: `zca` not found in PATH");
-      const account = resolveZalouserAccountSync({ cfg: cfg as MoltbotConfig, accountId });
+      const account = resolveZalouserAccountSync({ cfg: cfg as OpenClawConfig, accountId });
       const result = await runZca(["group", "members", groupId, "-j"], {
         profile: account.profile,
         timeout: 20000,
@@ -364,7 +376,9 @@ export const zalouserPlugin: ChannelPlugin<ResolvedZalouserAccount> = {
       if (!result.ok) {
         throw new Error(result.stderr || "Failed to list group members");
       }
-      const parsed = parseJsonOutput<Array<Partial<ZcaFriend> & { userId?: string | number }>>(result.stdout);
+      const parsed = parseJsonOutput<Array<Partial<ZcaFriend> & { userId?: string | number }>>(
+        result.stdout,
+      );
       const rows = Array.isArray(parsed)
         ? parsed
             .map((m) => {
@@ -398,7 +412,7 @@ export const zalouserPlugin: ChannelPlugin<ResolvedZalouserAccount> = {
         }
         try {
           const account = resolveZalouserAccountSync({
-            cfg: cfg as MoltbotConfig,
+            cfg: cfg as OpenClawConfig,
             accountId: accountId ?? DEFAULT_ACCOUNT_ID,
           });
           const args =
@@ -433,7 +447,8 @@ export const zalouserPlugin: ChannelPlugin<ResolvedZalouserAccount> = {
                   name: g.name ?? undefined,
                 }))
               : [];
-            const best = matches.find((g) => g.name?.toLowerCase() === trimmed.toLowerCase()) ?? matches[0];
+            const best =
+              matches.find((g) => g.name?.toLowerCase() === trimmed.toLowerCase()) ?? matches[0];
             results.push({
               input,
               resolved: Boolean(best?.id),
@@ -454,7 +469,7 @@ export const zalouserPlugin: ChannelPlugin<ResolvedZalouserAccount> = {
     idLabel: "zalouserUserId",
     normalizeAllowEntry: (entry) => entry.replace(/^(zalouser|zlu):/i, ""),
     notifyApproval: async ({ cfg, id }) => {
-      const account = resolveZalouserAccountSync({ cfg: cfg as MoltbotConfig });
+      const account = resolveZalouserAccountSync({ cfg: cfg as OpenClawConfig });
       const authenticated = await checkZcaAuthenticated(account.profile);
       if (!authenticated) throw new Error("Zalouser not authenticated");
       await sendMessageZalouser(id, "Your pairing request has been approved.", {
@@ -465,13 +480,13 @@ export const zalouserPlugin: ChannelPlugin<ResolvedZalouserAccount> = {
   auth: {
     login: async ({ cfg, accountId, runtime }) => {
       const account = resolveZalouserAccountSync({
-        cfg: cfg as MoltbotConfig,
+        cfg: cfg as OpenClawConfig,
         accountId: accountId ?? DEFAULT_ACCOUNT_ID,
       });
       const ok = await checkZcaInstalled();
       if (!ok) {
         throw new Error(
-          "Missing dependency: `zca` not found in PATH. See docs.molt.bot/channels/zalouser",
+          "Missing dependency: `zca` not found in PATH. See docs.openclaw.ai/channels/zalouser",
         );
       }
       runtime.log(
@@ -509,7 +524,7 @@ export const zalouserPlugin: ChannelPlugin<ResolvedZalouserAccount> = {
     chunkerMode: "text",
     textChunkLimit: 2000,
     sendText: async ({ to, text, accountId, cfg }) => {
-      const account = resolveZalouserAccountSync({ cfg: cfg as MoltbotConfig, accountId });
+      const account = resolveZalouserAccountSync({ cfg: cfg as OpenClawConfig, accountId });
       const result = await sendMessageZalouser(to, text, { profile: account.profile });
       return {
         channel: "zalouser",
@@ -519,7 +534,7 @@ export const zalouserPlugin: ChannelPlugin<ResolvedZalouserAccount> = {
       };
     },
     sendMedia: async ({ to, text, mediaUrl, accountId, cfg }) => {
-      const account = resolveZalouserAccountSync({ cfg: cfg as MoltbotConfig, accountId });
+      const account = resolveZalouserAccountSync({ cfg: cfg as OpenClawConfig, accountId });
       const result = await sendMessageZalouser(to, text, {
         profile: account.profile,
         mediaUrl,
@@ -550,8 +565,7 @@ export const zalouserPlugin: ChannelPlugin<ResolvedZalouserAccount> = {
       probe: snapshot.probe,
       lastProbeAt: snapshot.lastProbeAt ?? null,
     }),
-    probeAccount: async ({ account, timeoutMs }) =>
-      probeZalouser(account.profile, timeoutMs),
+    probeAccount: async ({ account, timeoutMs }) => probeZalouser(account.profile, timeoutMs),
     buildAccountSnapshot: async ({ account, runtime }) => {
       const zcaInstalled = await checkZcaInstalled();
       const configured = zcaInstalled ? await checkZcaAuthenticated(account.profile) : false;
@@ -564,7 +578,7 @@ export const zalouserPlugin: ChannelPlugin<ResolvedZalouserAccount> = {
         running: runtime?.running ?? false,
         lastStartAt: runtime?.lastStartAt ?? null,
         lastStopAt: runtime?.lastStopAt ?? null,
-        lastError: configured ? (runtime?.lastError ?? null) : runtime?.lastError ?? configError,
+        lastError: configured ? (runtime?.lastError ?? null) : (runtime?.lastError ?? configError),
         lastInboundAt: runtime?.lastInboundAt ?? null,
         lastOutboundAt: runtime?.lastOutboundAt ?? null,
         dmPolicy: account.config.dmPolicy ?? "pairing",
@@ -589,7 +603,7 @@ export const zalouserPlugin: ChannelPlugin<ResolvedZalouserAccount> = {
       const { monitorZalouserProvider } = await import("./monitor.js");
       return monitorZalouserProvider({
         account,
-        config: ctx.cfg as MoltbotConfig,
+        config: ctx.cfg as OpenClawConfig,
         runtime: ctx.runtime,
         abortSignal: ctx.abortSignal,
         statusSink: (patch) => ctx.setStatus({ accountId: ctx.accountId, ...patch }),

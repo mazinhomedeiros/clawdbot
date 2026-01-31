@@ -1,15 +1,15 @@
 import type {
   ChannelMessageActionAdapter,
   ChannelMessageActionName,
-  MoltbotConfig,
-} from "clawdbot/plugin-sdk";
+  OpenClawConfig,
+} from "openclaw/plugin-sdk";
 import {
   createActionGate,
   jsonResult,
   readNumberParam,
   readReactionParams,
   readStringParam,
-} from "clawdbot/plugin-sdk";
+} from "openclaw/plugin-sdk";
 
 import { listEnabledGoogleChatAccounts, resolveGoogleChatAccount } from "./accounts.js";
 import {
@@ -24,16 +24,17 @@ import { resolveGoogleChatOutboundSpace } from "./targets.js";
 
 const providerId = "googlechat";
 
-function listEnabledAccounts(cfg: MoltbotConfig) {
+function listEnabledAccounts(cfg: OpenClawConfig) {
   return listEnabledGoogleChatAccounts(cfg).filter(
     (account) => account.enabled && account.credentialSource !== "none",
   );
 }
 
-function isReactionsEnabled(accounts: ReturnType<typeof listEnabledAccounts>, cfg: MoltbotConfig) {
+function isReactionsEnabled(accounts: ReturnType<typeof listEnabledAccounts>, cfg: OpenClawConfig) {
   for (const account of accounts) {
     const gate = createActionGate(
-      (account.config.actions ?? (cfg.channels?.["googlechat"] as { actions?: unknown })?.actions) as Record<
+      (account.config.actions ??
+        (cfg.channels?.["googlechat"] as { actions?: unknown })?.actions) as Record<
         string,
         boolean | undefined
       >,
@@ -49,11 +50,11 @@ function resolveAppUserNames(account: { config: { botUser?: string | null } }) {
 
 export const googlechatMessageActions: ChannelMessageActionAdapter = {
   listActions: ({ cfg }) => {
-    const accounts = listEnabledAccounts(cfg as MoltbotConfig);
+    const accounts = listEnabledAccounts(cfg as OpenClawConfig);
     if (accounts.length === 0) return [];
     const actions = new Set<ChannelMessageActionName>([]);
     actions.add("send");
-    if (isReactionsEnabled(accounts, cfg as MoltbotConfig)) {
+    if (isReactionsEnabled(accounts, cfg as OpenClawConfig)) {
       actions.add("react");
       actions.add("reactions");
     }
@@ -69,7 +70,7 @@ export const googlechatMessageActions: ChannelMessageActionAdapter = {
   },
   handleAction: async ({ action, params, cfg, accountId }) => {
     const account = resolveGoogleChatAccount({
-      cfg: cfg as MoltbotConfig,
+      cfg: cfg as OpenClawConfig,
       accountId,
     });
     if (account.credentialSource === "none") {
@@ -103,7 +104,12 @@ export const googlechatMessageActions: ChannelMessageActionAdapter = {
           text: content,
           thread: threadId ?? undefined,
           attachments: upload.attachmentUploadToken
-            ? [{ attachmentUploadToken: upload.attachmentUploadToken, contentName: loaded.filename }]
+            ? [
+                {
+                  attachmentUploadToken: upload.attachmentUploadToken,
+                  contentName: loaded.filename,
+                },
+              ]
             : undefined,
         });
         return jsonResult({ ok: true, to: space });

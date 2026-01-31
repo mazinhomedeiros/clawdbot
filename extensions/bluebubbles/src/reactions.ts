@@ -1,5 +1,5 @@
 import { resolveBlueBubblesAccount } from "./accounts.js";
-import type { MoltbotConfig } from "clawdbot/plugin-sdk";
+import type { OpenClawConfig } from "openclaw/plugin-sdk";
 import { blueBubblesFetchWithTimeout, buildBlueBubblesApiUrl } from "./types.js";
 
 export type BlueBubblesReactionOpts = {
@@ -7,17 +7,10 @@ export type BlueBubblesReactionOpts = {
   password?: string;
   accountId?: string;
   timeoutMs?: number;
-  cfg?: MoltbotConfig;
+  cfg?: OpenClawConfig;
 };
 
-const REACTION_TYPES = new Set([
-  "love",
-  "like",
-  "dislike",
-  "laugh",
-  "emphasize",
-  "question",
-]);
+const REACTION_TYPES = new Set(["love", "like", "dislike", "laugh", "emphasize", "question"]);
 
 const REACTION_ALIASES = new Map<string, string>([
   // General

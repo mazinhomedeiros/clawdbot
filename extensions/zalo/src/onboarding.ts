@@ -1,31 +1,28 @@
 import type {
   ChannelOnboardingAdapter,
   ChannelOnboardingDmPolicy,
-  MoltbotConfig,
+  OpenClawConfig,
   WizardPrompter,
-} from "clawdbot/plugin-sdk";
+} from "openclaw/plugin-sdk";
 import {
   addWildcardAllowFrom,
   DEFAULT_ACCOUNT_ID,
   normalizeAccountId,
   promptAccountId,
-} from "clawdbot/plugin-sdk";
+} from "openclaw/plugin-sdk";
 
-import {
-  listZaloAccountIds,
-  resolveDefaultZaloAccountId,
-  resolveZaloAccount,
-} from "./accounts.js";
+import { listZaloAccountIds, resolveDefaultZaloAccountId, resolveZaloAccount } from "./accounts.js";
 
 const channel = "zalo" as const;
 
 type UpdateMode = "polling" | "webhook";
 
 function setZaloDmPolicy(
-  cfg: MoltbotConfig,
+  cfg: OpenClawConfig,
   dmPolicy: "pairing" | "allowlist" | "open" | "disabled",
 ) {
-  const allowFrom = dmPolicy === "open" ? addWildcardAllowFrom(cfg.channels?.zalo?.allowFrom) : undefined;
+  const allowFrom =
+    dmPolicy === "open" ? addWildcardAllowFrom(cfg.channels?.zalo?.allowFrom) : undefined;
   return {
     ...cfg,
     channels: {
@@ -36,17 +33,17 @@ function setZaloDmPolicy(
         ...(allowFrom ? { allowFrom } : {}),
       },
     },
-  } as MoltbotConfig;
+  } as OpenClawConfig;
 }
 
 function setZaloUpdateMode(
-  cfg: MoltbotConfig,
+  cfg: OpenClawConfig,
   accountId: string,
   mode: UpdateMode,
   webhookUrl?: string,
   webhookSecret?: string,
   webhookPath?: string,
-): MoltbotConfig {
+): OpenClawConfig {
   const isDefault = accountId === DEFAULT_ACCOUNT_ID;
   if (mode === "polling") {
     if (isDefault) {
@@ -62,19 +59,14 @@ function setZaloUpdateMode(
           ...cfg.channels,
           zalo: rest,
         },
-      } as MoltbotConfig;
+      } as OpenClawConfig;
     }
     const accounts = { ...(cfg.channels?.zalo?.accounts ?? {}) } as Record<
       string,
       Record<string, unknown>
     >;
     const existing = accounts[accountId] ?? {};
-    const {
-      webhookUrl: _url,
-      webhookSecret: _secret,
-      webhookPath: _path,
-      ...rest
-    } = existing;
+    const { webhookUrl: _url, webhookSecret: _secret, webhookPath: _path, ...rest } = existing;
     accounts[accountId] = rest;
     return {
       ...cfg,
@@ -85,7 +77,7 @@ function setZaloUpdateMode(
           accounts,
         },
       },
-    } as MoltbotConfig;
+    } as OpenClawConfig;
   }
 
   if (isDefault) {
@@ -100,7 +92,7 @@ function setZaloUpdateMode(
           webhookPath,
         },
       },
-    } as MoltbotConfig;
+    } as OpenClawConfig;
   }
 
   const accounts = { ...(cfg.channels?.zalo?.accounts ?? {}) } as Record<
@@ -122,7 +114,7 @@ function setZaloUpdateMode(
         accounts,
       },
     },
-  } as MoltbotConfig;
+  } as OpenClawConfig;
 }
 
 async function noteZaloTokenHelp(prompter: WizardPrompter): Promise<void> {
@@ -132,17 +124,17 @@ async function noteZaloTokenHelp(prompter: WizardPrompter): Promise<void> {
       "2) Create a bot and get the token",
       "3) Token looks like 12345689:abc-xyz",
       "Tip: you can also set ZALO_BOT_TOKEN in your env.",
-      "Docs: https://docs.molt.bot/channels/zalo",
+      "Docs: https://docs.openclaw.ai/channels/zalo",
     ].join("\n"),
     "Zalo bot token",
   );
 }
 
 async function promptZaloAllowFrom(params: {
-  cfg: MoltbotConfig;
+  cfg: OpenClawConfig;
   prompter: WizardPrompter;
   accountId: string;
-}): Promise<MoltbotConfig> {
+}): Promise<OpenClawConfig> {
   const { cfg, prompter, accountId } = params;
   const resolved = resolveZaloAccount({ cfg, accountId });
   const existingAllowFrom = resolved.config.allowFrom ?? [];
@@ -176,7 +168,7 @@ async function promptZaloAllowFrom(params: {
           allowFrom: unique,
         },
       },
-    } as MoltbotConfig;
+    } as OpenClawConfig;
   }
 
   return {
@@ -197,7 +189,7 @@ async function promptZaloAllowFrom(params: {
         },
       },
     },
-  } as MoltbotConfig;
+  } as OpenClawConfig;
 }
 
 const dmPolicy: ChannelOnboardingDmPolicy = {
@@ -206,14 +198,14 @@ const dmPolicy: ChannelOnboardingDmPolicy = {
   policyKey: "channels.zalo.dmPolicy",
   allowFromKey: "channels.zalo.allowFrom",
   getCurrent: (cfg) => (cfg.channels?.zalo?.dmPolicy ?? "pairing") as "pairing",
-  setPolicy: (cfg, policy) => setZaloDmPolicy(cfg as MoltbotConfig, policy),
+  setPolicy: (cfg, policy) => setZaloDmPolicy(cfg as OpenClawConfig, policy),
   promptAllowFrom: async ({ cfg, prompter, accountId }) => {
     const id =
       accountId && normalizeAccountId(accountId)
-        ? normalizeAccountId(accountId) ?? DEFAULT_ACCOUNT_ID
-        : resolveDefaultZaloAccountId(cfg as MoltbotConfig);
+        ? (normalizeAccountId(accountId) ?? DEFAULT_ACCOUNT_ID)
+        : resolveDefaultZaloAccountId(cfg as OpenClawConfig);
     return promptZaloAllowFrom({
-      cfg: cfg as MoltbotConfig,
+      cfg: cfg as OpenClawConfig,
       prompter,
       accountId: id,
     });
@@ -224,8 +216,8 @@ export const zaloOnboardingAdapter: ChannelOnboardingAdapter = {
   channel,
   dmPolicy,
   getStatus: async ({ cfg }) => {
-    const configured = listZaloAccountIds(cfg as MoltbotConfig).some((accountId) =>
-      Boolean(resolveZaloAccount({ cfg: cfg as MoltbotConfig, accountId }).token),
+    const configured = listZaloAccountIds(cfg as OpenClawConfig).some((accountId) =>
+      Boolean(resolveZaloAccount({ cfg: cfg as OpenClawConfig, accountId }).token),
     );
     return {
       channel,
@@ -235,15 +227,19 @@ export const zaloOnboardingAdapter: ChannelOnboardingAdapter = {
       quickstartScore: configured ? 1 : 10,
     };
   },
-  configure: async ({ cfg, prompter, accountOverrides, shouldPromptAccountIds, forceAllowFrom }) => {
+  configure: async ({
+    cfg,
+    prompter,
+    accountOverrides,
+    shouldPromptAccountIds,
+    forceAllowFrom,
+  }) => {
     const zaloOverride = accountOverrides.zalo?.trim();
-    const defaultZaloAccountId = resolveDefaultZaloAccountId(cfg as MoltbotConfig);
-    let zaloAccountId = zaloOverride
-      ? normalizeAccountId(zaloOverride)
-      : defaultZaloAccountId;
+    const defaultZaloAccountId = resolveDefaultZaloAccountId(cfg as OpenClawConfig);
+    let zaloAccountId = zaloOverride ? normalizeAccountId(zaloOverride) : defaultZaloAccountId;
     if (shouldPromptAccountIds && !zaloOverride) {
       zaloAccountId = await promptAccountId({
-        cfg: cfg as MoltbotConfig,
+        cfg: cfg as OpenClawConfig,
         prompter,
         label: "Zalo",
         currentId: zaloAccountId,
@@ -252,7 +248,7 @@ export const zaloOnboardingAdapter: ChannelOnboardingAdapter = {
       });
     }
 
-    let next = cfg as MoltbotConfig;
+    let next = cfg as OpenClawConfig;
     const resolvedAccount = resolveZaloAccount({ cfg: next, accountId: zaloAccountId });
     const accountConfigured = Boolean(resolvedAccount.token);
     const allowEnv = zaloAccountId === DEFAULT_ACCOUNT_ID;
@@ -280,7 +276,7 @@ export const zaloOnboardingAdapter: ChannelOnboardingAdapter = {
               enabled: true,
             },
           },
-        } as MoltbotConfig;
+        } as OpenClawConfig;
       } else {
         token = String(
           await prompter.text({
@@ -323,7 +319,7 @@ export const zaloOnboardingAdapter: ChannelOnboardingAdapter = {
               botToken: token,
             },
           },
-        } as MoltbotConfig;
+        } as OpenClawConfig;
       } else {
         next = {
           ...next,
@@ -342,7 +338,7 @@ export const zaloOnboardingAdapter: ChannelOnboardingAdapter = {
               },
             },
           },
-        } as MoltbotConfig;
+        } as OpenClawConfig;
       }
     }
 
@@ -354,7 +350,8 @@ export const zaloOnboardingAdapter: ChannelOnboardingAdapter = {
       const webhookUrl = String(
         await prompter.text({
           message: "Webhook URL (https://...) ",
-          validate: (value) => (value?.trim()?.startsWith("https://") ? undefined : "HTTPS URL required"),
+          validate: (value) =>
+            value?.trim()?.startsWith("https://") ? undefined : "HTTPS URL required",
         }),
       ).trim();
       const defaultPath = (() => {

@@ -5,7 +5,7 @@ import {
   type ChannelOnboardingAdapter,
   type ChannelOnboardingDmPolicy,
   type WizardPrompter,
-} from "clawdbot/plugin-sdk";
+} from "openclaw/plugin-sdk";
 import { listMatrixDirectoryGroupsLive } from "./directory-live.js";
 import { listMatrixDirectoryPeersLive } from "./directory-live.js";
 import { resolveMatrixAccount } from "./matrix/accounts.js";
@@ -15,7 +15,8 @@ import type { CoreConfig, DmPolicy } from "./types.js";
 const channel = "matrix" as const;
 
 function setMatrixDmPolicy(cfg: CoreConfig, policy: DmPolicy) {
-  const allowFrom = policy === "open" ? addWildcardAllowFrom(cfg.channels?.matrix?.dm?.allowFrom) : undefined;
+  const allowFrom =
+    policy === "open" ? addWildcardAllowFrom(cfg.channels?.matrix?.dm?.allowFrom) : undefined;
   return {
     ...cfg,
     channels: {
@@ -318,7 +319,7 @@ export const matrixOnboardingAdapter: ChannelOnboardingAdapter = {
     const deviceName = String(
       await prompter.text({
         message: "Matrix device name (optional)",
-        initialValue: existing.deviceName ?? "Moltbot Gateway",
+        initialValue: existing.deviceName ?? "OpenClaw Gateway",
       }),
     ).trim();
 
@@ -390,10 +391,7 @@ export const matrixOnboardingAdapter: ChannelOnboardingAdapter = {
                 unresolved.push(entry);
               }
             }
-            roomKeys = [
-              ...resolvedIds,
-              ...unresolved.map((entry) => entry.trim()).filter(Boolean),
-            ];
+            roomKeys = [...resolvedIds, ...unresolved.map((entry) => entry.trim()).filter(Boolean)];
             if (resolvedIds.length > 0 || unresolved.length > 0) {
               await prompter.note(
                 [

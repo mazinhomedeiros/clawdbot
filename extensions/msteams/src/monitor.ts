@@ -2,9 +2,9 @@ import type { Request, Response } from "express";
 import {
   mergeAllowlist,
   summarizeMapping,
-  type MoltbotConfig,
+  type OpenClawConfig,
   type RuntimeEnv,
-} from "clawdbot/plugin-sdk";
+} from "openclaw/plugin-sdk";
 import type { MSTeamsConversationStore } from "./conversation-store.js";
 import { createMSTeamsConversationStoreFs } from "./conversation-store-fs.js";
 import { formatUnknownError } from "./errors.js";
@@ -20,7 +20,7 @@ import { resolveMSTeamsCredentials } from "./token.js";
 import { getMSTeamsRuntime } from "./runtime.js";
 
 export type MonitorMSTeamsOpts = {
-  cfg: MoltbotConfig;
+  cfg: OpenClawConfig;
   runtime?: RuntimeEnv;
   abortSignal?: AbortSignal;
   conversationStore?: MSTeamsConversationStore;
@@ -90,9 +90,9 @@ export async function monitorMSTeamsProvider(
 
   try {
     const allowEntries =
-      allowFrom?.map((entry) => cleanAllowEntry(String(entry))).filter(
-        (entry) => entry && entry !== "*",
-      ) ?? [];
+      allowFrom
+        ?.map((entry) => cleanAllowEntry(String(entry)))
+        .filter((entry) => entry && entry !== "*") ?? [];
     if (allowEntries.length > 0) {
       const { additions } = await resolveAllowlistUsers("msteams users", allowEntries);
       allowFrom = mergeAllowlist({ existing: allowFrom, additions });

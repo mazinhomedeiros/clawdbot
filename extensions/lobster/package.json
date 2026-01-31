@@ -1,9 +1,9 @@
 {
-  "name": "@moltbot/lobster",
-  "version": "2026.1.29",
-  "type": "module",
+  "name": "@openclaw/lobster",
+  "version": "2026.1.30",
   "description": "Lobster workflow tool plugin (typed pipelines + resumable approvals)",
-  "moltbot": {
+  "type": "module",
+  "openclaw": {
     "extensions": [
       "./index.ts"
     ]

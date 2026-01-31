@@ -7,7 +7,7 @@
  * - m.poll.end - Closes a poll
  */
 
-import type { PollInput } from "clawdbot/plugin-sdk";
+import type { PollInput } from "openclaw/plugin-sdk";
 
 export const M_POLL_START = "m.poll.start" as const;
 export const M_POLL_RESPONSE = "m.poll.response" as const;
@@ -82,9 +82,10 @@ export function getTextContent(text?: TextContent): string {
 }
 
 export function parsePollStartContent(content: PollStartContent): PollSummary | null {
-  const poll = (content as Record<string, PollStartSubtype | undefined>)[M_POLL_START]
-    ?? (content as Record<string, PollStartSubtype | undefined>)[ORG_POLL_START]
-    ?? (content as Record<string, PollStartSubtype | undefined>)["m.poll"];
+  const poll =
+    (content as Record<string, PollStartSubtype | undefined>)[M_POLL_START] ??
+    (content as Record<string, PollStartSubtype | undefined>)[ORG_POLL_START] ??
+    (content as Record<string, PollStartSubtype | undefined>)["m.poll"];
   if (!poll) return null;
 
   const question = getTextContent(poll.question);

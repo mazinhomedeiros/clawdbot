@@ -1,6 +1,6 @@
 import { readFileSync } from "node:fs";
 
-import type { RuntimeEnv } from "clawdbot/plugin-sdk";
+import type { RuntimeEnv } from "openclaw/plugin-sdk";
 
 import type { ResolvedNextcloudTalkAccount } from "./accounts.js";
 
@@ -87,9 +87,7 @@ export async function resolveNextcloudTalkRoomKind(params: {
         fetchedAt: Date.now(),
         error: `status:${response.status}`,
       });
-      runtime?.log?.(
-        `nextcloud-talk: room lookup failed (${response.status}) token=${roomToken}`,
-      );
+      runtime?.log?.(`nextcloud-talk: room lookup failed (${response.status}) token=${roomToken}`);
       return undefined;
     }
 

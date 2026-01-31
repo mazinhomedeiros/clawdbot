@@ -3,12 +3,9 @@ import type {
   ChannelResolveKind,
   ChannelResolveResult,
   RuntimeEnv,
-} from "clawdbot/plugin-sdk";
+} from "openclaw/plugin-sdk";
 
-import {
-  listMatrixDirectoryGroupsLive,
-  listMatrixDirectoryPeersLive,
-} from "./directory-live.js";
+import { listMatrixDirectoryGroupsLive, listMatrixDirectoryPeersLive } from "./directory-live.js";
 
 function pickBestGroupMatch(
   matches: ChannelDirectoryEntry[],

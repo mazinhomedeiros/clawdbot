@@ -1,4 +1,4 @@
-import type { RuntimeEnv } from "clawdbot/plugin-sdk";
+import type { RuntimeEnv } from "openclaw/plugin-sdk";
 
 import { extractMessageText } from "./utils.js";
 
@@ -80,8 +80,6 @@ export async function getChannelHistory(
     return cache.slice(0, count);
   }
 
-  runtime?.log?.(
-    `[tlon] Cache has ${cache.length} messages, need ${count}, fetching from scry...`,
-  );
+  runtime?.log?.(`[tlon] Cache has ${cache.length} messages, need ${count}, fetching from scry...`);
   return await fetchChannelHistory(api, channelNest, count, runtime);
 }

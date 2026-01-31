@@ -1,16 +1,16 @@
 import type {
   ChannelOnboardingAdapter,
   ChannelOnboardingDmPolicy,
-  MoltbotConfig,
+  OpenClawConfig,
   WizardPrompter,
-} from "clawdbot/plugin-sdk";
+} from "openclaw/plugin-sdk";
 import {
   addWildcardAllowFrom,
   DEFAULT_ACCOUNT_ID,
   normalizeAccountId,
   promptAccountId,
   promptChannelAccessConfig,
-} from "clawdbot/plugin-sdk";
+} from "openclaw/plugin-sdk";
 
 import {
   listZalouserAccountIds,
@@ -24,13 +24,11 @@ import type { ZcaFriend, ZcaGroup } from "./types.js";
 const channel = "zalouser" as const;
 
 function setZalouserDmPolicy(
-  cfg: MoltbotConfig,
+  cfg: OpenClawConfig,
   dmPolicy: "pairing" | "allowlist" | "open" | "disabled",
-): MoltbotConfig {
+): OpenClawConfig {
   const allowFrom =
-    dmPolicy === "open"
-      ? addWildcardAllowFrom(cfg.channels?.zalouser?.allowFrom)
-      : undefined;
+    dmPolicy === "open" ? addWildcardAllowFrom(cfg.channels?.zalouser?.allowFrom) : undefined;
   return {
     ...cfg,
     channels: {
@@ -41,7 +39,7 @@ function setZalouserDmPolicy(
         ...(allowFrom ? { allowFrom } : {}),
       },
     },
-  } as MoltbotConfig;
+  } as OpenClawConfig;
 }
 
 async function noteZalouserHelp(prompter: WizardPrompter): Promise<void> {
@@ -53,17 +51,17 @@ async function noteZalouserHelp(prompter: WizardPrompter): Promise<void> {
       "1) Install zca-cli",
       "2) You'll scan a QR code with your Zalo app",
       "",
-      "Docs: https://docs.molt.bot/channels/zalouser",
+      "Docs: https://docs.openclaw.ai/channels/zalouser",
     ].join("\n"),
     "Zalo Personal Setup",
   );
 }
 
 async function promptZalouserAllowFrom(params: {
-  cfg: MoltbotConfig;
+  cfg: OpenClawConfig;
   prompter: WizardPrompter;
   accountId: string;
-}): Promise<MoltbotConfig> {
+}): Promise<OpenClawConfig> {
   const { cfg, prompter, accountId } = params;
   const resolved = resolveZalouserAccountSync({ cfg, accountId });
   const existingAllowFrom = resolved.config.allowFrom ?? [];
@@ -131,7 +129,7 @@ async function promptZalouserAllowFrom(params: {
             allowFrom: unique,
           },
         },
-      } as MoltbotConfig;
+      } as OpenClawConfig;
     }
 
     return {
@@ -152,15 +150,15 @@ async function promptZalouserAllowFrom(params: {
           },
         },
       },
-    } as MoltbotConfig;
+    } as OpenClawConfig;
   }
 }
 
 function setZalouserGroupPolicy(
-  cfg: MoltbotConfig,
+  cfg: OpenClawConfig,
   accountId: string,
   groupPolicy: "open" | "allowlist" | "disabled",
-): MoltbotConfig {
+): OpenClawConfig {
   if (accountId === DEFAULT_ACCOUNT_ID) {
     return {
       ...cfg,
@@ -172,7 +170,7 @@ function setZalouserGroupPolicy(
           groupPolicy,
         },
       },
-    } as MoltbotConfig;
+    } as OpenClawConfig;
   }
   return {
     ...cfg,
@@ -191,14 +189,14 @@ function setZalouserGroupPolicy(
         },
       },
     },
-  } as MoltbotConfig;
+  } as OpenClawConfig;
 }
 
 function setZalouserGroupAllowlist(
-  cfg: MoltbotConfig,
+  cfg: OpenClawConfig,
   accountId: string,
   groupKeys: string[],
-): MoltbotConfig {
+): OpenClawConfig {
   const groups = Object.fromEntries(groupKeys.map((key) => [key, { allow: true }]));
   if (accountId === DEFAULT_ACCOUNT_ID) {
     return {
@@ -211,7 +209,7 @@ function setZalouserGroupAllowlist(
           groups,
         },
       },
-    } as MoltbotConfig;
+    } as OpenClawConfig;
   }
   return {
     ...cfg,
@@ -230,19 +228,22 @@ function setZalouserGroupAllowlist(
         },
       },
     },
-  } as MoltbotConfig;
+  } as OpenClawConfig;
 }
 
 async function resolveZalouserGroups(params: {
-  cfg: MoltbotConfig;
+  cfg: OpenClawConfig;
   accountId: string;
   entries: string[];
 }): Promise<Array<{ input: string; resolved: boolean; id?: string }>> {
   const account = resolveZalouserAccountSync({ cfg: params.cfg, accountId: params.accountId });
-  const result = await runZca(["group", "list", "-j"], { profile: account.profile, timeout: 15000 });
+  const result = await runZca(["group", "list", "-j"], {
+    profile: account.profile,
+    timeout: 15000,
+  });
   if (!result.ok) throw new Error(result.stderr || "Failed to list groups");
-  const groups = (parseJsonOutput<ZcaGroup[]>(result.stdout) ?? []).filter(
-    (group) => Boolean(group.groupId),
+  const groups = (parseJsonOutput<ZcaGroup[]>(result.stdout) ?? []).filter((group) =>
+    Boolean(group.groupId),
   );
   const byName = new Map<string, ZcaGroup[]>();
   for (const group of groups) {
@@ -270,15 +271,16 @@ const dmPolicy: ChannelOnboardingDmPolicy = {
   channel,
   policyKey: "channels.zalouser.dmPolicy",
   allowFromKey: "channels.zalouser.allowFrom",
-  getCurrent: (cfg) => ((cfg as MoltbotConfig).channels?.zalouser?.dmPolicy ?? "pairing") as "pairing",
-  setPolicy: (cfg, policy) => setZalouserDmPolicy(cfg as MoltbotConfig, policy),
+  getCurrent: (cfg) =>
+    ((cfg as OpenClawConfig).channels?.zalouser?.dmPolicy ?? "pairing") as "pairing",
+  setPolicy: (cfg, policy) => setZalouserDmPolicy(cfg as OpenClawConfig, policy),
   promptAllowFrom: async ({ cfg, prompter, accountId }) => {
     const id =
       accountId && normalizeAccountId(accountId)
-        ? normalizeAccountId(accountId) ?? DEFAULT_ACCOUNT_ID
-        : resolveDefaultZalouserAccountId(cfg as MoltbotConfig);
+        ? (normalizeAccountId(accountId) ?? DEFAULT_ACCOUNT_ID)
+        : resolveDefaultZalouserAccountId(cfg as OpenClawConfig);
     return promptZalouserAllowFrom({
-      cfg: cfg as MoltbotConfig,
+      cfg: cfg as OpenClawConfig,
       prompter,
       accountId: id,
     });
@@ -289,10 +291,10 @@ export const zalouserOnboardingAdapter: ChannelOnboardingAdapter = {
   channel,
   dmPolicy,
   getStatus: async ({ cfg }) => {
-    const ids = listZalouserAccountIds(cfg as MoltbotConfig);
+    const ids = listZalouserAccountIds(cfg as OpenClawConfig);
     let configured = false;
     for (const accountId of ids) {
-      const account = resolveZalouserAccountSync({ cfg: cfg as MoltbotConfig, accountId });
+      const account = resolveZalouserAccountSync({ cfg: cfg as OpenClawConfig, accountId });
       const isAuth = await checkZcaAuthenticated(account.profile);
       if (isAuth) {
         configured = true;
@@ -307,7 +309,13 @@ export const zalouserOnboardingAdapter: ChannelOnboardingAdapter = {
       quickstartScore: configured ? 1 : 15,
     };
   },
-  configure: async ({ cfg, prompter, accountOverrides, shouldPromptAccountIds, forceAllowFrom }) => {
+  configure: async ({
+    cfg,
+    prompter,
+    accountOverrides,
+    shouldPromptAccountIds,
+    forceAllowFrom,
+  }) => {
     // Check zca is installed
     const zcaInstalled = await checkZcaInstalled();
     if (!zcaInstalled) {
@@ -316,7 +324,7 @@ export const zalouserOnboardingAdapter: ChannelOnboardingAdapter = {
           "The `zca` binary was not found in PATH.",
           "",
           "Install zca-cli, then re-run onboarding:",
-          "Docs: https://docs.molt.bot/channels/zalouser",
+          "Docs: https://docs.openclaw.ai/channels/zalouser",
         ].join("\n"),
         "Missing Dependency",
       );
@@ -324,14 +332,12 @@ export const zalouserOnboardingAdapter: ChannelOnboardingAdapter = {
     }
 
     const zalouserOverride = accountOverrides.zalouser?.trim();
-    const defaultAccountId = resolveDefaultZalouserAccountId(cfg as MoltbotConfig);
-    let accountId = zalouserOverride
-      ? normalizeAccountId(zalouserOverride)
-      : defaultAccountId;
+    const defaultAccountId = resolveDefaultZalouserAccountId(cfg as OpenClawConfig);
+    let accountId = zalouserOverride ? normalizeAccountId(zalouserOverride) : defaultAccountId;
 
     if (shouldPromptAccountIds && !zalouserOverride) {
       accountId = await promptAccountId({
-        cfg: cfg as MoltbotConfig,
+        cfg: cfg as OpenClawConfig,
         prompter,
         label: "Zalo Personal",
         currentId: accountId,
@@ -340,7 +346,7 @@ export const zalouserOnboardingAdapter: ChannelOnboardingAdapter = {
       });
     }
 
-    let next = cfg as MoltbotConfig;
+    let next = cfg as OpenClawConfig;
     const account = resolveZalouserAccountSync({ cfg: next, accountId });
     const alreadyAuthenticated = await checkZcaAuthenticated(account.profile);
 
@@ -364,10 +370,7 @@ export const zalouserOnboardingAdapter: ChannelOnboardingAdapter = {
         });
 
         if (!result.ok) {
-          await prompter.note(
-            `Login failed: ${result.stderr || "Unknown error"}`,
-            "Error",
-          );
+          await prompter.note(`Login failed: ${result.stderr || "Unknown error"}`, "Error");
         } else {
           const isNowAuth = await checkZcaAuthenticated(account.profile);
           if (isNowAuth) {
@@ -398,7 +401,7 @@ export const zalouserOnboardingAdapter: ChannelOnboardingAdapter = {
             profile: account.profile !== "default" ? account.profile : undefined,
           },
         },
-      } as MoltbotConfig;
+      } as OpenClawConfig;
     } else {
       next = {
         ...next,
@@ -417,7 +420,7 @@ export const zalouserOnboardingAdapter: ChannelOnboardingAdapter = {
             },
           },
         },
-      } as MoltbotConfig;
+      } as OpenClawConfig;
     }
 
     if (forceAllowFrom) {
@@ -454,10 +457,7 @@ export const zalouserOnboardingAdapter: ChannelOnboardingAdapter = {
             const unresolved = resolved
               .filter((entry) => !entry.resolved)
               .map((entry) => entry.input);
-            keys = [
-              ...resolvedIds,
-              ...unresolved.map((entry) => entry.trim()).filter(Boolean),
-            ];
+            keys = [...resolvedIds, ...unresolved.map((entry) => entry.trim()).filter(Boolean)];
             if (resolvedIds.length > 0 || unresolved.length > 0) {
               await prompter.note(
                 [

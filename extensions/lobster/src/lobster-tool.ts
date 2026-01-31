@@ -2,7 +2,7 @@ import { Type } from "@sinclair/typebox";
 import { spawn } from "node:child_process";
 import path from "node:path";
 
-import type { MoltbotPluginApi } from "../../../src/plugins/types.js";
+import type { OpenClawPluginApi } from "../../../src/plugins/types.js";
 
 type LobsterEnvelope =
   | {
@@ -168,7 +168,7 @@ function parseEnvelope(stdout: string): LobsterEnvelope {
   throw new Error("lobster returned invalid JSON envelope");
 }
 
-export function createLobsterTool(api: MoltbotPluginApi) {
+export function createLobsterTool(api: OpenClawPluginApi) {
   return {
     name: "lobster",
     description:
@@ -192,9 +192,11 @@ export function createLobsterTool(api: MoltbotPluginApi) {
       const execPath = resolveExecutablePath(
         typeof params.lobsterPath === "string" ? params.lobsterPath : undefined,
       );
-      const cwd = typeof params.cwd === "string" && params.cwd.trim() ? params.cwd.trim() : process.cwd();
+      const cwd =
+        typeof params.cwd === "string" && params.cwd.trim() ? params.cwd.trim() : process.cwd();
       const timeoutMs = typeof params.timeoutMs === "number" ? params.timeoutMs : 20_000;
-      const maxStdoutBytes = typeof params.maxStdoutBytes === "number" ? params.maxStdoutBytes : 512_000;
+      const maxStdoutBytes =
+        typeof params.maxStdoutBytes === "number" ? params.maxStdoutBytes : 512_000;
 
       const argv = (() => {
         if (action === "run") {

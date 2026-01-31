@@ -1,10 +1,10 @@
-import type { ChannelMessageActionName, ChannelPlugin, MoltbotConfig } from "clawdbot/plugin-sdk";
+import type { ChannelMessageActionName, ChannelPlugin, OpenClawConfig } from "openclaw/plugin-sdk";
 import {
   buildChannelConfigSchema,
   DEFAULT_ACCOUNT_ID,
   MSTeamsConfigSchema,
   PAIRING_APPROVED_MESSAGE,
-} from "clawdbot/plugin-sdk";
+} from "openclaw/plugin-sdk";
 
 import { msteamsOnboardingAdapter } from "./onboarding.js";
 import { msteamsOutbound } from "./outbound.js";
@@ -20,10 +20,7 @@ import {
 } from "./resolve-allowlist.js";
 import { sendAdaptiveCardMSTeams, sendMessageMSTeams } from "./send.js";
 import { resolveMSTeamsCredentials } from "./token.js";
-import {
-  listMSTeamsDirectoryGroupsLive,
-  listMSTeamsDirectoryPeersLive,
-} from "./directory-live.js";
+import { listMSTeamsDirectoryGroupsLive, listMSTeamsDirectoryPeersLive } from "./directory-live.js";
 
 type ResolvedMSTeamsAccount = {
   accountId: string;
@@ -102,7 +99,7 @@ export const msteamsPlugin: ChannelPlugin<ResolvedMSTeamsAccount> = {
       },
     }),
     deleteAccount: ({ cfg }) => {
-      const next = { ...cfg } as MoltbotConfig;
+      const next = { ...cfg } as OpenClawConfig;
       const nextChannels = { ...cfg.channels };
       delete nextChannels.msteams;
       if (Object.keys(nextChannels).length > 0) {
@@ -225,8 +222,7 @@ export const msteamsPlugin: ChannelPlugin<ResolvedMSTeamsAccount> = {
         note: undefined as string | undefined,
       }));
 
-      const stripPrefix = (value: string) =>
-        normalizeMSTeamsUserInput(value);
+      const stripPrefix = (value: string) => normalizeMSTeamsUserInput(value);
 
       if (kind === "user") {
         const pending: Array<{ input: string; query: string; index: number }> = [];
@@ -314,7 +310,7 @@ export const msteamsPlugin: ChannelPlugin<ResolvedMSTeamsAccount> = {
               target.name =
                 entry.channelName && entry.teamName
                   ? `${entry.teamName}/${entry.channelName}`
-                  : entry.channelName ?? entry.teamName;
+                  : (entry.channelName ?? entry.teamName);
             } else {
               target.id = entry.teamId;
               target.name = entry.teamName;
