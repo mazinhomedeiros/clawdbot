@@ -16,6 +16,12 @@ RUN if [ -n "$OPENCLAW_DOCKER_APT_PACKAGES" ]; then \
       rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*; \
     fi
 
+# Install uv and expose to non-root user
+RUN curl -fsSL https://astral.sh/uv/install.sh | sh \
+ && cp /root/.cargo/bin/uv /usr/local/bin/uv \
+ && chmod +x /usr/local/bin/uv \
+ && uv --version
+ 
 COPY package.json pnpm-lock.yaml pnpm-workspace.yaml .npmrc ./
 COPY ui/package.json ./ui/package.json
 COPY patches ./patches
