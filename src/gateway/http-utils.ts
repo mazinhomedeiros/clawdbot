@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import type { IncomingMessage } from "node:http";
 
 import { buildAgentMainSessionKey, normalizeAgentId } from "../routing/session-key.js";
+import { isLoopbackAddress, isTrustedProxyAddress } from "./net.js";
 
 export function getHeader(req: IncomingMessage, name: string): string | undefined {
   const raw = req.headers[name.toLowerCase()];
@@ -21,6 +22,46 @@ export function getBearerToken(req: IncomingMessage): string | undefined {
   }
   const token = raw.slice(7).trim();
   return token || undefined;
+}
+
+export type GatewayAuthTokenSource = "bearer" | "header" | "query";
+
+export function resolveGatewayAuthToken(params: {
+  req: IncomingMessage;
+  url?: URL;
+  trustedProxies?: string[];
+}): { token?: string; source?: GatewayAuthTokenSource } {
+  const bearer = getBearerToken(params.req);
+  if (bearer) {
+    return { token: bearer, source: "bearer" };
+  }
+  const headerToken = getHeader(params.req, "x-openclaw-token")?.trim();
+  if (headerToken) {
+    return { token: headerToken, source: "header" };
+  }
+  const queryToken = params.url?.searchParams.get("token")?.trim();
+  if (queryToken && isSecureQueryTokenRequest(params.req, params.trustedProxies)) {
+    return { token: queryToken, source: "query" };
+  }
+  return { token: undefined };
+}
+
+function isSecureQueryTokenRequest(req: IncomingMessage, trustedProxies?: string[]): boolean {
+  if ((req.socket as { encrypted?: boolean }).encrypted) {
+    return true;
+  }
+  const remoteAddr = req.socket?.remoteAddress;
+  if (isLoopbackAddress(remoteAddr)) {
+    return true;
+  }
+  const forwardedProto = getHeader(req, "x-forwarded-proto")?.trim().toLowerCase();
+  if (!forwardedProto || (forwardedProto !== "https" && forwardedProto !== "wss")) {
+    return false;
+  }
+  if (!trustedProxies || trustedProxies.length === 0) {
+    return false;
+  }
+  return isTrustedProxyAddress(remoteAddr, trustedProxies);
 }
 
 export function resolveAgentIdFromHeader(req: IncomingMessage): string | undefined {

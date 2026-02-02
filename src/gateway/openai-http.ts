@@ -15,7 +15,11 @@ import {
   setSseHeaders,
   writeDone,
 } from "./http-common.js";
-import { getBearerToken, resolveAgentIdForRequest, resolveSessionKey } from "./http-utils.js";
+import {
+  resolveAgentIdForRequest,
+  resolveGatewayAuthToken,
+  resolveSessionKey,
+} from "./http-utils.js";
 
 type OpenAiHttpOptions = {
   auth: ResolvedGatewayAuth;
@@ -184,10 +188,15 @@ export async function handleOpenAiHttpRequest(
     return true;
   }
 
-  const token = getBearerToken(req);
+  const authToken = resolveGatewayAuthToken({
+    req,
+    url,
+    trustedProxies: opts.trustedProxies,
+  });
+  const token = authToken.token;
   const authResult = await authorizeGatewayConnect({
     auth: opts.auth,
-    connectAuth: { token, password: token },
+    connectAuth: token ? { token, password: token } : null,
     req,
     trustedProxies: opts.trustedProxies,
   });

@@ -24,7 +24,7 @@ import { isSubagentSessionKey } from "../routing/session-key.js";
 import { normalizeMessageChannel } from "../utils/message-channel.js";
 
 import { authorizeGatewayConnect, type ResolvedGatewayAuth } from "./auth.js";
-import { getBearerToken, getHeader } from "./http-utils.js";
+import { getHeader, resolveGatewayAuthToken } from "./http-utils.js";
 import {
   readJsonBodyOrError,
   sendInvalidRequest,
@@ -117,7 +117,12 @@ export async function handleToolsInvokeHttpRequest(
   }
 
   const cfg = loadConfig();
-  const token = getBearerToken(req);
+  const authToken = resolveGatewayAuthToken({
+    req,
+    url,
+    trustedProxies: opts.trustedProxies ?? cfg.gateway?.trustedProxies,
+  });
+  const token = authToken.token;
   const authResult = await authorizeGatewayConnect({
     auth: opts.auth,
     connectAuth: token ? { token, password: token } : null,
