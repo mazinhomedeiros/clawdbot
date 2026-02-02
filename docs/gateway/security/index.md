@@ -101,6 +101,38 @@ gateway:
 
 When `trustedProxies` is configured, the Gateway will use `X-Forwarded-For` headers to determine the real client IP for local client detection. Make sure your proxy overwrites (not appends to) incoming `X-Forwarded-For` headers to prevent spoofing.
 
+### Gateway auth via query token (HTTPS only)
+
+Gateway HTTP endpoints now accept `?token=...` **only** for HTTPS requests (or HTTPS forwarded by a trusted proxy). This keeps the convenience of tokenized URLs while preventing accidental exposure over plain HTTP.
+
+> Prefer passing tokens via headers. Query tokens can leak via logs, browser history, or referrers.
+
+#### Traefik example (recommended: header injection)
+
+```yaml
+labels:
+  - "traefik.http.routers.openclaw.rule=Host(`claw.example.com`)"
+  - "traefik.http.routers.openclaw.entrypoints=websecure"
+  - "traefik.http.routers.openclaw.tls=true"
+  - "traefik.http.routers.openclaw.middlewares=openclaw-auth"
+  - "traefik.http.middlewares.openclaw-auth.headers.customrequestheaders.X-OpenClaw-Token=${OPENCLAW_GATEWAY_TOKEN}"
+```
+
+#### Traefik example (query token redirect)
+
+If you want to distribute a fixed tokenized URL, you can add a redirect middleware that appends `?token=...`:
+
+```yaml
+labels:
+  - "traefik.http.routers.openclaw.rule=Host(`claw.example.com`)"
+  - "traefik.http.routers.openclaw.entrypoints=websecure"
+  - "traefik.http.routers.openclaw.tls=true"
+  - "traefik.http.routers.openclaw.middlewares=openclaw-token"
+  - "traefik.http.middlewares.openclaw-token.redirectregex.regex=^https://claw\.example\.com/(.*)$"
+  - "traefik.http.middlewares.openclaw-token.redirectregex.replacement=https://claw.example.com/$${1}?token=${OPENCLAW_GATEWAY_TOKEN}"
+  - "traefik.http.middlewares.openclaw-token.redirectregex.permanent=true"
+```
+
 ## Local session logs live on disk
 
 OpenClaw stores session transcripts on disk under `~/.openclaw/agents/<agentId>/sessions/*.jsonl`.

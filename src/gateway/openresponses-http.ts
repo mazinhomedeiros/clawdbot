@@ -15,7 +15,11 @@ import { agentCommand } from "../commands/agent.js";
 import { emitAgentEvent, onAgentEvent } from "../infra/agent-events.js";
 import { defaultRuntime } from "../runtime.js";
 import { authorizeGatewayConnect, type ResolvedGatewayAuth } from "./auth.js";
-import { getBearerToken, resolveAgentIdForRequest, resolveSessionKey } from "./http-utils.js";
+import {
+  resolveAgentIdForRequest,
+  resolveGatewayAuthToken,
+  resolveSessionKey,
+} from "./http-utils.js";
 import {
   readJsonBodyOrError,
   sendJson,
@@ -343,10 +347,15 @@ export async function handleOpenResponsesHttpRequest(
     return true;
   }
 
-  const token = getBearerToken(req);
+  const authToken = resolveGatewayAuthToken({
+    req,
+    url,
+    trustedProxies: opts.trustedProxies,
+  });
+  const token = authToken.token;
   const authResult = await authorizeGatewayConnect({
     auth: opts.auth,
-    connectAuth: { token, password: token },
+    connectAuth: token ? { token, password: token } : null,
     req,
     trustedProxies: opts.trustedProxies,
   });
